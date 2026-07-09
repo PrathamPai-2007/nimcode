@@ -1,12 +1,12 @@
 # Nimcode
 
-**Nimcode** is an open-source, terminal-first AI coding agent driven by NVIDIA NIM, utilizing the powerful Nemotron-3 models. It wraps a continuous Read-Eval-Print Loop (REPL) around a dual-model LLM architecture, giving the AI programmatic "hands" (sandboxed tools) to inspect and alter your workspace.
+**Nimcode** is an open-source, CLI-based AI coding agent driven by NVIDIA NIM.
 
-Crucially, **nimcode prioritizes human control.** Every irreversible action—from modifying files to running shell commands—passes through a human approval gate before it touches your disk or the shell.
+It wraps a continuous Read-Eval-Print Loop (REPL) around a dual-model LLM architecture, giving the AI programmatic "hands" (sandboxed tools) to inspect and alter your workspace. Crucially, **nimcode prioritizes human control.** Every irreversible action—from modifying files to running shell commands—passes through a human approval gate before it touches your disk or the shell.
 
 ## Key Features
 
-*   **Beautiful Terminal Interface (TUI):** A gorgeous, responsive terminal interface powered by `prompt_toolkit` and `rich`. Enjoy inline interactive model selection, mode-colored UI frames, seamless autocomplete for commands, and an unobtrusive status bar.
+*   **Terminal Interface (TUI):** A gorgeous, responsive terminal interface powered by `prompt_toolkit` and `rich`. Enjoy inline interactive model selection, mode-colored UI frames, seamless autocomplete for commands, and an unobtrusive status bar.
 *   **Three Operational Modes (Plan, Build & YOLO):**
     *   **Plan Mode (`/plan`):** Enforces a strict "Plan-Before-Execution" protocol. The agent must present a structured architectural `<plan>` for approval before executing any tools.
     *   **Build Mode (`/build`):** Human-in-the-loop execution. Every tool call displays a unified diff or command preview before prompting for `y/n` approval.
@@ -25,7 +25,7 @@ Crucially, **nimcode prioritizes human control.** Every irreversible action—fr
 
 1.  Clone the repository and navigate into the directory:
     ```bash
-    git clone https://github.com/yourusername/nimcode.git
+    git clone https://github.com/PrathamPai-2007/nimcode.git
     cd nimcode
     ```
 2.  Install `nimcode` globally in editable mode:
@@ -55,9 +55,9 @@ Check your environment and configuration:
 nimcode status
 ```
 
-Start an interactive REPL session:
+Start an new session:
 ```bash
-nimcode start
+nimcode
 ```
 
 Run nimcode with a direct task instruction:
