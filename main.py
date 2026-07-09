@@ -1,0 +1,338 @@
+import os
+import sys
+
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+import json
+import typer
+from dotenv import load_dotenv
+from openai import OpenAI
+from pathlib import Path
+from typing import Optional, Any
+from tui import NimcodeTUI
+
+from config import load_config
+from context import generate_workspace_map
+from agent import run_agent_loop
+
+app = typer.Typer(
+    name="nimcode",
+    help="An open-source, terminal-first AI coding agent driven by NVIDIA NIM (DeepSeek V4).",
+)
+
+
+def _get_client_and_setup() -> tuple[OpenAI, Any, Path, str]:
+    """Helper to load environment, config, client, and harvested workspace map."""
+    load_dotenv()
+
+    # Global fallback for API key if not in local .env
+    global_env = Path.home() / ".nimcode" / ".env"
+    if global_env.exists() and not os.environ.get("NVIDIA_API_KEY"):
+        load_dotenv(dotenv_path=global_env)
+
+    api_key = os.environ.get("NVIDIA_API_KEY")
+    if not api_key:
+        typer.secho("Error: NVIDIA_API_KEY is not set.", fg=typer.colors.RED, bold=True)
+        typer.echo(
+            "Please set NVIDIA_API_KEY in your current environment, .env file, or globally at ~/.nimcode/.env"
+        )
+        raise typer.Exit(code=1)
+
+    config = load_config()
+
+    client = OpenAI(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key=api_key,
+        timeout=float(config.timeout),
+        max_retries=0,
+    )
+
+    workspace_root = Path(config.workspace_root).resolve()
+    config.workspace_root = str(workspace_root)
+
+    # Ensure any persisted model across sessions for this workspace_root is loaded
+    try:
+        model_file = workspace_root / ".nimcode" / "model.json"
+        if model_file.exists():
+            with open(model_file, "r", encoding="utf-8") as mf:
+                mdata = json.load(mf)
+                if "fast_model" in mdata and mdata["fast_model"]:
+                    config.fast_model = mdata["fast_model"]
+                if "plan_model" in mdata and mdata["plan_model"]:
+                    config.plan_model = mdata["plan_model"]
+    except Exception:
+        pass
+
+    workspace_map = generate_workspace_map(str(workspace_root))
+
+    return client, config, workspace_root, workspace_map
+
+
+@app.callback(invoke_without_command=True)
+def main(ctx: typer.Context):
+    """
+    An open-source, terminal-first AI coding agent driven by NVIDIA NIM (DeepSeek V4).
+    Run without arguments (`nimcode`) to boot into the interactive TUI.
+    """
+    if ctx.invoked_subcommand is None:
+        start()
+
+
+@app.command()
+def run(
+    prompt: str = typer.Argument(
+        ..., help="The initial coding task or instruction for NIM-Engineer."
+    ),
+    mode: Optional[str] = typer.Option(
+        None, "--mode", "-m", help="Mode to run in: 'plan', 'build', or 'yolo'."
+    ),
+    yolo: bool = typer.Option(
+        False,
+        "--yolo",
+        "-y",
+        help="Run directly in YOLO mode (auto-accept edits and commands).",
+    ),
+):
+    """
+    Start the NIM-Engineer agent loop with a specific task prompt.
+    """
+    client, config, workspace_root, workspace_map = _get_client_and_setup()
+    typer.clear()
+    if yolo or (mode and mode.lower() == "yolo"):
+        config.mode = "yolo"
+        initial_state = "YOLO"
+    elif mode and mode.lower() == "plan":
+        config.mode = "plan"
+        initial_state = "AWAITING_PLAN_APPROVAL"
+    elif mode and mode.lower() == "build":
+        config.mode = "build"
+        initial_state = "EXECUTING"
+    else:
+        initial_state = (
+            "YOLO"
+            if config.mode == "yolo"
+            else ("AWAITING_PLAN_APPROVAL" if config.mode == "plan" else "EXECUTING")
+        )
+    run_agent_loop(
+        client,
+        prompt,
+        config,
+        workspace_root,
+        workspace_map,
+        initial_state=initial_state,
+    )
+
+
+@app.command()
+def start():
+    """
+    Start an interactive nimcode session by prompting for the initial task with a beautiful TUI.
+    """
+    client, config, workspace_root, workspace_map = _get_client_and_setup()
+    typer.clear()
+
+    tui = NimcodeTUI(config=config)
+    tui.show_welcome(workspace_root)
+
+    prompt, mode = tui.get_prompt()
+
+    if prompt and prompt.startswith("<RESUME_SESSION> "):
+        session_file_name = prompt.split(" ", 1)[1]
+        session_path = workspace_root / ".nimcode" / "sessions" / session_file_name
+        with open(session_path, "r", encoding="utf-8") as f:
+            existing_messages = json.load(f)
+        run_agent_loop(
+            client,
+            "",
+            config,
+            workspace_root,
+            workspace_map,
+            existing_messages=existing_messages,
+            session_file_name=session_file_name,
+        )
+        return
+
+    if not prompt or not prompt.strip():
+        typer.echo("No prompt provided. Exiting.")
+        raise typer.Exit()
+
+    initial_state = (
+        "AWAITING_PLAN_APPROVAL"
+        if mode == "Plan Mode"
+        else ("YOLO" if mode == "YOLO Mode" else "EXECUTING")
+    )
+    run_agent_loop(
+        client,
+        prompt.strip(),
+        config,
+        workspace_root,
+        workspace_map,
+        initial_state=initial_state,
+    )
+
+
+@app.command()
+def status():
+    """
+    Check the current configuration, API key readiness, and workspace map.
+    """
+    load_dotenv()
+    global_env = Path.home() / ".nimcode" / ".env"
+    if global_env.exists() and not os.environ.get("NVIDIA_API_KEY"):
+        load_dotenv(dotenv_path=global_env)
+
+    config = load_config()
+    workspace_root = Path(config.workspace_root).resolve()
+    api_key = os.environ.get("NVIDIA_API_KEY")
+
+    typer.secho("\n🔍 nimcode Status Check", fg=typer.colors.CYAN, bold=True)
+    typer.echo(f"  • Workspace Root:     {workspace_root}")
+    typer.echo(f"  • API Key Set:        {'✅ Yes' if api_key else '❌ No'}")
+    typer.echo(f"  • Fast Model:         {config.fast_model}")
+    typer.echo(f"  • Plan Model:         {config.plan_model}")
+    typer.echo(f"  • Active Mode:        {config.mode}")
+    typer.echo(f"  • Loop Iteration Cap: {config.max_loop_iterations}")
+    session_dir = workspace_root / ".nimcode" / "sessions"
+    session_count = len(list(session_dir.glob("*.json"))) if session_dir.exists() else 0
+    typer.echo(
+        f"  • Session Logs:       {'✅ Active (' + str(session_count) + ' sessions)' if session_count > 0 else 'None'}"
+    )
+
+    workspace_map = generate_workspace_map(str(workspace_root))
+    line_count = len(workspace_map.splitlines())
+    typer.echo(
+        f"  • Harvested Files:    ~{line_count - 1} entries across workspace tree"
+    )
+    typer.echo("")
+
+
+@app.command()
+def resume(
+    latest: bool = typer.Option(
+        False, "--latest", "-l", help="Resume the most recent session automatically."
+    ),
+):
+    """
+    Resume an interrupted nimcode session.
+    """
+    client, config, workspace_root, workspace_map = _get_client_and_setup()
+    session_dir = workspace_root / ".nimcode" / "sessions"
+
+    legacy_session = workspace_root / ".nimcode_session.json"
+    if legacy_session.exists():
+        session_dir.mkdir(parents=True, exist_ok=True)
+        import shutil
+
+        shutil.move(str(legacy_session), str(session_dir / "legacy_session.json"))
+        typer.secho(
+            "\n📁 Migrated legacy session to .nimcode/sessions/legacy_session.json",
+            fg=typer.colors.CYAN,
+        )
+
+    if not session_dir.exists() or not list(session_dir.glob("*.json")):
+        typer.secho(
+            "No active sessions found. Use 'start' or 'run' to begin a new session.",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit()
+
+    sessions = sorted(
+        list(session_dir.glob("*.json")), key=lambda x: x.stat().st_mtime, reverse=True
+    )
+
+    if latest:
+        selected_session = sessions[0]
+    else:
+        from rich.console import Console
+        from rich.table import Table
+        from rich.panel import Panel
+
+        console = Console()
+
+        table = Table(title="Old Chats", border_style="cyan")
+        table.add_column("ID", style="bold cyan")
+        table.add_column("Date", style="dim")
+        table.add_column("First Prompt", style="white")
+
+        for idx, s_path in enumerate(sessions):
+            try:
+                with open(s_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    first_prompt = next(
+                        (m["content"] for m in data if m.get("role") == "user"),
+                        "Empty session",
+                    )
+                    first_prompt = (
+                        (first_prompt[:50] + "...")
+                        if len(first_prompt) > 50
+                        else first_prompt
+                    )
+            except Exception:
+                first_prompt = "Error reading session"
+
+            import datetime
+
+            date_str = datetime.datetime.fromtimestamp(s_path.stat().st_mtime).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            table.add_row(str(idx + 1), date_str, first_prompt.replace("\n", " "))
+
+        console.print(Panel(table, border_style="cyan", padding=(1, 2)))
+        choice = typer.prompt("Enter ID to resume (or 'c' to cancel)")
+        if choice.isdigit() and 1 <= int(choice) <= len(sessions):
+            selected_session = sessions[int(choice) - 1]
+        else:
+            typer.secho("Resume cancelled.", fg=typer.colors.YELLOW)
+            raise typer.Exit()
+
+    try:
+        with open(selected_session, "r", encoding="utf-8") as f:
+            existing_messages = json.load(f)
+    except Exception as e:
+        typer.secho(f"Error loading session log: {e}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    if not existing_messages:
+        typer.secho(
+            "Session file is empty. Starting a new session.", fg=typer.colors.YELLOW
+        )
+        run_agent_loop(
+            client,
+            "Hello, continue from where we left off.",
+            config,
+            workspace_root,
+            workspace_map,
+            session_file_name=selected_session.name,
+        )
+    else:
+        typer.secho(
+            f"Restoring session history from {selected_session.name} ({len(existing_messages)} messages loaded)...",
+            fg=typer.colors.GREEN,
+            bold=True,
+        )
+        run_agent_loop(
+            client,
+            "",
+            config,
+            workspace_root,
+            workspace_map,
+            existing_messages=existing_messages,
+            session_file_name=selected_session.name,
+        )
+
+
+@app.command()
+def init():
+    """
+    Initialize or update an AGENTS.md file in the workspace root.
+    """
+    client, config, workspace_root, workspace_map = _get_client_and_setup()
+    from agent import run_init_command
+
+    run_init_command(config, client=client, workspace_root=workspace_root)
+
+
+if __name__ == "__main__":
+    app()
