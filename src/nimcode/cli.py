@@ -1,21 +1,131 @@
 import os
 import sys
-
-if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-
 import json
 import typer
 from dotenv import load_dotenv
 from openai import OpenAI
 from pathlib import Path
 from typing import Optional, Any
-from tui import NimcodeTUI
 
-from config import load_config
-from context import generate_workspace_map
-from agent import run_agent_loop
+from nimcode.ui.tui import NimcodeTUI
+from nimcode.config import (
+    load_config,
+    get_project_nimcode_dir,
+    select_interactive_session,
+)
+from nimcode.context import generate_workspace_map
+from nimcode.core.agent import run_agent_loop, run_init_command
+
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+def patch_completions_menu_above():
+    """
+    Monkeypatches prompt_toolkit's FloatContainer._draw_float to force the
+    autocomplete completion menus to always render above the cursor line.
+    """
+    try:
+        from prompt_toolkit.layout.containers import FloatContainer
+        from prompt_toolkit.layout.menus import (
+            CompletionsMenu,
+            MultiColumnCompletionsMenu,
+        )
+        from prompt_toolkit.layout.containers import ConditionalContainer
+        from prompt_toolkit.application.current import get_app
+
+        original_draw_float = FloatContainer._draw_float
+
+        def patched_draw_float(
+            self, fl, screen, mouse_handlers, write_position, style, erase_bg, z_index
+        ):
+            content = fl.content
+            while isinstance(content, ConditionalContainer):
+                content = content.content
+
+            # Identify if this float represents standard or multi-column completions menus
+            is_menu = (
+                isinstance(content, (CompletionsMenu, MultiColumnCompletionsMenu))
+                or "CompletionsMenu" in type(content).__name__
+            )
+
+            if is_menu and fl.ycursor:
+                try:
+                    cpos = screen.get_menu_position(
+                        fl.attach_to_window or get_app().layout.current_window
+                    )
+                    cursor_y = cpos.y - write_position.ypos
+
+                    # Calculate preferred width/height of the completion menu
+                    fl_width = fl.get_width()
+                    if fl_width is None:
+                        width = fl.content.preferred_width(
+                            write_position.width
+                        ).preferred
+                        width = min(write_position.width, width)
+                    else:
+                        width = fl_width
+
+                    height = fl.content.preferred_height(
+                        width, write_position.height
+                    ).preferred
+
+                    # Force the height to fit the space above the cursor
+                    height = min(height, cursor_y)
+                    ypos = cursor_y - height
+
+                    # Temporarily override Float attributes to absolute coordinates above the cursor
+                    orig_ycursor = fl.ycursor
+                    orig_top = fl.top
+                    orig_bottom = fl.bottom
+                    orig_height = fl.height
+
+                    fl.ycursor = False
+                    fl.top = ypos
+                    fl.bottom = None
+                    fl.height = height
+
+                    try:
+                        original_draw_float(
+                            self,
+                            fl,
+                            screen,
+                            mouse_handlers,
+                            write_position,
+                            style,
+                            erase_bg,
+                            z_index,
+                        )
+                    finally:
+                        # Restore original values to prevent side effects on subsequent renders
+                        fl.ycursor = orig_ycursor
+                        fl.top = orig_top
+                        fl.bottom = orig_bottom
+                        fl.height = orig_height
+                    return
+                except Exception:
+                    pass
+
+            # Fallback to standard rendering logic
+            original_draw_float(
+                self,
+                fl,
+                screen,
+                mouse_handlers,
+                write_position,
+                style,
+                erase_bg,
+                z_index,
+            )
+
+        FloatContainer._draw_float = patched_draw_float
+    except Exception:
+        pass
+
+
+# Run patch at startup
+patch_completions_menu_above()
 
 app = typer.Typer(
     name="nimcode",
@@ -54,7 +164,7 @@ def _get_client_and_setup() -> tuple[OpenAI, Any, Path, str]:
 
     # Ensure any persisted model across sessions for this workspace_root is loaded
     try:
-        model_file = workspace_root / ".nimcode" / "model.json"
+        model_file = get_project_nimcode_dir(workspace_root) / "model.json"
         if model_file.exists():
             with open(model_file, "r", encoding="utf-8") as mf:
                 mdata = json.load(mf)
@@ -71,7 +181,7 @@ def _get_client_and_setup() -> tuple[OpenAI, Any, Path, str]:
 
 
 @app.callback(invoke_without_command=True)
-def main(ctx: typer.Context):
+def main_callback(ctx: typer.Context):
     """
     An open-source, terminal-first AI coding agent driven by NVIDIA NIM (DeepSeek V4).
     Run without arguments (`nimcode`) to boot into the interactive TUI.
@@ -140,7 +250,9 @@ def start():
 
     if prompt and prompt.startswith("<RESUME_SESSION> "):
         session_file_name = prompt.split(" ", 1)[1]
-        session_path = workspace_root / ".nimcode" / "sessions" / session_file_name
+        session_path = (
+            get_project_nimcode_dir(workspace_root) / "sessions" / session_file_name
+        )
         with open(session_path, "r", encoding="utf-8") as f:
             existing_messages = json.load(f)
         run_agent_loop(
@@ -187,17 +299,17 @@ def status():
     workspace_root = Path(config.workspace_root).resolve()
     api_key = os.environ.get("NVIDIA_API_KEY")
 
-    typer.secho("\n🔍 nimcode Status Check", fg=typer.colors.CYAN, bold=True)
+    typer.secho("\nnimcode Status Check", fg=typer.colors.CYAN, bold=True)
     typer.echo(f"  • Workspace Root:     {workspace_root}")
-    typer.echo(f"  • API Key Set:        {'✅ Yes' if api_key else '❌ No'}")
+    typer.echo(f"  • API Key Set:        {'Yes' if api_key else 'No'}")
     typer.echo(f"  • Fast Model:         {config.fast_model}")
     typer.echo(f"  • Plan Model:         {config.plan_model}")
     typer.echo(f"  • Active Mode:        {config.mode}")
     typer.echo(f"  • Loop Iteration Cap: {config.max_loop_iterations}")
-    session_dir = workspace_root / ".nimcode" / "sessions"
+    session_dir = get_project_nimcode_dir(workspace_root) / "sessions"
     session_count = len(list(session_dir.glob("*.json"))) if session_dir.exists() else 0
     typer.echo(
-        f"  • Session Logs:       {'✅ Active (' + str(session_count) + ' sessions)' if session_count > 0 else 'None'}"
+        f"  • Session Logs:       {'Active (' + str(session_count) + ' sessions)' if session_count > 0 else 'None'}"
     )
 
     workspace_map = generate_workspace_map(str(workspace_root))
@@ -218,7 +330,7 @@ def resume(
     Resume an interrupted nimcode session.
     """
     client, config, workspace_root, workspace_map = _get_client_and_setup()
-    session_dir = workspace_root / ".nimcode" / "sessions"
+    session_dir = get_project_nimcode_dir(workspace_root) / "sessions"
 
     legacy_session = workspace_root / ".nimcode_session.json"
     if legacy_session.exists():
@@ -227,7 +339,7 @@ def resume(
 
         shutil.move(str(legacy_session), str(session_dir / "legacy_session.json"))
         typer.secho(
-            "\n📁 Migrated legacy session to .nimcode/sessions/legacy_session.json",
+            f"\nMigrated legacy session to {session_dir}/legacy_session.json",
             fg=typer.colors.CYAN,
         )
 
@@ -245,46 +357,8 @@ def resume(
     if latest:
         selected_session = sessions[0]
     else:
-        from rich.console import Console
-        from rich.table import Table
-        from rich.panel import Panel
-
-        console = Console()
-
-        table = Table(title="Old Chats", border_style="cyan")
-        table.add_column("ID", style="bold cyan")
-        table.add_column("Date", style="dim")
-        table.add_column("First Prompt", style="white")
-
-        for idx, s_path in enumerate(sessions):
-            try:
-                with open(s_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    first_prompt = next(
-                        (m["content"] for m in data if m.get("role") == "user"),
-                        "Empty session",
-                    )
-                    first_prompt = (
-                        (first_prompt[:50] + "...")
-                        if len(first_prompt) > 50
-                        else first_prompt
-                    )
-            except Exception:
-                first_prompt = "Error reading session"
-
-            import datetime
-
-            date_str = datetime.datetime.fromtimestamp(s_path.stat().st_mtime).strftime(
-                "%Y-%m-%d %H:%M"
-            )
-            table.add_row(str(idx + 1), date_str, first_prompt.replace("\n", " "))
-
-        console.print(Panel(table, border_style="cyan", padding=(1, 2)))
-        choice = typer.prompt("Enter ID to resume (or 'c' to cancel)")
-        if choice.isdigit() and 1 <= int(choice) <= len(sessions):
-            selected_session = sessions[int(choice) - 1]
-        else:
-            typer.secho("Resume cancelled.", fg=typer.colors.YELLOW)
+        selected_session = select_interactive_session(config, workspace_root)
+        if not selected_session:
             raise typer.Exit()
 
     try:
@@ -329,8 +403,6 @@ def init():
     Initialize or update an AGENTS.md file in the workspace root.
     """
     client, config, workspace_root, workspace_map = _get_client_and_setup()
-    from agent import run_init_command
-
     run_init_command(config, client=client, workspace_root=workspace_root)
 
 

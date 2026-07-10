@@ -19,9 +19,15 @@ Current Workspace Structure:
 """
 
 
-def build_system_prompt(workspace_root: str, workspace_map: str) -> str:
+def build_system_prompt(
+    workspace_root: str, workspace_map: str, disable_native_tools: bool = False
+) -> str:
     agents_md_content = ""
     agents_md_path = Path(workspace_root) / "AGENTS.md"
+    if not agents_md_path.exists():
+        from nimcode.config import get_project_nimcode_dir
+
+        agents_md_path = get_project_nimcode_dir(workspace_root) / "AGENTS.md"
     if not agents_md_path.exists():
         agents_md_path = Path(workspace_root) / ".nimcode" / "AGENTS.md"
 
@@ -33,33 +39,58 @@ def build_system_prompt(workspace_root: str, workspace_map: str) -> str:
         except Exception:
             pass
 
-    return SYSTEM_PROMPT_TEMPLATE.format(
+    base_prompt = SYSTEM_PROMPT_TEMPLATE.format(
         workspace_root=workspace_root,
         workspace_map=workspace_map,
         agents_md_section=agents_md_content,
     )
 
+    if disable_native_tools:
+        base_prompt += """
+
+CRITICAL: NATIVE TOOL CALLING IS DISABLED/NOT SUPPORTED BY THE ENDPOINT.
+To execute tools, you MUST format your tool calls in XML format inside your response text.
+For example, to read a file, output:
+<tool_call name="read_file">{"path": "file.txt"}</tool_call>
+
+To write a file, output:
+<tool_call name="write_file">{"path": "file.txt", "content": "hello world"}</tool_call>
+
+To execute a command, output:
+<tool_call name="execute_command">{"command": "python script.py"}</tool_call>
+
+Do NOT output any native OpenAI function calls. Only output the XML <tool_call> block as shown above. Only call one tool at a time.
+"""
+    return base_prompt
+
 
 def strip_reasoning_spans(text: str) -> str:
     """
-    Removes <think>...</think> spans or similar CoT reasoning artifacts from output.
-    Also handles unclosed <think> blocks if truncated or still streaming.
+    Removes <think>...</think>, <thought>...</thought>, and <reasoning>...</reasoning>
+    spans or similar CoT reasoning artifacts from output.
+    Also handles unclosed blocks if truncated or still streaming.
     """
     if not text:
         return ""
-    # Strip closed <think>...</think> tags (DOTALL so . matches newlines)
-    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    # Strip any trailing or unclosed <think> block if present
-    cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = text
+    for tag in ["think", "thought", "reasoning"]:
+        cleaned = re.sub(
+            f"<{tag}>.*?</{tag}>", "", cleaned, flags=re.DOTALL | re.IGNORECASE
+        )
+        cleaned = re.sub(f"<{tag}>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
     return cleaned.strip()
 
 
 def extract_plan_block(text: str) -> Optional[str]:
     """
     Extracts the contents inside <plan>...</plan> tags.
-    Returns None if no plan block is found.
+    Returns None if no plan block is found. Also handles unclosed <plan> tag if truncated.
     """
     match = re.search(r"<plan>(.*?)</plan>", text, flags=re.DOTALL | re.IGNORECASE)
     if match:
         return match.group(1).strip()
+    # Check for unclosed <plan> block if output was truncated
+    match_unclosed = re.search(r"<plan>(.*)$", text, flags=re.DOTALL | re.IGNORECASE)
+    if match_unclosed:
+        return match_unclosed.group(1).strip()
     return None
