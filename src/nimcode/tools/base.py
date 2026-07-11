@@ -1,14 +1,10 @@
-import sys
 import json
 import difflib
+import shlex
+import subprocess
 from pathlib import Path
 from typing import Dict, Any, Tuple
 from nimcode.tools.registry import ToolSandboxError
-
-if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    if hasattr(sys.stderr, "reconfigure"):
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
 def resolve_and_validate_path(path_str: str, workspace_root: Path) -> Path:
@@ -38,6 +34,97 @@ def resolve_and_validate_path(path_str: str, workspace_root: Path) -> Path:
     return target_path
 
 
+def is_docker_available() -> bool:
+    """
+    Check if Docker daemon is available and responsive.
+    Returns True if 'docker info' succeeds, False otherwise.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return False
+
+
+def is_valid_tool_call(tool_call: Any) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Validate that a tool call has the required arguments.
+    Returns (is_valid, tool_name, args).
+    """
+    func = getattr(tool_call, "function", None)
+    if not func:
+        return False, "", {}
+    tool_name = getattr(func, "name", "")
+    raw_args = getattr(func, "arguments", "")
+
+    if isinstance(raw_args, dict):
+        args = raw_args
+    else:
+        try:
+            args = json.loads(raw_args) if raw_args else {}
+        except Exception:
+            return False, tool_name, {}
+
+    if tool_name == "read_file":
+        if not args.get("path"):
+            return False, tool_name, args
+    elif tool_name == "write_file":
+        if not args.get("path"):
+            return False, tool_name, args
+        if "content" not in args:
+            return False, tool_name, args
+    elif tool_name == "execute_command":
+        if not args.get("command"):
+            return False, tool_name, args
+    elif tool_name == "run_tests":
+        # command is optional, defaults to pytest
+        pass
+    elif tool_name == "list_files":
+        # path is optional, defaults to "."
+        pass
+    elif tool_name == "glob_files":
+        if not args.get("pattern"):
+            return False, tool_name, args
+    elif tool_name == "patch_file_ast":
+        if not args.get("path"):
+            return False, tool_name, args
+        if not args.get("target_symbol") or not args.get("replacement_code"):
+            return False, tool_name, args
+    elif tool_name == "patch_file_blocks":
+        if not args.get("path"):
+            return False, tool_name, args
+        if not args.get("edit_blocks"):
+            return False, tool_name, args
+    elif tool_name == "search_grep":
+        if not args.get("query"):
+            return False, tool_name, args
+    elif tool_name == "search_symbols":
+        if not args.get("query"):
+            return False, tool_name, args
+    elif tool_name == "spawn_agent":
+        if not args.get("role"):
+            return False, tool_name, args
+        if not args.get("task_prompt"):
+            return False, tool_name, args
+    elif tool_name == "send_message_to_agent":
+        if not args.get("agent_id"):
+            return False, tool_name, args
+        if not args.get("message"):
+            return False, tool_name, args
+    elif tool_name == "kill_agent":
+        if not args.get("agent_id"):
+            return False, tool_name, args
+    elif tool_name == "list_agents":
+        pass
+    else:
+        return False, tool_name, args
+    return True, tool_name, args
+
+
 def render_preview(tool_name: str, args: Dict[str, Any], workspace_root: Path) -> str:
     """
     Renders a human-friendly preview of the tool call before requesting approval.
@@ -59,33 +146,71 @@ def render_preview(tool_name: str, args: Dict[str, Any], workspace_root: Path) -
                     ) as f:
                         old_content = f.read()
                 except Exception:
-                    old_content = "<binary or unreadable content>\n"
-
-            old_lines = old_content.splitlines(keepends=True)
-            new_lines = new_content.splitlines(keepends=True)
-            diff = list(
-                difflib.unified_diff(
-                    old_lines,
-                    new_lines,
-                    fromfile=f"a/{path_str} (current)",
-                    tofile=f"b/{path_str} (proposed)",
-                )
+                    old_content = "<binary or unreadable file>"
+            diff = difflib.unified_diff(
+                old_content.splitlines(keepends=True),
+                new_content.splitlines(keepends=True),
+                fromfile=f"a/{path_str}",
+                tofile=f"b/{path_str}",
             )
-            diff_text = "".join(diff) if diff else "No changes detected."
-            return f"\n[Tool Preview: write_file] Path: {path_str}\n--- Unified Diff ---\n{diff_text}\n--------------------\n"
-        except Exception as e:
-            return f"\n[Tool Preview: write_file] Path: {path_str} (Error computing diff: {e})\n"
+            diff_text = "".join(diff)
+            if not diff_text:
+                diff_text = "(no changes)"
+            return f"\n[Tool Preview: write_file] Path: {path_str}\n{diff_text}\n"
+        except ToolSandboxError as e:
+            return f"\n[Tool Preview: write_file] Path: {path_str}\nError: {e}\n"
 
     elif tool_name == "execute_command":
-        cmd = args.get("command", "")
-        return f"\n[Tool Preview: execute_command] Command:\n$ {cmd}\n(CWD: {workspace_root.resolve()})\n"
+        command = args.get("command", "")
+        use_docker = args.get("use_docker", None)
+        if use_docker is None:
+            # Will be determined at execution time based on config
+            use_docker = is_docker_available()
+        if use_docker:
+            docker_image = args.get("docker_image", "python:3.11-slim")
+            workspace = workspace_root.resolve()
+            # Show a preview of the docker command
+            cmd_preview = (
+                f"docker run --rm --init "
+                f"--cap-drop ALL "
+                f"--security-opt no-new-privileges:true "
+                f"-v {shlex.quote(str(workspace))}:/workspace "
+                f"-w /workspace "
+                f"{docker_image} "
+                f"sh -c {shlex.quote(command)}"
+            )
+            return f"\n[Tool Preview: execute_command (Docker)]\n{cmd_preview}\n"
+        else:
+            return f"\n[Tool Preview: execute_command (Host)]\n{command}\n"
 
     elif tool_name == "run_tests":
-        test_cmd = (
-            args.get("test_command", "")
-            or "auto-detect (pytest / npm test / cargo test / go test)"
-        )
-        return f"\n[Tool Preview: run_tests] Test Command:\n$ {test_cmd}\n(CWD: {workspace_root.resolve()})\n"
+        command = args.get("command", "pytest")
+        use_docker = args.get("use_docker", None)
+        if use_docker is None:
+            use_docker = is_docker_available()
+        if use_docker:
+            docker_image = args.get("docker_image", "python:3.11-slim")
+            workspace = workspace_root.resolve()
+            cmd_preview = (
+                f"docker run --rm --init "
+                f"--cap-drop ALL "
+                f"--security-opt no-new-privileges:true "
+                f"-v {shlex.quote(str(workspace))}:/workspace "
+                f"-w /workspace "
+                f"{docker_image} "
+                f"sh -c {shlex.quote(command)}"
+            )
+            return f"\n[Tool Preview: run_tests (Docker)]\n{cmd_preview}\n"
+        else:
+            return f"\n[Tool Preview: run_tests (Host)]\n{command}\n"
+
+    elif tool_name == "list_files":
+        path = args.get("path", ".")
+        return f"\n[Tool Preview: list_files] Path: {path}\n"
+
+    elif tool_name == "glob_files":
+        pattern = args.get("pattern", "**/*")
+        return f"\n[Tool Preview: glob_files] Pattern: {pattern}\n"
 
     elif tool_name == "patch_file_ast":
         path_str = args.get("path", "")
@@ -93,60 +218,77 @@ def render_preview(tool_name: str, args: Dict[str, Any], workspace_root: Path) -
         rep_code = args.get("replacement_code", "")
         try:
             from nimcode.tools.patch import patch_file_ast_logic
-
             diff_text = patch_file_ast_logic(
                 workspace_root, path_str, target_sym, rep_code, dry_run=True
             )
-            return f"\n[Tool Preview: patch_file_ast] Path: {path_str} | Target: '{target_sym}'\n--- Unified Diff ---\n{diff_text}\n--------------------\n"
+            return f"\n[Tool Preview: patch_file_ast] Path: {path_str}\n{diff_text}\n"
         except Exception as e:
-            return f"\n[Tool Preview: patch_file_ast] Path: {path_str} (Error computing diff: {e})\n"
+            return f"\n[Tool Preview: patch_file_ast] Path: {path_str}\nError Proposed Patch: {e}\n"
+
+    elif tool_name == "patch_file_blocks":
+        path_str = args.get("path", "")
+        edit_blocks = args.get("edit_blocks", "")
+        try:
+            from nimcode.tools.fs import patch_file_blocks_logic
+            diff_text = patch_file_blocks_logic(
+                workspace_root, path_str, edit_blocks, dry_run=True
+            )
+            return f"\n[Tool Preview: patch_file_blocks] Path: {path_str}\n{diff_text}\n"
+        except Exception as e:
+            return f"\n[Tool Preview: patch_file_blocks] Path: {path_str}\nError Proposed Patch: {e}\n"
+
+    elif tool_name == "search_grep":
+        query = args.get("query", "")
+        path = args.get("path", ".")
+        return f"\n[Tool Preview: search_grep] Query: '{query}', Path: {path}\n"
+
+    elif tool_name == "search_symbols":
+        query = args.get("query", "")
+        return f"\n[Tool Preview: search_symbols] Query: '{query}'\n"
 
     elif tool_name == "spawn_agent":
-        role = args.get("role", "Subagent")
-        prompt = args.get("task_prompt", "")
-        return f"\n[Tool Preview: spawn_agent] Role: {role}\nTask Prompt: {prompt[:150]}...\n"
+        task = args.get("task_prompt", "")
+        return f"\n[Tool Preview: spawn_agent] Task: {task[:100]}...\n"
 
     elif tool_name == "send_message_to_agent":
-        aid = args.get("agent_id", "")
-        msg = args.get("message", "")
-        return f"\n[Tool Preview: send_message_to_agent] Target ID: {aid}\nMessage: {msg[:150]}...\n"
+        agent_id = args.get("agent_id", "")
+        message = args.get("message", "")
+        return f"\n[Tool Preview: send_message_to_agent] Agent: {agent_id}, Message: {message[:100]}...\n"
 
-    return f"\n[Tool Preview: {tool_name}] Args: {json.dumps(args)}\n"
+    elif tool_name == "kill_agent":
+        agent_id = args.get("agent_id", "")
+        return f"\n[Tool Preview: kill_agent] Agent: {agent_id}\n"
+
+    elif tool_name == "list_agents":
+        return "\n[Tool Preview: list_agents]\n"
+
+    return f"\n[Tool Preview: {tool_name}] Args: {json.dumps(args, indent=2)}\n"
 
 
-def is_valid_tool_call(tool_call) -> Tuple[bool, str, Dict[str, Any]]:
+def scrub_env(env: Dict[str, str]) -> Dict[str, str]:
     """
-    Validates tool name and checks if JSON arguments can be parsed cleanly.
-    Returns (is_valid, tool_name, parsed_args).
+    Remove sensitive environment variables before passing to subprocess.
     """
-    import re
-    from nimcode.tools.registry import AVAILABLE_TOOLS_SPEC
-
-    try:
-        tool_name = tool_call.function.name
-        valid_names = {spec["function"]["name"] for spec in AVAILABLE_TOOLS_SPEC}
-        if tool_name not in valid_names:
-            return False, tool_name or "unknown", {}
-
-        raw_args = tool_call.function.arguments or "{}"
-        # Strip markdown code fences that some models wrap around JSON
-        raw_args = re.sub(r"```(?:json)?\s*", "", raw_args, flags=re.IGNORECASE)
-        raw_args = re.sub(r"```", "", raw_args)
-        raw_args = raw_args.strip()
-        if not raw_args:
-            raw_args = "{}"
-
-        args = json.loads(raw_args)
-        if not isinstance(args, dict):
-            return False, tool_name, {}
-
-        # Check required fields
-        for spec in AVAILABLE_TOOLS_SPEC:
-            if spec["function"]["name"] == tool_name:
-                required = spec["function"].get("required", [])
-                for req_field in required:
-                    if req_field not in args:
-                        return False, tool_name, args
-        return True, tool_name, args
-    except Exception:
-        return False, "malformed_tool_call", {}
+    sensitive_keys = {
+        "API_KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PRIVATE_KEY",
+        "ACCESS_TOKEN",
+        "AUTH_TOKEN",
+        "NVIDIA_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GITHUB_TOKEN",
+        "GITLAB_TOKEN",
+        "DOCKER_TOKEN",
+    }
+    scrubbed = {}
+    for k, v in env.items():
+        upper_k = k.upper()
+        if any(s in upper_k for s in sensitive_keys):
+            scrubbed[k] = "***REDACTED***"
+        else:
+            scrubbed[k] = v
+    return scrubbed

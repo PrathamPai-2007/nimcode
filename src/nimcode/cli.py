@@ -18,7 +18,8 @@ from nimcode.core.agent import run_agent_loop, run_init_command
 
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    if getattr(sys, "stderr", None) is not None and hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
 def patch_completions_menu_above():
@@ -137,12 +138,17 @@ def _get_client_and_setup() -> tuple[OpenAI, Any, Path, str]:
     """Helper to load environment, config, client, and harvested workspace map."""
     load_dotenv()
 
+    config = load_config()
+
     # Global fallback for API key if not in local .env
     global_env = Path.home() / ".nimcode" / ".env"
     if global_env.exists() and not os.environ.get("NVIDIA_API_KEY"):
         load_dotenv(dotenv_path=global_env)
 
     api_key = os.environ.get("NVIDIA_API_KEY")
+    if not api_key and config.api_base_url:
+        api_key = "local_dummy_key"
+
     if not api_key:
         typer.secho("Error: NVIDIA_API_KEY is not set.", fg=typer.colors.RED, bold=True)
         typer.echo(
@@ -150,10 +156,10 @@ def _get_client_and_setup() -> tuple[OpenAI, Any, Path, str]:
         )
         raise typer.Exit(code=1)
 
-    config = load_config()
+    base_url = config.api_base_url if config.api_base_url else "https://integrate.api.nvidia.com/v1"
 
     client = OpenAI(
-        base_url="https://integrate.api.nvidia.com/v1",
+        base_url=base_url,
         api_key=api_key,
         timeout=float(config.timeout),
         max_retries=0,

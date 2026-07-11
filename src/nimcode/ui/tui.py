@@ -1,22 +1,16 @@
-import sys
 from pathlib import Path
-
-if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    if hasattr(sys.stderr, "reconfigure"):
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+from typing import Optional
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from prompt_toolkit.completion import WordCompleter
-from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
 from nimcode.ui.console import show_help, print_welcome
-
-console = Console()
+from nimcode.ui.output import console, symbol
 
 
 # Build a fast id->name lookup from AVAILABLE_MODELS (which is keyed by number)
@@ -65,7 +59,7 @@ class NimcodeTUI:
     def print_welcome(self):
         print_welcome()
 
-    def show_welcome(self, workspace_root: str = None):
+    def show_welcome(self, workspace_root: Optional[str] = None):
         self.print_welcome()
 
     def show_help(self):
@@ -90,13 +84,16 @@ class NimcodeTUI:
                 mode_name = "BUILD MODE"
                 sep_class = "class:sep-build"
 
-            mode_label = f"── {mode_name} "
+            hline = symbol("hline")
+            mode_label = f"{hline}{hline} {mode_name} "
             remaining_width = term_width - len(mode_label)
             if remaining_width < 0:
                 sep = mode_label[:term_width] + "\n"
             else:
-                sep = mode_label + ("─" * remaining_width) + "\n"
-            return FormattedText([(sep_class, sep), ("class:prompt", "❯ ")])
+                sep = mode_label + (hline * remaining_width) + "\n"
+            return FormattedText(
+                [(sep_class, sep), ("class:prompt", f"{symbol('prompt')} ")]
+            )
 
         def get_bottom_toolbar():
             import shutil
@@ -119,11 +116,15 @@ class NimcodeTUI:
                 )
                 model_name = _model_display_name(current_model)
 
-            right_str = f" [ Shift+Tab: cycle mode | ?: help ] Model: {model_name} ──"
-            left_str = "── "
+            hline = symbol("hline")
+            right_str = (
+                f" [ Shift+Tab: cycle mode | ?: help ] Model: {model_name} "
+                f"{hline}{hline}"
+            )
+            left_str = f"{hline}{hline} "
             padding = term_width - len(left_str) - len(right_str)
 
-            status_line = left_str + ("─" * max(0, padding)) + right_str
+            status_line = left_str + (hline * max(0, padding)) + right_str
             return FormattedText([(sep_class, status_line)])
 
         while True:
@@ -146,6 +147,7 @@ class NimcodeTUI:
                 "/init",
                 "/quit",
                 "/exit",
+                "/kill",
             ]
             try:
                 from nimcode import skills
@@ -156,12 +158,13 @@ class NimcodeTUI:
             completer = WordCompleter(commands, ignore_case=True, WORD=True)
 
             try:
-                user_input = self.session.prompt(
-                    get_prompt_message,
-                    bottom_toolbar=get_bottom_toolbar,
-                    completer=completer,
-                    reserve_space_for_menu=2,
-                )
+                with patch_stdout():
+                    user_input = self.session.prompt(
+                        get_prompt_message,
+                        bottom_toolbar=get_bottom_toolbar,
+                        completer=completer,
+                        reserve_space_for_menu=2,
+                    )
                 stripped = user_input.strip()
 
                 if stripped in ["?", "/help", "help"]:
@@ -281,11 +284,33 @@ class NimcodeTUI:
                     console.print(f"[bold green]{result}[/bold green]")
                     continue
 
+                elif stripped.lower().startswith("/kill"):
+                    parts = stripped.split(" ", 1)
+                    if len(parts) < 2 or not parts[1].strip():
+                        console.print("[yellow]Usage: /kill <agent_id>[/yellow]")
+                    else:
+                        aid = parts[1].strip()
+                        from nimcode.tools.swarm import ACTIVE_SUBAGENTS
+
+                        if aid in ACTIVE_SUBAGENTS:
+                            ACTIVE_SUBAGENTS[aid]["status"] = "KILLED"
+                            ACTIVE_SUBAGENTS[aid]["output"] = (
+                                "Killed by user slash command."
+                            )
+                            console.print(
+                                f"[bold green]Subagent '{aid}' has been killed.[/bold green]"
+                            )
+                        else:
+                            console.print(
+                                f"[bold red]No subagent found with ID '{aid}'.[/bold red]"
+                            )
+                    continue
+
                 elif stripped.lower() == "/model":
                     if self.config:
                         from nimcode.config import select_interactive_model
 
-                        # Note: no client in TUI context — model switch won't generate summary
+                        # Note: no client in TUI context; model switch won't generate summary
                         select_interactive_model(self.config)
                     else:
                         console.print(
@@ -326,7 +351,7 @@ class NimcodeTUI:
                     if self.config:
                         from nimcode.core.agent import run_init_command
 
-                        # client not available in TUI context — falls back to template
+                        # client not available in TUI context; falls back to template
                         run_init_command(self.config)
                     else:
                         console.print(

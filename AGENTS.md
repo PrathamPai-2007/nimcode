@@ -56,7 +56,7 @@ If you are an AI tasked with adding features or fixing bugs in `nimcode`, you **
 
 ## Slash Commands & Interactive UI (TUI)
 
-If tasked to add a new user-facing command (like `/model`, `/skills`, `/init`, `/resume`, `/yolo`, etc.):
+If tasked to add a new user-facing command (like `/model`, `/skills`, `/init`, `/resume`, `/yolo`, `/build`, `/test`, `/diff`, `/changes`, `/team`, `/compact`, `/kill`):
 1. **Intercept in TUI:** Add the detection logic inside `src/nimcode/ui/tui.py` (`get_prompt()`) so it's captured on `nimcode start` (`nimcode`). Also ensure `WordCompleter` includes the command.
 2. **Intercept in REPL:** Add the identical detection logic inside `src/nimcode/core/agent.py` (`get_user_turn()` inside `run_agent_loop`) to ensure mid-session commands are equally supported.
 3. **Dynamic State & Context Handoff:** Do *not* restart the agent loop to apply state changes. Update the references on the active `config` object in memory. When switching models mid-session (`/model`), `nimcode` automatically checks if new prompts occurred since the last switch; if so, it prompts the old model to write `summary.md` and injects it into the new model for seamless context continuity. This logic lives in `src/nimcode/config.py` (`select_interactive_model`).
@@ -95,3 +95,14 @@ Additionally, if a local `.env` is not present in the workspace, `src/nimcode/cl
 ## Default Model
 
 The default model for both `fast_model` and `plan_model` is **Nemotron 3 Nano 30B** (`nvidia/nemotron-3-nano-30b-a3b`), configured in the `Config` dataclass in `src/nimcode/config.py`. This can be overridden per-workspace via `nimcode.toml` or persisted mid-session via `/model` (saved to `~/.nimcode/<project>/model.json`).
+
+## Docker Execution Sandbox
+
+`execute_command` and `run_tests` run inside a temporary Docker container by default:
+- Image: `python:3.11-slim` (overridable via `docker_image` in `nimcode.toml` or interactively via `/config`)
+- Network: Docker **bridge** — full internet access (pip install, curl, npm etc. work)
+- Filesystem: only `workspace_root` is mounted (read-write); host filesystem not accessible
+- Resources: 512 MB RAM, 1 CPU (overridable)
+- Container is destroyed immediately after the command exits (`--rm`)
+
+If Docker is not available, nimcode falls back to direct subprocess execution and prints a warning. Set `disable_docker = true` in `nimcode.toml` or configure it via the `/config` command to always use the direct path.

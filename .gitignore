@@ -11,3 +11,5 @@ venv/
 dist/
 build/
 .nimcode/
+.pytest_cache/
+.mypy_cache/

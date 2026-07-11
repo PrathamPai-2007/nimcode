@@ -50,14 +50,24 @@ def build_system_prompt(
 
 CRITICAL: NATIVE TOOL CALLING IS DISABLED/NOT SUPPORTED BY THE ENDPOINT.
 To execute tools, you MUST format your tool calls in XML format inside your response text.
-For example, to read a file, output:
+For example:
+- To read a file:
 <tool_call name="read_file">{"path": "file.txt"}</tool_call>
 
-To write a file, output:
+- To write a file:
 <tool_call name="write_file">{"path": "file.txt", "content": "hello world"}</tool_call>
 
-To execute a command, output:
+- To execute a command:
 <tool_call name="execute_command">{"command": "python script.py"}</tool_call>
+
+- To patch a file using SEARCH/REPLACE blocks:
+<tool_call name="patch_file_blocks">{"path": "file.py", "edit_blocks": "<<<<<<< SEARCH\\ndef hello():\\n    print(\\"hi\\")\\n=======\\ndef hello():\\n    print(\\"hello world\\")\\n>>>>>>> REPLACE"}</tool_call>
+
+- To search codebase contents (grep):
+<tool_call name="search_grep">{"query": "def my_func"}</tool_call>
+
+- To search class/function symbols:
+<tool_call name="search_symbols">{"query": "MyClass"}</tool_call>
 
 Do NOT output any native OpenAI function calls. Only output the XML <tool_call> block as shown above. Only call one tool at a time.
 """

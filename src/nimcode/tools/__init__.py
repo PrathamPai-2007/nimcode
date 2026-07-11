@@ -16,13 +16,17 @@ from .base import (
     resolve_and_validate_path,
     render_preview,
     is_valid_tool_call,
+    is_docker_available,
 )
 from .swarm import (
     ACTIVE_SUBAGENTS,
     spawn_agent_logic,
     send_message_to_agent_logic,
+    kill_agent_logic,
+    list_agents_logic,
 )
 from .cmd import (
+    run_tests_tool,
     execute_test_runner,
 )
 
@@ -38,8 +42,12 @@ __all__ = [
     "resolve_and_validate_path",
     "render_preview",
     "is_valid_tool_call",
+    "is_docker_available",
     "ACTIVE_SUBAGENTS",
     "spawn_agent_logic",
     "send_message_to_agent_logic",
+    "kill_agent_logic",
+    "list_agents_logic",
+    "run_tests_tool",
     "execute_test_runner",
 ]

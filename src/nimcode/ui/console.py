@@ -1,17 +1,10 @@
-import sys
-from rich.console import Console
-from rich.panel import Panel
-from rich.text import Text
 from rich.align import Align
 from rich.columns import Columns
+from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
-console = Console()
-
-if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    if hasattr(sys.stderr, "reconfigure"):
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+from nimcode.ui.output import console, symbol
 
 
 def show_help():
@@ -51,7 +44,10 @@ def show_help():
 
     panel = Panel(table, border_style="cyan", padding=(1, 2))
     console.print(panel)
-    console.print()
+    console.print(
+        "[dim]Note: Shell commands and tests run inside a sandboxed Docker container by default.\n"
+        "To execute commands directly on the host, set 'disable_docker = true' in nimcode.toml.[/dim]\n"
+    )
 
 
 def print_welcome():
@@ -67,14 +63,17 @@ def print_welcome():
     )
     left_text.append("NVIDIA NIM Coding Agent\n", style="dim")
 
+    bullet = symbol("bullet")
     right_text = Text()
     right_text.append("\n\n")
     right_text.append(
-        "• Shift+Tab to cycle between Plan, Build & YOLO modes\n",
+        f"{bullet} Shift+Tab to cycle between Plan, Build & YOLO modes\n",
         style="dim",
     )
-    right_text.append("• To use commands and skills, use /\n", style="dim")
-    right_text.append("• Run /help or ? for a list of nimcode commands\n", style="dim")
+    right_text.append(f"{bullet} To use commands and skills, use /\n", style="dim")
+    right_text.append(
+        f"{bullet} Run /help or ? for a list of nimcode commands\n", style="dim"
+    )
 
     columns = Columns(
         [Align.center(left_text), right_text], expand=True, padding=(0, 4)

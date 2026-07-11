@@ -20,10 +20,8 @@ from nimcode.tools import (
     execute_local_tool,
 )
 from nimcode.core.state import AgentState
+from nimcode.ui.output import echo, secho, symbol
 
-if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 SESSION_DIR = "sessions"
 
@@ -77,6 +75,20 @@ def parse_xml_tool_calls(text: str) -> List[MockToolCall]:
     return tool_calls
 
 
+def clean_surrogates(val: Any) -> Any:
+    if isinstance(val, str):
+        try:
+            val = val.encode("utf-16", "surrogatepass").decode("utf-16")
+        except Exception:
+            pass
+        return "".join(c for c in val if not (0xD800 <= ord(c) <= 0xDFFF))
+    elif isinstance(val, list):
+        return [clean_surrogates(x) for x in val]
+    elif isinstance(val, dict):
+        return {k: clean_surrogates(v) for k, v in val.items()}
+    return val
+
+
 def normalize_messages(
     messages: List[Dict[str, Any]], disable_native_tools: bool = False
 ) -> List[Dict[str, Any]]:
@@ -84,6 +96,7 @@ def normalize_messages(
     Normalizes the message list to satisfy API constraints like alternating user/assistant roles.
     Merges consecutive messages of the same role (user, assistant, system) into a single message.
     """
+    messages = clean_surrogates(messages)
     if not messages:
         return []
 
@@ -122,7 +135,7 @@ def normalize_messages(
                 msg_copy.pop("tool_call_id", None)
         mapped_messages.append(msg_copy)
 
-    normalized = []
+    normalized: List[Dict[str, Any]] = []
     for msg in mapped_messages:
         if not normalized:
             normalized.append(msg)
@@ -219,12 +232,12 @@ def call_nim_with_retry(
                     or "enable-auto-tool-choice" in err_str
                 )
             ):
-                typer.secho(
+                secho(
                     "\nWarning: Native auto tool choice is not supported/configured on this server.",
                     fg=typer.colors.YELLOW,
                     bold=True,
                 )
-                typer.secho(
+                secho(
                     "Falling back to prompt-based XML tool calling...\n",
                     fg=typer.colors.YELLOW,
                 )
@@ -246,7 +259,7 @@ def call_nim_with_retry(
             if attempt == max_retries - 1:
                 raise
             wait_time = (2**attempt) * 2
-            typer.echo(
+            echo(
                 f"\nAPI error ({e}). Retrying in {wait_time}s... (Attempt {attempt + 1}/{max_retries})"
             )
             time.sleep(wait_time)
@@ -345,9 +358,7 @@ def run_init_command(
     Initializes or updates an AGENTS.md file in the workspace root.
     Scans project tech stack markers and generates/enriches AGENTS.md.
     """
-    from rich.console import Console
-
-    console = Console()
+    from nimcode.ui.output import console
 
     root = Path(workspace_root if workspace_root else config.workspace_root).resolve()
     agents_md_path = root / "AGENTS.md"
@@ -514,21 +525,22 @@ def enable_persistent_prompt(state, config, workspace_root, last_input):
             model_name = m["name"]
             break
 
-    mode_label = f"── {mode_name} "
+    hline = symbol("hline")
+    mode_label = f"{hline}{hline} {mode_name} "
     remaining_upper = term_width - len(mode_label)
-    upper_border = mode_label + ("─" * max(0, remaining_upper))
+    upper_border = mode_label + (hline * max(0, remaining_upper))
 
-    left_str = f"── ({pwd}) "
-    right_str = f" ({model_name}) ──"
+    left_str = f"{hline}{hline} ({pwd}) "
+    right_str = f" ({model_name}) {hline}{hline}"
     padding = term_width - len(left_str) - len(right_str)
     if padding < 0:
         avail = term_width - len(right_str) - 6
         if avail > 5:
-            left_str = f"── (..{pwd[-(avail - 2) :]}) "
+            left_str = f"{hline}{hline} (..{pwd[-(avail - 2) :]}) "
         else:
-            left_str = "── "
+            left_str = f"{hline}{hline} "
         padding = term_width - len(left_str) - len(right_str)
-    lower_border = left_str + ("─" * max(0, padding)) + right_str
+    lower_border = left_str + (hline * max(0, padding)) + right_str
 
     sys.stdout.write(
         f"\033[{term_height - 2};1H\033[2K{sep_class_ansi}{upper_border}\033[0m"
@@ -538,7 +550,9 @@ def enable_persistent_prompt(state, config, workspace_root, last_input):
     input_str = input_str.replace("\n", " ")
     if len(input_str) > term_width - 6:
         input_str = input_str[: term_width - 9] + "..."
-    sys.stdout.write(f"\033[{term_height - 1};1H\033[2K\033[1;36m❯ \033[0m{input_str}")
+    sys.stdout.write(
+        f"\033[{term_height - 1};1H\033[2K\033[1;36m{symbol('prompt')} \033[0m{input_str}"
+    )
     sys.stdout.write(
         f"\033[{term_height};1H\033[2K{sep_class_ansi}{lower_border}\033[0m"
     )
@@ -564,7 +578,7 @@ def print_session_history(messages: List[Dict[str, Any]]):
     if not messages:
         return
 
-    typer.secho("\n=== Resumed Session History ===", fg=typer.colors.BLUE, bold=True)
+    secho("\n=== Resumed Session History ===", fg=typer.colors.BLUE, bold=True)
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content") or ""
@@ -572,21 +586,23 @@ def print_session_history(messages: List[Dict[str, Any]]):
         if role == "system":
             continue
         elif role == "user":
-            typer.secho(f"\n❯ {content}", fg=typer.colors.CYAN, bold=True)
+            secho(f"\n{symbol('prompt')} {content}", fg=typer.colors.CYAN, bold=True)
         elif role == "assistant":
             if content.strip():
-                typer.echo(f"\n{content}")
+                echo(f"\n{content}")
             if msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
                     func = tc.get("function", {})
                     name = func.get("name", "unknown")
-                    typer.secho(f"  🔧 Tool Call: {name}", fg=typer.colors.YELLOW)
+                    secho(
+                        f"  {symbol('tool')} Tool Call: {name}", fg=typer.colors.YELLOW
+                    )
         elif role == "tool":
             snippet = content.strip().replace("\n", " ")
             if len(snippet) > 80:
                 snippet = snippet[:80] + "..."
-            typer.secho(f"  ↳ Tool Result: {snippet}", fg=typer.colors.GREEN)
-    typer.secho("===============================\n", fg=typer.colors.BLUE, bold=True)
+            secho(f"  {symbol('arrow')} Tool Result: {snippet}", fg=typer.colors.GREEN)
+    secho("===============================\n", fg=typer.colors.BLUE, bold=True)
 
 
 def run_agent_loop(
@@ -615,7 +631,7 @@ def run_agent_loop(
         import shutil
 
         shutil.move(str(legacy_session), str(session_dir / "legacy_session.json"))
-        typer.secho(
+        secho(
             f"\nMigrated legacy session to {SESSION_DIR}/legacy_session.json",
             fg=typer.colors.CYAN,
         )
@@ -625,7 +641,7 @@ def run_agent_loop(
         session_file_name = f"session_{timestamp}.json"
 
     session_path = session_dir / session_file_name
-    user_input = user_prompt
+    user_input: Optional[str] = user_prompt
 
     messages = []
     state = initial_state
@@ -678,12 +694,19 @@ def run_agent_loop(
                 "/yolo",
                 "/resume",
                 "/model",
+                "/config",
+                "/changes",
+                "/diff",
+                "/test",
+                "/team",
                 "/compact",
                 "/skills",
                 "/install-skill",
                 "/init",
                 "/quit",
                 "/exit",
+                "/kill",
+                "/restore",
             ]
             try:
                 from nimcode import skills
@@ -746,7 +769,7 @@ def run_agent_loop(
                     "prompt": "bold #00ffff",
                 }
             )
-            session = PromptSession(key_bindings=bindings, style=style)
+            session: PromptSession = PromptSession(key_bindings=bindings, style=style)
 
             def get_prompt_message():
                 import shutil
@@ -765,13 +788,16 @@ def run_agent_loop(
                     mode_name = "BUILD MODE"
                     sep_class = "class:sep-build"
 
-                mode_label = f"── {mode_name} "
+                hline = symbol("hline")
+                mode_label = f"{hline}{hline} {mode_name} "
                 remaining_width = term_width - len(mode_label)
                 if remaining_width < 0:
                     sep = mode_label[:term_width] + "\n"
                 else:
-                    sep = mode_label + ("─" * remaining_width) + "\n"
-                return FormattedText([(sep_class, sep), ("class:prompt", "❯ ")])
+                    sep = mode_label + (hline * remaining_width) + "\n"
+                return FormattedText(
+                    [(sep_class, sep), ("class:prompt", f"{symbol('prompt')} ")]
+                )
 
             def get_bottom_toolbar():
                 import shutil
@@ -801,23 +827,24 @@ def run_agent_loop(
                         model_name = m["name"]
                         break
 
-                left_str = f"── ({pwd}) "
-                right_str = f" ({model_name}) ──"
+                hline = symbol("hline")
+                left_str = f"{hline}{hline} ({pwd}) "
+                right_str = f" ({model_name}) {hline}{hline}"
 
                 padding = term_width - len(left_str) - len(right_str)
                 if padding < 0:
                     avail = term_width - len(right_str) - 6
                     if avail > 5:
-                        left_str = f"── (..{pwd[-(avail - 2) :]}) "
+                        left_str = f"{hline}{hline} (..{pwd[-(avail - 2) :]}) "
                     else:
-                        left_str = "── "
+                        left_str = f"{hline}{hline} "
                     padding = term_width - len(left_str) - len(right_str)
 
-                status_line = left_str + ("─" * max(0, padding)) + right_str
+                status_line = left_str + (hline * max(0, padding)) + right_str
                 return FormattedText([(sep_class, status_line)])
 
             disable_persistent_prompt()
-            typer.secho("\nUser Input (or 'exit' to finish task)", fg=typer.colors.CYAN)
+            secho("\nUser Input (or 'exit' to finish task)", fg=typer.colors.CYAN)
             try:
                 sys.stdout.write("\033[999B\r")
                 sys.stdout.flush()
@@ -832,7 +859,7 @@ def run_agent_loop(
                     reserve_space_for_menu=2,
                 ).strip()
             except (KeyboardInterrupt, EOFError):
-                typer.echo("\nPrompt cancelled. Exiting.")
+                echo("\nPrompt cancelled. Exiting.")
                 return None
             if not user_input:
                 continue
@@ -845,7 +872,7 @@ def run_agent_loop(
                 if cmd == "/plan":
                     state = AgentState.AWAITING_PLAN_APPROVAL
                     config.mode = "plan"
-                    typer.secho(
+                    secho(
                         "\nSwitched to Plan Mode (AWAITING_PLAN_APPROVAL). Tools disabled until plan is approved.\n",
                         fg=typer.colors.CYAN,
                         bold=True,
@@ -853,7 +880,7 @@ def run_agent_loop(
                 elif cmd == "/build":
                     state = AgentState.EXECUTING
                     config.mode = "build"
-                    typer.secho(
+                    secho(
                         "\nSwitched to Build Mode (EXECUTING with human-in-the-loop approval).\n",
                         fg=typer.colors.GREEN,
                         bold=True,
@@ -861,7 +888,7 @@ def run_agent_loop(
                 elif cmd == "/yolo":
                     state = AgentState.YOLO
                     config.mode = "yolo"
-                    typer.secho(
+                    secho(
                         "\nSwitched to YOLO Mode (EXECUTING with auto-approval of edits and commands).\n",
                         fg=typer.colors.RED,
                         bold=True,
@@ -883,6 +910,15 @@ def run_agent_loop(
                     else Path(".").resolve()
                 )
                 continue
+            elif user_input.strip().lower() == "/restore":
+                from nimcode.config import restore_interactive_backup
+
+                restore_interactive_backup(
+                    Path(workspace_root).resolve()
+                    if workspace_root
+                    else Path(".").resolve()
+                )
+                continue
             elif user_input.strip().lower() == "/config":
                 from nimcode.config import configure_interactive
 
@@ -898,13 +934,13 @@ def run_agent_loop(
                     if workspace_root
                     else Path(".").resolve()
                 )
-                typer.secho(
+                secho(
                     "\nRunning test suite inside validation sandbox...",
                     fg=typer.colors.CYAN,
                     bold=True,
                 )
                 res = execute_test_runner(root_path, config, test_cmd)
-                typer.secho(
+                secho(
                     f"\n--- Test Runner Results ---\n{res}\n---------------------------",
                     fg=typer.colors.CYAN,
                 )
@@ -913,19 +949,17 @@ def run_agent_loop(
                 from nimcode.tools import ACTIVE_SUBAGENTS
 
                 if not ACTIVE_SUBAGENTS:
-                    typer.secho(
+                    secho(
                         "No subagents spawned yet. Use `spawn_agent` tool or ask nimcode to delegate tasks.",
                         fg=typer.colors.YELLOW,
                     )
                 else:
-                    typer.secho(
+                    secho(
                         "\nActive Subagent Swarm Team:", fg=typer.colors.CYAN, bold=True
                     )
                     for aid, sub in ACTIVE_SUBAGENTS.items():
-                        typer.echo(
-                            f"  [{aid}] Role: {sub['role']} | Status: {sub['status']}"
-                        )
-                        typer.echo(
+                        echo(f"  [{aid}] Role: {sub['role']} | Status: {sub['status']}")
+                        echo(
                             f"       Summary: {sub['output'][:120]}...\n"
                             if len(sub["output"]) > 120
                             else f"       Summary: {sub['output']}\n"
@@ -933,11 +967,32 @@ def run_agent_loop(
                 continue
             if user_input.startswith("/install-skill "):
                 url = user_input.split(" ", 1)[1].strip()
-                typer.secho(f"Installing skill from {url}...", fg=typer.colors.CYAN)
+                secho(f"Installing skill from {url}...", fg=typer.colors.CYAN)
                 from nimcode import skills
 
                 result = skills.install_skill(url)
-                typer.secho(result, fg=typer.colors.GREEN, bold=True)
+                secho(result, fg=typer.colors.GREEN, bold=True)
+                continue
+            elif user_input.strip().lower().startswith("/kill"):
+                parts = user_input.strip().split(" ", 1)
+                if len(parts) < 2 or not parts[1].strip():
+                    secho("Usage: /kill <agent_id>", fg=typer.colors.YELLOW)
+                else:
+                    aid = parts[1].strip()
+                    from nimcode.tools.swarm import ACTIVE_SUBAGENTS
+
+                    if aid in ACTIVE_SUBAGENTS:
+                        ACTIVE_SUBAGENTS[aid]["status"] = "KILLED"
+                        ACTIVE_SUBAGENTS[aid]["output"] = (
+                            "Killed by user slash command."
+                        )
+                        secho(
+                            f"Subagent '{aid}' has been killed.", fg=typer.colors.GREEN
+                        )
+                    else:
+                        secho(
+                            f"No subagent found with ID '{aid}'.", fg=typer.colors.RED
+                        )
                 continue
             elif user_input.lower() == "/model":
                 from nimcode.config import select_interactive_model
@@ -950,11 +1005,11 @@ def run_agent_loop(
                     session_path=session_path,
                 )
                 continue
-            elif user_input.lower() == "/compact":
+            elif user_input.strip().lower() == "/compact":
                 from nimcode.config import generate_summary_with_progress
-                from rich.console import Console
+                from nimcode.ui.output import console
 
-                _con = Console()
+                _con = console
                 user_messages = [m for m in messages if m.get("role") == "user"]
                 if len(user_messages) < 2:
                     _con.print(
@@ -969,7 +1024,7 @@ def run_agent_loop(
                     )
                     est_tokens = total_chars // 4
                     _con.print(
-                        f"[bold cyan]⚡ /compact[/bold cyan] — Current history: [bold]{len(messages)}[/bold] messages (~[bold]{est_tokens:,}[/bold] tokens).\n"
+                        f"[bold cyan][compact] /compact[/bold cyan] Current history: [bold]{len(messages)}[/bold] messages (~[bold]{est_tokens:,}[/bold] tokens).\n"
                         f"This will ask the model to summarise the conversation, then [bold red]erase[/bold red] the full history\n"
                         f"and replace it with the summary to free up context space.\n"
                     )
@@ -1025,11 +1080,11 @@ def run_agent_loop(
                             )
                             after_tokens = after_chars // 4
                             _con.print(
-                                f"[bold green]✅ Compacted.[/bold green] History now: [bold]{len(messages)}[/bold] messages (~[bold]{after_tokens:,}[/bold] tokens).\n"
+                                f"[bold green][OK] Compacted.[/bold green] History now: [bold]{len(messages)}[/bold] messages (~[bold]{after_tokens:,}[/bold] tokens).\n"
                             )
                         else:
                             _con.print(
-                                "[red]Compaction failed — history has not been modified.[/red]\n"
+                                "[red]Compaction failed; history has not been modified.[/red]\n"
                             )
 
                 continue
@@ -1038,11 +1093,11 @@ def run_agent_loop(
 
                 skill_list = skills.list_skills()
                 if not skill_list:
-                    typer.secho("No skills installed yet.", fg=typer.colors.CYAN)
+                    secho("No skills installed yet.", fg=typer.colors.CYAN)
                 else:
-                    typer.secho("\nInstalled Skills:", fg=typer.colors.CYAN, bold=True)
+                    secho("\nInstalled Skills:", fg=typer.colors.CYAN, bold=True)
                     for s in skill_list:
-                        typer.echo(f"  /{s}")
+                        echo(f"  /{s}")
                 continue
             elif user_input.lower() == "/init":
                 run_init_command(config, client=client, workspace_root=workspace_root)
@@ -1057,7 +1112,7 @@ def run_agent_loop(
                             existing_msgs = json.load(f)
                         messages[:] = existing_msgs
                         session_path = selected_session
-                        typer.secho(
+                        secho(
                             f"\nResumed session: {selected_session.name}",
                             fg=typer.colors.GREEN,
                             bold=True,
@@ -1066,17 +1121,24 @@ def run_agent_loop(
 
                         if messages:
                             last_msg = messages[-1]
-                            if last_msg.get("role") in ("user", "tool") or (
-                                last_msg.get("role") == "assistant"
-                                and last_msg.get("tool_calls")
-                            ):
+                            if last_msg.get("role") == "assistant" and last_msg.get("tool_calls"):
+                                for tc in last_msg["tool_calls"]:
+                                    dummy_res = {
+                                        "role": "tool",
+                                        "tool_call_id": tc.get("id"),
+                                        "content": "Execution aborted due to session suspension."
+                                    }
+                                    messages.append(dummy_res)
+                                    log_turn(dummy_res, session_path)
+                                return "__RESUME_AI_LOOP__"
+                            elif last_msg.get("role") in ("user", "tool"):
                                 return "__RESUME_AI_LOOP__"
                     except Exception as e:
-                        typer.secho(f"Error loading session: {e}", fg=typer.colors.RED)
+                        secho(f"Error loading session: {e}", fg=typer.colors.RED)
                 continue
             elif (
                 user_input.startswith("/")
-                and user_input.lower()
+                and user_input.strip().lower().split()[0]
                 not in [
                     "/exit",
                     "/quit",
@@ -1091,9 +1153,10 @@ def run_agent_loop(
                     "/skills",
                     "/init",
                     "/resume",
+                    "/kill",
                     "?",
                 ]
-                and not user_input.lower().startswith("/install-skill")
+                and not user_input.strip().lower().startswith("/install-skill")
             ):
                 from nimcode import skills
 
@@ -1103,13 +1166,13 @@ def run_agent_loop(
                 if skill_name in installed:
                     content = skills.get_skill_content(skill_name)
                     rest_of_prompt = parts[1] if len(parts) > 1 else ""
-                    typer.secho(
+                    secho(
                         f"Injecting context from skill: {skill_name}...",
                         fg=typer.colors.CYAN,
                     )
                     return f"<skill_context>\n{content}\n</skill_context>\n\n{rest_of_prompt}"
                 else:
-                    typer.secho(
+                    secho(
                         f"Unknown command: {user_input.split()[0]}. Type /help or ? for available commands.",
                         fg=typer.colors.YELLOW,
                     )
@@ -1131,7 +1194,7 @@ def run_agent_loop(
                     "q",
                     "done",
                 ]:
-                    typer.secho(
+                    secho(
                         "\nTask completed. Exiting nimcode session.",
                         fg=typer.colors.GREEN,
                         bold=True,
@@ -1198,6 +1261,11 @@ def run_agent_loop(
                         if session_path:
                             log_turn(messages[last_user_idx], session_path)
                     else:
+                        if messages and messages[-1].get("role") == "tool":
+                            dummy_ack = {"role": "assistant", "content": "Context handoff."}
+                            messages.append(dummy_ack)
+                            if session_path:
+                                log_turn(dummy_ack, session_path)
                         inj_msg = {
                             "role": "user",
                             "content": handoff_block
@@ -1206,7 +1274,7 @@ def run_agent_loop(
                         messages.append(inj_msg)
                         if session_path:
                             log_turn(inj_msg, session_path)
-                    typer.secho(
+                    secho(
                         f"\nInjected summary.md context into prompt for {current_model}.",
                         fg=typer.colors.CYAN,
                         bold=True,
@@ -1216,14 +1284,13 @@ def run_agent_loop(
             try:
                 import sys
                 import rich.spinner
-                from rich.console import Console
+                from nimcode.ui.output import console
 
                 rich.spinner.SPINNERS["working_dots"] = {
                     "interval": 300,
                     "frames": ["working", "working.", "working..", "working..."],
                 }
-
-                c = Console()
+                c = console
                 import shutil
 
                 term_height = shutil.get_terminal_size().lines
@@ -1243,7 +1310,7 @@ def run_agent_loop(
                     sys.stdout.flush()
 
             except Exception as e:
-                typer.secho(f"\nFatal API error: {e}", fg=typer.colors.RED, bold=True)
+                secho(f"\nFatal API error: {e}", fg=typer.colors.RED, bold=True)
                 break
 
             raw_message = response.choices[0].message
@@ -1254,7 +1321,7 @@ def run_agent_loop(
                 raw_message = MockMessage(cleaned_content, xml_calls)
 
             # Build serializable message for history
-            msg_dict = {"role": "assistant", "content": cleaned_content}
+            msg_dict: Dict[str, Any] = {"role": "assistant", "content": cleaned_content}
             if raw_message.tool_calls:
                 msg_dict["tool_calls"] = [
                     {
@@ -1274,25 +1341,25 @@ def run_agent_loop(
             if state == AgentState.AWAITING_PLAN_APPROVAL:
                 plan_text = extract_plan_block(cleaned_content)
                 if not plan_text:
-                    typer.secho(
+                    secho(
                         "\n--- Proposed Architectural Plan ---",
                         fg=typer.colors.BLUE,
                         bold=True,
                     )
-                    typer.echo(cleaned_content)
-                    typer.secho(
+                    echo(cleaned_content)
+                    secho(
                         "-----------------------------------",
                         fg=typer.colors.BLUE,
                         bold=True,
                     )
                 else:
-                    typer.secho(
+                    secho(
                         "\n--- Proposed Architectural Plan (<plan>) ---",
                         fg=typer.colors.BLUE,
                         bold=True,
                     )
-                    typer.echo(plan_text)
-                    typer.secho(
+                    echo(plan_text)
+                    secho(
                         "--------------------------------------------",
                         fg=typer.colors.BLUE,
                         bold=True,
@@ -1306,13 +1373,13 @@ def run_agent_loop(
                     .lower()
                 )
                 if approval == "q":
-                    typer.echo("Exiting nimcode session.")
+                    echo("Exiting nimcode session.")
                     break
                 elif approval == "yolo":
                     state = AgentState.YOLO
                     config.mode = "yolo"
                     current_model = config.fast_model
-                    typer.secho(
+                    secho(
                         f"\nPlan approved! Switching to {state} state (Auto-approval enabled) with fast model: {current_model}\n",
                         fg=typer.colors.RED,
                         bold=True,
@@ -1339,7 +1406,7 @@ def run_agent_loop(
                 state = AgentState.EXECUTING
                 config.mode = "build"
                 current_model = config.fast_model
-                typer.secho(
+                secho(
                     f"\nPlan approved! Switching to {state} state with fast model: {current_model}\n",
                     fg=typer.colors.GREEN,
                     bold=True,
@@ -1356,7 +1423,7 @@ def run_agent_loop(
             # State 2: EXECUTING
             if not raw_message.tool_calls:
                 if cleaned_content:
-                    typer.echo(f"\n{cleaned_content}")
+                    echo(f"\n{cleaned_content}")
 
                 user_input = get_user_turn()
                 if user_input is None or user_input.lower() in [
@@ -1367,7 +1434,7 @@ def run_agent_loop(
                     "q",
                     "done",
                 ]:
-                    typer.secho(
+                    secho(
                         "\nTask completed. Exiting nimcode session.",
                         fg=typer.colors.GREEN,
                         bold=True,
@@ -1384,19 +1451,31 @@ def run_agent_loop(
                 loop_count = 0  # Reset loop counter on human input turn
                 continue
 
-            if loop_count >= config.max_loop_iterations:
-                typer.secho(
-                    f"\nWarning: Max consecutive loop iterations ({config.max_loop_iterations}) reached without human check-in. Stopping runaway execution.",
+            # If in YOLO mode, allow up to 50 steps before checking in, otherwise use config limit
+            loop_limit = 50 if state == AgentState.YOLO else config.max_loop_iterations
+            if loop_count >= loop_limit:
+                secho(
+                    f"\nWarning: Max consecutive loop iterations ({loop_limit}) reached without human check-in. Stopping runaway execution.",
                     fg=typer.colors.YELLOW,
                     bold=True,
                 )
                 user_input = (
-                    prompt_user("Resume loop? (y to continue / q to quit)")
+                    prompt_user("Resume loop? (y to continue / enter feedback to redirect / q to quit)")
                     .strip()
-                    .lower()
                 )
-                if user_input != "y":
+                if user_input.lower() == "q":
                     break
+                elif user_input.lower() != "y":
+                    for tc in raw_message.tool_calls:
+                        cancel_msg = {
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": f"Execution cancelled by user. Feedback: {user_input}"
+                        }
+                        messages.append(cancel_msg)
+                        log_turn(cancel_msg, session_path)
+                    loop_count = 0
+                    continue
                 loop_count = 0
 
             loop_count += 1
@@ -1414,13 +1493,13 @@ def run_agent_loop(
                         "Please re-issue the tool call with valid JSON arguments matching the tool schema. "
                         "Do NOT wrap JSON in markdown code fences."
                     )
-                    typer.secho(f"\nWarning: {result}", fg=typer.colors.RED)
+                    secho(f"\nWarning: {result}", fg=typer.colors.RED)
                 else:
                     preview = render_preview(tool_name, args, workspace_root)
-                    typer.echo(preview)
+                    echo(preview)
 
                     if state == AgentState.YOLO:
-                        typer.secho(
+                        secho(
                             f"[YOLO Mode] Auto-approving execution of {tool_name}...",
                             fg=typer.colors.RED,
                             bold=True,
@@ -1435,7 +1514,7 @@ def run_agent_loop(
                             .lower()
                         )
                     if approval == "q":
-                        typer.echo("Exiting nimcode session.")
+                        echo("Exiting nimcode session.")
                         disable_persistent_prompt()
                         atexit.unregister(disable_persistent_prompt)
                         return
@@ -1443,16 +1522,38 @@ def run_agent_loop(
                         result = execute_local_tool(
                             tool_name, args, workspace_root, config
                         )
-                        typer.secho(
+                        secho(
                             f"--- Output ({len(result)} chars) ---\n{result}\n-----------------------------",
                             fg=typer.colors.CYAN,
                         )
+                        if state == AgentState.YOLO and tool_name in [
+                            "write_file",
+                            "patch_file_ast",
+                            "patch_file_blocks",
+                        ]:
+                            from nimcode.tools import execute_test_runner
+
+                            secho(
+                                "\n[YOLO Mode] Code changed. Auto-running test suite for verification...",
+                                fg=typer.colors.RED,
+                                bold=True,
+                            )
+                            test_res = execute_test_runner(workspace_root, config)
+                            secho(
+                                f"--- Test Results ---\n{test_res}\n--------------------",
+                                fg=typer.colors.CYAN,
+                            )
+                            if (
+                                "[exit code: 0]" not in test_res
+                                and "exit code: 0" not in test_res
+                            ):
+                                result += f"\n\n[CRITICAL WARNING: Auto-run tests failed! Please fix this immediately]\n{test_res}"
                     else:
                         feedback = prompt_user(
                             "Execution rejected. Enter feedback/reason (or leave blank for 'Rejected by user')"
                         ).strip()
                         result = feedback if feedback else "Rejected by user."
-                        typer.secho("Execution rejected.", fg=typer.colors.YELLOW)
+                        secho("Execution rejected.", fg=typer.colors.YELLOW)
 
                 tool_result_msg = {
                     "role": "tool",
@@ -1465,11 +1566,16 @@ def run_agent_loop(
             messages = prune_history(messages, config.context_budget_tokens)
 
         except KeyboardInterrupt:
-            typer.secho(
+            secho(
                 "\n\n[Stopped by ESC/Interrupt] Stopped working on current prompt. Standing by for next prompt...\n",
                 fg=typer.colors.YELLOW,
                 bold=True,
             )
+            if messages and messages[-1].get("role") == "tool":
+                dummy_ack = {"role": "assistant", "content": "Tool execution interrupted."}
+                messages.append(dummy_ack)
+                log_turn(dummy_ack, session_path)
+
             user_msg = {
                 "role": "user",
                 "content": "[Operation interrupted and cancelled by user via ESC/Ctrl+C. Standing by for new instructions.]",
@@ -1487,7 +1593,7 @@ def run_agent_loop(
                 "q",
                 "done",
             ]:
-                typer.secho(
+                secho(
                     "\nTask completed. Exiting nimcode session.",
                     fg=typer.colors.GREEN,
                     bold=True,

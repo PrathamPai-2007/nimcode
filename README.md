@@ -12,6 +12,9 @@ It wraps a continuous Read-Eval-Print Loop (REPL) around a multi-model LLM archi
     *   **Build Mode (`/build`):** Human-in-the-loop execution. Every tool call displays a unified diff or command preview before prompting for `y/n` approval.
     *   **YOLO Mode (`/yolo` / `--yolo`):** High-speed autonomous execution. Displays full terminal previews for every action but automatically accepts tool calls without pausing for human input.
 *   **Instant Mode & Model Switching:** Press `Shift+Tab` to cycle between Plan, Build, and YOLO modes directly from the prompt. Type `/model` to instantly swap NVIDIA NIM models mid-conversation—Nimcode automatically handles the context handoff via `summary.md`.
+*   **Sub-Agent Swarms:** Spawn background AI agents using the `/team` command and `spawn_agent` tools. Delegate complex sub-tasks to specialized subagents running in parallel.
+*   **Extensible Skills System:** Install and manage dynamic capabilities on the fly using `/skills` and `/install-skill`.
+*   **Built-in Testing & Review:** Use `/test` to instantly trigger your test suite inside the sandbox, or `/diff` and `/changes` to review uncommitted edits.
 *   **Consolidated Workspace Architecture:** All system files, session histories, backups, and handoff summaries are stored securely inside `~/.nimcode/<project-name>/`, keeping your workspace root pristine.
 *   **Live Agent Rules:** Use the `/init` command to automatically construct a robust `AGENTS.md` file. Nimcode injects these rules live on every turn, meaning updates apply immediately without restarting your session.
 *   **Auto-Backups & Session Recovery:** Overwritten files are automatically snapshotted to `~/.nimcode/<project-name>/backups/`. Use `/resume` or `nimcode resume` to instantly reload and continue past conversations.
@@ -51,8 +54,10 @@ It wraps a continuous Read-Eval-Print Loop (REPL) around a multi-model LLM archi
 | `max_loop_iterations`  | `10`                            | Safety cap on consecutive AI steps per turn          |
 | `output_cap`           | `2000`                          | Max characters returned from any single tool output  |
 | `auto_backup`          | `true`                          | Snapshot files before overwriting them               |
+| `disable_docker`       | `false`                         | Toggle to disable Docker command sandboxing          |
+| `docker_image`         | `python:3.11-slim`              | Docker image used for sandboxed command runs         |
 
-You can switch models at any time mid-session with the `/model` command — no need to edit the config file.
+You can switch models or modify runtime configuration settings at any time mid-session with the `/model` and `/config` commands.
 
 ## Usage
 
@@ -91,6 +96,16 @@ nimcode resume --latest
 Initialize or update the `AGENTS.md` rules file for the current workspace:
 ```bash
 nimcode init
+```
+
+Check the status of active subagents:
+```bash
+/team
+```
+
+List available skills:
+```bash
+/skills
 ```
 
 ## Project Structure
@@ -137,3 +152,5 @@ The `/model` command lets you switch between any of these NVIDIA NIM-hosted mode
 | 6 | Nemotron 3 Nano 30B     | `nvidia/nemotron-3-nano-30b-a3b` *(default)*   |
 | 7 | Nemotron 3 Super 120B   | `nvidia/nemotron-3-super-120b-a12b`            |
 | 8 | Nemotron 3 Ultra 550B   | `nvidia/nemotron-3-ultra-550b-a55b`            |
+| 9 | MiniMax-M3              | `minimaxai/minimax-m3`                         |
+| 10| GLM-5.2                 | `z-ai/glm-5.2`                                 |

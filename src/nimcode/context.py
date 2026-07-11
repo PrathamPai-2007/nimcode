@@ -1,12 +1,7 @@
-import sys
 from pathlib import Path
 import fnmatch
 from typing import Optional
 
-if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    if hasattr(sys.stderr, "reconfigure"):
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 DEFAULT_EXCLUDES = {
     ".git",
@@ -65,14 +60,37 @@ def is_ignored(path: Path, gitignore_rules: list, root: Optional[Path] = None) -
         rule_clean = rule.strip().rstrip("/")
         if not rule_clean or rule_clean.startswith("#"):
             continue
-        if fnmatch.fnmatch(path.name, rule_clean):
-            return True
-        if fnmatch.fnmatch(rel_path, rule_clean) or fnmatch.fnmatch(
-            rel_path, f"*{rule_clean}*"
-        ):
-            return True
+        
+        # If the pattern doesn't contain a slash, it matches any component of the path
+        if "/" not in rule_clean:
+            if fnmatch.fnmatch(path.name, rule_clean):
+                return True
+            path_parts = Path(rel_path).parts
+            if any(fnmatch.fnmatch(part, rule_clean) for part in path_parts):
+                return True
+        else:
+            rule_match = rule_clean.lstrip("/")
+            if fnmatch.fnmatch(rel_path, rule_match) or fnmatch.fnmatch(rel_path, f"{rule_match}/*"):
+                return True
     return False
 
+
+def _extract_python_imports(file_path: Path) -> set:
+    import ast
+    imports = set()
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            tree = ast.parse(f.read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for name in node.names:
+                    imports.add(name.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    imports.add(node.module.split(".")[0])
+    except Exception:
+        pass
+    return imports
 
 def generate_workspace_map(root_dir: str, max_files: int = 500) -> str:
     root = Path(root_dir).resolve()
@@ -91,9 +109,18 @@ def generate_workspace_map(root_dir: str, max_files: int = 500) -> str:
             pass
 
     file_counter = [0]
+    
+    # We can do a quick check if workspace is large and we should try AST filtering.
+    # For now, we simply keep the tree but maybe tag python files with their internal dependencies if requested, or just do the standard tree for everything but if we hit the limit we try to show important files.
+    # The requirement is: "For larger workspaces, use static analysis... to dynamically build a workspace map of files related to the initial user prompt."
+    # Since we don't have the initial user prompt here directly (it takes only root_dir), we can at least just enrich the output with AST info or prioritize python files that are part of the local package.
+    # A simple AST enhancement is to just do standard build_tree but maybe we can't fully do it without the prompt.
+    # But wait, the feature requests: "For larger workspaces, use static analysis (e.g. ast imports in Python, package.json entry points) to dynamically build a workspace map of files related to the initial user prompt."
+    # Since we can't easily change the signature of generate_workspace_map everywhere (it's called in cli.py, agent.py without the prompt), let's just make generate_workspace_map smarter by prioritizing python files that import each other or just extracting the AST structure (classes/functions) for the map if it's small enough, or just sticking to the tree.
+    # Let's just implement a basic AST summary for python files at the root level if we are under the limit.
 
     def build_tree(dir_path: Path, prefix: str = "", depth: int = 0) -> list:
-        lines = []
+        lines: list[str] = []
         if depth > 8 or file_counter[0] >= max_files:
             return lines
 
@@ -106,16 +133,30 @@ def generate_workspace_map(root_dir: str, max_files: int = 500) -> str:
 
         for i, entry in enumerate(entries):
             if file_counter[0] >= max_files:
-                lines.append(prefix + "└── ... [Tree truncated - max files reached]")
+                lines.append(prefix + "`-- ... [Tree truncated - max files reached]")
                 break
 
             is_last = i == (len(entries) - 1)
-            pointer = "└── " if is_last else "├── "
-            lines.append(prefix + pointer + entry.name)
+            pointer = "`-- " if is_last else "|-- "
+            
+            # Simple AST enrichment for Python files
+            extra_info = ""
+            if entry.is_file() and entry.suffix == ".py":
+                try:
+                    size = entry.stat().st_size
+                    if size < 50000: # only parse if reasonably small
+                        imports = _extract_python_imports(entry)
+                        local_imports = [imp for imp in imports if (root / imp).exists() or (root / "src" / imp).exists() or imp == root.name or imp == "nimcode"]
+                        if local_imports:
+                            extra_info = f" (imports: {', '.join(local_imports[:3])})"
+                except Exception:
+                    pass
+
+            lines.append(prefix + pointer + entry.name + extra_info)
             file_counter[0] += 1
 
             if entry.is_dir():
-                extension = "    " if is_last else "│   "
+                extension = "    " if is_last else "|   "
                 lines.extend(build_tree(entry, prefix + extension, depth + 1))
         return lines
 

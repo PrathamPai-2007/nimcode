@@ -14,13 +14,27 @@ if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
 def get_project_nimcode_dir(workspace_root: Any) -> Path:
     """
     Returns the centralized global project directory:
-    ~/.nimcode/<project-folder-name>/
-    Also handles one-time automatic migration from local .nimcode/ if present.
+    ~/.nimcode/<project-folder-name>_<path-hash>/
+    Also handles one-time automatic migration from legacy global and local .nimcode/ if present.
     """
     if not isinstance(workspace_root, Path):
         workspace_root = Path(str(workspace_root))
     resolved = workspace_root.resolve()
-    project_dir = Path.home() / ".nimcode" / resolved.name
+
+    import hashlib
+    path_hash = hashlib.md5(str(resolved).encode("utf-8")).hexdigest()[:8]
+    project_dir = Path.home() / ".nimcode" / f"{resolved.name}_{path_hash}"
+
+    # One-time migration from legacy un-hashed global directory if it exists
+    legacy_global = Path.home() / ".nimcode" / resolved.name
+    if legacy_global.exists() and legacy_global.is_dir() and legacy_global != project_dir:
+        import shutil
+        try:
+            shutil.copytree(legacy_global, project_dir, dirs_exist_ok=True)
+            shutil.rmtree(legacy_global, ignore_errors=True)
+        except Exception:
+            pass
+
     project_dir.mkdir(parents=True, exist_ok=True)
 
     # Migrate local .nimcode/ if it exists inside workspace_root
@@ -47,14 +61,20 @@ class Config:
     max_loop_iterations: int = 10
     workspace_root: str = "."
     timeout: int = 60
-    output_cap: int = 2000
-    context_budget_tokens: int = 16000
+    output_cap: int = 100000
+    context_budget_tokens: int = 128000
     auto_backup: bool = True
     denylist: List[str] = field(default_factory=list)
     pending_summary_injection: bool = False
     pending_summary_old_model: str = ""
     pending_summary_new_model: str = ""
     disable_native_tools: bool = False
+    # Docker sandbox configuration
+    docker_image: str = "python:3.11-slim"
+    docker_expose_ports: List[int] = field(default_factory=list)
+    docker_extra_args: List[str] = field(default_factory=list)
+    disable_docker: bool = False
+    api_base_url: Optional[str] = None
 
 
 def save_last_used_model(
@@ -70,9 +90,15 @@ def save_last_used_model(
         nimcode_dir = get_project_nimcode_dir(root)
         model_file = nimcode_dir / "model.json"
         data = {
+            "model": model_id,
             "fast_model": model_id,
             "plan_model": model_id,
             "updated_at": time.time(),
+            "timestamp": time.time(),
+            "docker_image": config.docker_image,
+            "docker_expose_ports": config.docker_expose_ports,
+            "docker_extra_args": config.docker_extra_args,
+            "disable_docker": config.disable_docker,
         }
         with open(model_file, "w", encoding="utf-8") as mf:
             json.dump(data, mf, indent=2)
@@ -80,13 +106,42 @@ def save_last_used_model(
         pass
 
 
-def load_config(path: Optional[str] = None) -> Config:
+def load_last_used_model(
+    workspace_root: Optional[Path] = None,
+) -> Optional[dict]:
     import json
 
-    if not path:
-        path = "nimcode.toml"
+    try:
+        root = workspace_root if workspace_root else Path.cwd().resolve()
+        nimcode_dir = get_project_nimcode_dir(root)
+        model_file = nimcode_dir / "model.json"
+        if model_file.exists():
+            with open(model_file, "r", encoding="utf-8") as mf:
+                return json.load(mf)
+    except Exception:
+        pass
+    return None
 
-    config_path = Path(path)
+
+def save_config(config: Config, workspace_root: Optional[Path] = None):
+    save_last_used_model(config, config.fast_model, workspace_root)
+
+
+def load_config(path: Optional[Any] = None) -> Config:
+    import json
+
+    if path is not None:
+        p = Path(path)
+        if p.is_dir():
+            config_path = p / "nimcode.toml"
+            workspace_root = p
+        else:
+            config_path = p
+            workspace_root = p.parent
+    else:
+        config_path = Path("nimcode.toml")
+        workspace_root = Path.cwd()
+
     if not config_path.exists():
         cfg = Config()
     else:
@@ -94,12 +149,11 @@ def load_config(path: Optional[str] = None) -> Config:
             data = tomli.load(f)
         cfg = Config(**data)
 
+    cfg.workspace_root = str(workspace_root.resolve())
+
     # Check if a persisted model exists for this project in .nimcode/model.json
     try:
-        root = Path(cfg.workspace_root).resolve()
-        model_json_path = get_project_nimcode_dir(root) / "model.json"
-        if not model_json_path.exists():
-            model_json_path = root / ".nimcode" / "model.json"
+        model_json_path = get_project_nimcode_dir(workspace_root) / "model.json"
         if model_json_path.exists():
             with open(model_json_path, "r", encoding="utf-8") as mf:
                 mdata = json.load(mf)
@@ -107,6 +161,17 @@ def load_config(path: Optional[str] = None) -> Config:
                     cfg.fast_model = mdata["fast_model"]
                 if "plan_model" in mdata and mdata["plan_model"]:
                     cfg.plan_model = mdata["plan_model"]
+                if "model" in mdata and mdata["model"]:
+                    cfg.fast_model = mdata["model"]
+                    cfg.plan_model = mdata["model"]
+                if "docker_image" in mdata:
+                    cfg.docker_image = mdata["docker_image"]
+                if "docker_expose_ports" in mdata:
+                    cfg.docker_expose_ports = mdata["docker_expose_ports"]
+                if "docker_extra_args" in mdata:
+                    cfg.docker_extra_args = mdata["docker_extra_args"]
+                if "disable_docker" in mdata:
+                    cfg.disable_docker = mdata["disable_docker"]
     except Exception:
         pass
 
@@ -171,6 +236,111 @@ def show_changes(workspace_root: Path):
     console.print()
 
 
+def restore_interactive_backup(workspace_root: Path):
+    from rich.console import Console
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout.containers import Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.layout.layout import Layout
+    import typer
+    import shutil
+    import time
+
+    console = Console()
+    root = workspace_root.resolve()
+    nimcode_dir = get_project_nimcode_dir(root)
+    backup_dir = nimcode_dir / "backups"
+
+    if not backup_dir.exists() or not any(backup_dir.iterdir()):
+        console.print("[yellow]No backups found in .nimcode/backups/.[/yellow]\n")
+        return
+
+    backups = sorted(
+        [f for f in backup_dir.iterdir() if f.is_file()],
+        key=lambda x: x.stat().st_mtime,
+        reverse=True,
+    )
+
+    current_index = 0
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _(event):
+        nonlocal current_index
+        current_index = max(0, current_index - 1)
+
+    @kb.add("down")
+    def _(event):
+        nonlocal current_index
+        current_index = min(len(backups) - 1, current_index + 1)
+
+    @kb.add("enter")
+    def _(event):
+        event.app.exit(result=backups[current_index])
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _(event):
+        event.app.exit(result=None)
+
+    def get_text():
+        lines = [("bold", "Select a Backup to Restore\n\n")]
+        for i, b in enumerate(backups):
+            parts = b.name.split("_", 1)
+            ts_str = (
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(parts[0])))
+                if parts[0].isdigit()
+                else "Unknown Time"
+            )
+            original_name = parts[1] if len(parts) > 1 else b.name
+
+            if i == current_index:
+                prefix = "> "
+                style = "bold #00ffff"
+            else:
+                prefix = "  "
+                style = ""
+            lines.append((style, f"{prefix}[{ts_str}] {original_name}\n"))
+        lines.append(("", "\nKeyboard: ↑/↓ Navigate  enter Select  esc Cancel\n"))
+        return lines
+
+    layout = Layout(Window(content=FormattedTextControl(text=get_text)))
+    app: Application = Application(layout=layout, key_bindings=kb, erase_when_done=True)
+
+    selected_backup = app.run()
+    if not selected_backup:
+        return
+
+    parts = selected_backup.name.split("_", 1)
+    guess_name = parts[1] if len(parts) > 1 else selected_backup.name
+    if guess_name.startswith("blocks_"):
+        guess_name = guess_name[len("blocks_"):]
+    
+    # Simple guess for the original path by replacing first few underscores if it's deeply nested
+    # Alternatively we just provide it as the default directly, or replace _ with /
+    # For now, let's just guess by replacing all _ with / and stripping .py (wait, no stripping)
+    guess_path = guess_name.replace("_", "/")
+    
+    # Try to see if there's a file matching the exact guess_name just in case it didn't have /
+    if (root / guess_name).exists():
+        guess_path = guess_name
+
+    target_rel = typer.prompt("Enter target path to restore to (relative to workspace)", default=guess_path)
+    target_path = (root / target_rel).resolve()
+
+    if not str(target_path).startswith(str(root)):
+        console.print("[red]Error: Target path is outside workspace.[/red]\n")
+        return
+
+    try:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(selected_backup, target_path)
+        console.print(f"[bold green]Successfully restored backup to {target_rel}[/bold green]\n")
+    except Exception as e:
+        console.print(f"[bold red]Failed to restore backup: {e}[/bold red]\n")
+
+
 def configure_interactive(config: Config):
     from rich.console import Console
     from rich.table import Table
@@ -212,11 +382,21 @@ def configure_interactive(config: Config):
         str(config.temperature_plan),
         "Temperature for plan model generation",
     )
+    table.add_row(
+        "7. disable_docker",
+        str(config.disable_docker),
+        "Disable Docker and always execute shell commands on host",
+    )
+    table.add_row(
+        "8. docker_image",
+        str(config.docker_image),
+        "Docker image to use for command sandboxing",
+    )
 
     console.print(table)
     choice = (
         typer.prompt(
-            "Enter setting number to modify (1-6) or press Enter/q to exit",
+            "Enter setting number to modify (1-8) or press Enter/q to exit",
             default="q",
         )
         .strip()
@@ -291,6 +471,34 @@ def configure_interactive(config: Config):
             )
         except ValueError:
             console.print("[red]Invalid float.[/red]\n")
+    elif choice == "7":
+        val = (
+            typer.prompt(
+                "Disable Docker? (y/n)",
+                default="y" if config.disable_docker else "n",
+            )
+            .strip()
+            .lower()
+        )
+        config.disable_docker = val == "y"
+        console.print(
+            f"[green]disable_docker updated to {config.disable_docker}[/green]\n"
+        )
+    elif choice == "8":
+        val = typer.prompt(
+            "Enter Docker image name",
+            default=str(config.docker_image),
+        ).strip()
+        if val:
+            config.docker_image = val
+            console.print(
+                f"[green]docker_image updated to {config.docker_image}[/green]\n"
+            )
+        else:
+            console.print("[red]Invalid empty string.[/red]\n")
+
+    # Persist the configuration changes
+    save_config(config)
 
 
 AVAILABLE_MODELS = {
@@ -308,6 +516,8 @@ AVAILABLE_MODELS = {
     "6": {"name": "Nemotron 3 Nano 30B", "id": "nvidia/nemotron-3-nano-30b-a3b"},
     "7": {"name": "Nemotron 3 Super 120B", "id": "nvidia/nemotron-3-super-120b-a12b"},
     "8": {"name": "Nemotron 3 Ultra 550B", "id": "nvidia/nemotron-3-ultra-550b-a55b"},
+    "9": {"name": "MiniMax-M3", "id": "minimaxai/minimax-m3"},
+    "10": {"name": "GLM-5.2", "id": "z-ai/glm-5.2"},
 }
 
 
@@ -375,7 +585,7 @@ def select_interactive_model(
         return lines
 
     layout = Layout(Window(content=FormattedTextControl(text=get_text)))
-    app = Application(layout=layout, key_bindings=kb, erase_when_done=True)
+    app: Application = Application(layout=layout, key_bindings=kb, erase_when_done=True)
 
     try:
         selection_id = app.run()
@@ -408,7 +618,7 @@ def select_interactive_model(
                 from nimcode.core.prompts import strip_reasoning_spans
 
                 summary_file = (
-                    workspace_root / ".nimcode" / "summary.md"
+                    get_project_nimcode_dir(workspace_root) / "summary.md"
                     if workspace_root
                     else None
                 )
@@ -463,7 +673,7 @@ def select_interactive_model(
                     console.print(
                         f"\n[bold cyan]⚡ Reusing existing summary.md for context handoff to {selected_model['name']}...[/bold cyan]"
                     )
-                    summary_text = summary_file.read_text(encoding="utf-8")
+                    summary_text = summary_file.read_text(encoding="utf-8") if summary_file else ""
 
                 # Update config models to the new model
                 config.plan_model = new_model_id
@@ -476,6 +686,13 @@ def select_interactive_model(
                 console.print(
                     f"[bold cyan]🤖 Feeding summary.md into {selected_model['name']} for context injection...[/bold cyan]"
                 )
+
+                if messages and messages[-1].get("role") == "tool":
+                    dummy_ack = {"role": "assistant", "content": "Tool execution completed."}
+                    messages.append(dummy_ack)
+                    if session_path:
+                        log_turn(dummy_ack, session_path)
+
                 handoff_msg = {
                     "role": "user",
                     "content": f"<model_handoff_context>\nAI Model has been switched from {old_model} to {new_model_id}.\nTo ensure proper context continuity, here is the accurate summary (`summary.md`) generated by the previous model:\n\n{summary_text}\n</model_handoff_context>\n\nPlease review this context and give a concise acknowledgment indicating you are ready to continue the task.",
@@ -581,7 +798,7 @@ def select_interactive_session(config, workspace_root):
         / "sessions"
     )
     if not session_dir.exists():
-        console.print("[yellow]No saved sessions found in .nimcode/sessions[/yellow]")
+        console.print("[yellow]No saved sessions found in central project sessions directory[/yellow]\n")
         return None
     sessions = sorted(
         [Path(p) for p in glob.glob(str(session_dir / "session_*.json"))],
@@ -589,45 +806,48 @@ def select_interactive_session(config, workspace_root):
         reverse=True,
     )
     if not sessions:
-        console.print("[yellow]No saved sessions found in .nimcode/sessions[/yellow]")
+        console.print("[yellow]No saved sessions found in central project sessions directory[/yellow]\n")
         return None
     current_index = 0
 
-    def get_text():
-        lines = ["Select a session to resume:\n"]
-        for idx, s in enumerate(sessions):
-            marker = "> " if idx == current_index else "  "
-            lines.append(f"{marker}{s.name}")
-        lines.append("\n↑/↓ Navigate  enter Select  esc Cancel")
-        return "\n".join(lines)
+    kb = KeyBindings()
 
-    bindings = KeyBindings()
-
-    @bindings.add("up")
+    @kb.add("up")
     def _(event):
         nonlocal current_index
-        if current_index > 0:
-            current_index -= 1
+        current_index = max(0, current_index - 1)
 
-    @bindings.add("down")
+    @kb.add("down")
     def _(event):
         nonlocal current_index
-        if current_index < len(sessions) - 1:
-            current_index += 1
+        current_index = min(len(sessions) - 1, current_index + 1)
 
-    @bindings.add("enter")
+    @kb.add("enter")
     def _(event):
         event.app.exit()
 
-    @bindings.add("escape")
-    @bindings.add("c-c")
+    @kb.add("escape")
+    @kb.add("c-c")
     def _(event):
         nonlocal current_index
         current_index = -1
         event.app.exit()
 
+    def get_text():
+        lines = [("bold", "Select a Session to Resume\n\n")]
+        for idx, s in enumerate(sessions):
+            if idx == current_index:
+                prefix = "> "
+                style = "bold #00ffff"
+            else:
+                prefix = "  "
+                style = ""
+            lines.append((style, f"{prefix}{s.name}\n"))
+        lines.append(("", "\nKeyboard: ↑/↓ Navigate  enter Select  esc Cancel\n"))
+        return lines
+
     layout = Layout(Window(content=FormattedTextControl(text=get_text)))
-    app = Application(layout=layout, key_bindings=bindings, full_screen=False)
+    app = Application(layout=layout, key_bindings=kb, erase_when_done=True)
     app.run()
     if current_index == -1:
         return None

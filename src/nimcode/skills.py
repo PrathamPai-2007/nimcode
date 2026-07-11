@@ -1,5 +1,4 @@
 import os
-import sys
 import shutil
 import urllib.request
 import zipfile
@@ -8,10 +7,6 @@ import re
 from pathlib import Path
 from urllib.parse import urlparse
 
-if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    if hasattr(sys.stderr, "reconfigure"):
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 SKILLS_DIR = Path.home() / ".nimcode" / "skills"
 
@@ -54,16 +49,12 @@ def install_skill(url: str) -> str:
             with zipfile.ZipFile(zip_path, "r") as zip_ref:
                 for member in zip_ref.namelist():
                     resolved_member = (target_path / member).resolve()
-                    if hasattr(resolved_member, "is_relative_to"):
-                        if not resolved_member.is_relative_to(target_path):
-                            raise Exception(
-                                "Zip Slip vulnerability detected in skill archive."
-                            )
-                    else:
-                        if str(target_path) not in str(resolved_member):
-                            raise Exception(
-                                "Zip Slip vulnerability detected in skill archive."
-                            )
+                    try:
+                        resolved_member.relative_to(target_path)
+                    except ValueError:
+                        raise Exception(
+                            "Zip Slip vulnerability detected in skill archive."
+                        )
                 zip_ref.extractall(target_path)
             os.remove(zip_path)
             return f"Successfully installed skill '{skill_name}' from zip."

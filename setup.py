@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="nimcode",
-    version="0.3.0",
+    version="0.4.0",
     package_dir={"": "src"},
     packages=find_packages(where="src"),
     install_requires=[

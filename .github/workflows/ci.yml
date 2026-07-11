@@ -24,7 +24,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ruff
+          pip install ruff pytest
           pip install -e .
 
       - name: Lint with ruff
@@ -51,5 +51,18 @@ jobs:
 
       - name: Smoke test — CLI entry point
         run: nimcode status
+        env:
+          NVIDIA_API_KEY: "dummy-key-for-ci"
+
+      - name: Verify Docker sandbox availability
+        run: |
+          python -c "
+          from nimcode.tools.base import is_docker_available
+          assert is_docker_available(), 'Docker should be available in CI'
+          print('Docker sandbox: OK')
+          "
+
+      - name: Run test suite
+        run: pytest
         env:
           NVIDIA_API_KEY: "dummy-key-for-ci"
