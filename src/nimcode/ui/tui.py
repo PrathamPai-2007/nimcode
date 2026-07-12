@@ -142,6 +142,7 @@ class NimcodeTUI:
                 "/test",
                 "/team",
                 "/compact",
+                "/recap",
                 "/skills",
                 "/install-skill",
                 "/init",
@@ -287,10 +288,16 @@ class NimcodeTUI:
                 elif stripped.lower().startswith("/kill"):
                     parts = stripped.split(" ", 1)
                     if len(parts) < 2 or not parts[1].strip():
-                        console.print("[yellow]Usage: /kill <agent_id>[/yellow]")
+                        console.print(
+                            "[yellow]Usage: /kill <agent_id> or /kill <process_id>[/yellow]"
+                        )
                     else:
                         aid = parts[1].strip()
                         from nimcode.tools.swarm import ACTIVE_SUBAGENTS
+                        from nimcode.tools.cmd import (
+                            BACKGROUND_PROCESSES,
+                            stop_process_tool,
+                        )
 
                         if aid in ACTIVE_SUBAGENTS:
                             ACTIVE_SUBAGENTS[aid]["status"] = "KILLED"
@@ -300,9 +307,16 @@ class NimcodeTUI:
                             console.print(
                                 f"[bold green]Subagent '{aid}' has been killed.[/bold green]"
                             )
+                        elif aid in BACKGROUND_PROCESSES:
+                            res = stop_process_tool(
+                                {"process_id": aid},
+                                Path(self.config.workspace_root),
+                                self.config,
+                            )
+                            console.print(f"[bold green]{res}[/bold green]")
                         else:
                             console.print(
-                                f"[bold red]No subagent found with ID '{aid}'.[/bold red]"
+                                f"[bold red]No subagent or background process found with ID '{aid}'.[/bold red]"
                             )
                     continue
 
@@ -323,6 +337,13 @@ class NimcodeTUI:
                         "[yellow]/compact is available once a session is active. "
                         "Start a session first, then use /compact mid-conversation "
                         "to free up context.[/yellow]"
+                    )
+                    continue
+
+                elif stripped.lower() == "/recap":
+                    console.print(
+                        "[yellow]/recap is available once a session is active. "
+                        "Start a session first, then use /recap to view a quick summary.[/yellow]"
                     )
                     continue
 

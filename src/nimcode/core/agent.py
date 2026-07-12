@@ -84,6 +84,8 @@ def clean_surrogates(val: Any) -> Any:
         return "".join(c for c in val if not (0xD800 <= ord(c) <= 0xDFFF))
     elif isinstance(val, list):
         return [clean_surrogates(x) for x in val]
+    elif isinstance(val, tuple):
+        return tuple(clean_surrogates(x) for x in val)
     elif isinstance(val, dict):
         return {k: clean_surrogates(v) for k, v in val.items()}
     return val
@@ -93,13 +95,15 @@ def normalize_messages(
     messages: List[Dict[str, Any]], disable_native_tools: bool = False
 ) -> List[Dict[str, Any]]:
     """
-    Normalizes the message list to satisfy API constraints like alternating user/assistant roles.
-    Merges consecutive messages of the same role (user, assistant, system) into a single message.
+    Normalizes the message list to satisfy API constraints like alternating user/assistant roles,
+    and requirements of specific models (like Zhipu GLM and MiniMax) where system messages must
+    appear exactly once at the beginning, and the sequence of roles must be strictly alternating.
     """
     messages = clean_surrogates(messages)
     if not messages:
         return []
 
+    # 1. Map messages (handle tool disabling if active)
     mapped_messages = []
     for msg in messages:
         msg_copy = dict(msg)
@@ -135,18 +139,35 @@ def normalize_messages(
                 msg_copy.pop("tool_call_id", None)
         mapped_messages.append(msg_copy)
 
-    normalized: List[Dict[str, Any]] = []
+    # 2. Extract and combine all system messages into a single one
+    system_contents = []
+    other_messages = []
     for msg in mapped_messages:
-        if not normalized:
-            normalized.append(msg)
+        if msg.get("role") == "system":
+            content = msg.get("content") or ""
+            if content.strip():
+                system_contents.append(content.strip())
+        else:
+            other_messages.append(msg)
+
+    # 3. Merge consecutive messages with the same role in other_messages
+    merged_others: List[Dict[str, Any]] = []
+    for msg in other_messages:
+        if (
+            not msg.get("content")
+            and not msg.get("tool_calls")
+            and msg.get("role") != "assistant"
+        ):
+            # Skip empty content if it's not assistant (which could have tool_calls)
+            continue
+        if not merged_others:
+            merged_others.append(msg)
             continue
 
-        last = normalized[-1]
-        # Only merge system, user, or assistant messages that have the same role
+        last = merged_others[-1]
         if last.get("role") == msg.get("role") and last.get("role") in (
             "user",
             "assistant",
-            "system",
         ):
             last_content = last.get("content") or ""
             msg_content = msg.get("content") or ""
@@ -158,7 +179,25 @@ def normalize_messages(
             if "tool_calls" in msg:
                 last["tool_calls"] = last.get("tool_calls", []) + msg["tool_calls"]
         else:
-            normalized.append(msg)
+            merged_others.append(msg)
+
+    # 4. Ensure the first message after system prompt is user
+    if merged_others and merged_others[0].get("role") == "assistant":
+        merged_others.insert(
+            0, {"role": "user", "content": "Let's continue the conversation."}
+        )
+
+    # 5. Build final list
+    normalized = []
+    if system_contents:
+        normalized.append({"role": "system", "content": "\n\n".join(system_contents)})
+    normalized.extend(merged_others)
+
+    # 6. Ensure the sequence is not system-only to avoid GLM/MiniMax API errors
+    if len(normalized) == 1 and normalized[0].get("role") == "system":
+        normalized.append(
+            {"role": "user", "content": "Hello. I am setting up the workspace session."}
+        )
 
     return normalized
 
@@ -170,6 +209,7 @@ def call_nim_with_retry(
     model: str,
     config: Config,
     max_retries: int = 3,
+    timeout: Optional[float] = None,
 ):
     """
     Calls the NVIDIA NIM OpenAI endpoint with exponential backoff for transient errors.
@@ -177,8 +217,11 @@ def call_nim_with_retry(
     """
     import threading
 
+    # Prune history to satisfy context budget constraint!
+    pruned_messages = prune_history(messages, config.context_budget_tokens)
+
     normalized_messages = normalize_messages(
-        messages, disable_native_tools=config.disable_native_tools
+        pruned_messages, disable_native_tools=config.disable_native_tools
     )
 
     for attempt in range(max_retries):
@@ -189,8 +232,13 @@ def call_nim_with_retry(
                 "temperature": config.temperature_plan
                 if model == config.plan_model
                 else config.temperature_fast,
-                "timeout": float(config.timeout),
+                "timeout": timeout if timeout is not None else float(config.timeout),
             }
+            if hasattr(config, "max_tokens") and config.max_tokens is not None:
+                kwargs["max_tokens"] = config.max_tokens
+            else:
+                kwargs["max_tokens"] = 4096
+
             if tools and not config.disable_native_tools:
                 kwargs["tools"] = tools
 
@@ -218,7 +266,15 @@ def call_nim_with_retry(
 
             if "err" in error_box:
                 raise error_box["err"]
-            return result_box["res"]
+
+            res = result_box.get("res")
+            if res and hasattr(res, "choices") and not res.choices:
+                raise RuntimeError(
+                    f"The model API returned a response with an empty 'choices' list. "
+                    f"This commonly occurs for models like MiniMax-M3 if the 'max_tokens' parameter is not specified or if there is a server-side error. "
+                    f"Response: {res}"
+                )
+            return res
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -271,44 +327,91 @@ def prune_history(
     max_turns_retained: int = 20,
 ) -> List[Dict[str, Any]]:
     """
-    Prunes long conversation histories by keeping the initial system and user messages,
-    and truncating older tool responses while preserving the most recent turns.
-    Respects both token budget estimates (~4 chars/token) and turn counts.
+    Prunes long conversation histories to satisfy context budget constraints.
+    First, it truncates older tool messages.
+    If the list is still over the token budget, it drops older user/assistant turns
+    while preserving the system prompt, first user prompt, and the most recent turns.
     """
-    total_chars = sum(
-        len(str(m.get("content", ""))) + len(str(m.get("tool_calls", "")))
-        for m in messages
-    )
-    estimated_tokens = total_chars // 4
+    if not messages:
+        return []
 
+    # Calculate current token estimate
+    def get_tokens(msg_list):
+        return sum(
+            (len(str(m.get("content", ""))) + len(str(m.get("tool_calls", "")))) // 4
+            for m in msg_list
+        )
+
+    estimated_tokens = get_tokens(messages)
     if (
         len(messages) <= max_turns_retained
         and estimated_tokens <= context_budget_tokens
     ):
         return messages
 
+    # Step 1: Truncate older tool results
     pruned = []
-    # Always keep system message and initial user prompt
-    for i in range(min(2, len(messages))):
-        pruned.append(messages[i])
-
-    # For the middle messages, truncate heavy tool contents if over budget or turn limit
+    # Always keep system message and initial user prompt intact
+    keep_indices = set(range(min(2, len(messages))))
     cutoff_index = max(2, len(messages) - max_turns_retained)
-    for i in range(2, len(messages)):
+
+    for i in range(len(messages)):
         msg = messages[i]
-        if i < cutoff_index:
-            # If over token budget significantly, we may skip or heavily summarize older tool output
-            if msg.get("role") == "tool":
-                pruned_msg = dict(msg)
-                pruned_msg["content"] = (
-                    str(msg.get("content", ""))[:150]
+        if i in keep_indices:
+            pruned.append(dict(msg))
+        else:
+            msg_copy = dict(msg)
+            if i < cutoff_index and msg_copy.get("role") == "tool":
+                msg_copy["content"] = (
+                    str(msg_copy.get("content", ""))[:150]
                     + "\n... [Older tool result truncated to conserve context]"
                 )
-                pruned.append(pruned_msg)
-                continue
-        pruned.append(msg)
+            pruned.append(msg_copy)
 
-    return pruned
+    # Check if we are still over budget
+    if get_tokens(pruned) <= context_budget_tokens:
+        return pruned
+
+    # Step 2: Over budget even after tool truncation.
+    # We must drop older messages. We must keep:
+    # - System message at index 0 (if present)
+    # - First user query at index 1 (if present)
+    # - The most recent messages
+    system_msg = pruned[0] if pruned and pruned[0].get("role") == "system" else None
+    first_user_msg = None
+    start_idx = 0
+    if system_msg:
+        start_idx = 1
+    if len(pruned) > start_idx and pruned[start_idx].get("role") == "user":
+        first_user_msg = pruned[start_idx]
+        start_idx += 1
+
+    # Keep list of system and first user message
+    essential = []
+    if system_msg:
+        essential.append(system_msg)
+    if first_user_msg:
+        essential.append(first_user_msg)
+
+    essential_tokens = get_tokens(essential)
+    budget_left = context_budget_tokens - essential_tokens
+
+    # Collect remaining messages from the end of the list until we run out of budget
+    recent_msgs = []
+    for msg in reversed(pruned[start_idx:]):
+        msg_tokens = get_tokens([msg])
+        if budget_left - msg_tokens >= 0 or not recent_msgs:
+            recent_msgs.append(msg)
+            budget_left -= msg_tokens
+        else:
+            # Out of budget! Stop including older messages.
+            break
+
+    recent_msgs.reverse()
+
+    # Construct pruned list
+    final_messages = essential + recent_msgs
+    return final_messages
 
 
 def log_turn(message_or_dict: Any, session_path: Path):
@@ -676,8 +779,20 @@ def run_agent_loop(
 
     def prompt_user(text, **kwargs):
         disable_persistent_prompt()
-        res = typer.prompt(text, **kwargs)
-        enable_persistent_prompt(state, config, workspace_root, user_input)
+        from prompt_toolkit import prompt as pt_prompt
+        from prompt_toolkit.patch_stdout import patch_stdout
+
+        prompt_text = (
+            text
+            if text.endswith(": ")
+            else (text + " " if text.endswith(":") else text + ": ")
+        )
+        try:
+            with patch_stdout():
+                res = pt_prompt(prompt_text)
+        except (KeyboardInterrupt, EOFError):
+            res = "q"
+        enable_persistent_prompt(state, config, workspace_root, res)
         return res
 
     def get_user_turn() -> Optional[str]:
@@ -700,6 +815,7 @@ def run_agent_loop(
                 "/test",
                 "/team",
                 "/compact",
+                "/recap",
                 "/skills",
                 "/install-skill",
                 "/init",
@@ -976,10 +1092,17 @@ def run_agent_loop(
             elif user_input.strip().lower().startswith("/kill"):
                 parts = user_input.strip().split(" ", 1)
                 if len(parts) < 2 or not parts[1].strip():
-                    secho("Usage: /kill <agent_id>", fg=typer.colors.YELLOW)
+                    secho(
+                        "Usage: /kill <agent_id> or /kill <process_id>",
+                        fg=typer.colors.YELLOW,
+                    )
                 else:
                     aid = parts[1].strip()
                     from nimcode.tools.swarm import ACTIVE_SUBAGENTS
+                    from nimcode.tools.cmd import (
+                        BACKGROUND_PROCESSES,
+                        stop_process_tool,
+                    )
 
                     if aid in ACTIVE_SUBAGENTS:
                         ACTIVE_SUBAGENTS[aid]["status"] = "KILLED"
@@ -989,9 +1112,15 @@ def run_agent_loop(
                         secho(
                             f"Subagent '{aid}' has been killed.", fg=typer.colors.GREEN
                         )
+                    elif aid in BACKGROUND_PROCESSES:
+                        res = stop_process_tool(
+                            {"process_id": aid}, workspace_root, config
+                        )
+                        secho(res, fg=typer.colors.GREEN)
                     else:
                         secho(
-                            f"No subagent found with ID '{aid}'.", fg=typer.colors.RED
+                            f"No subagent or background process found with ID '{aid}'.",
+                            fg=typer.colors.RED,
                         )
                 continue
             elif user_input.lower() == "/model":
@@ -1029,9 +1158,16 @@ def run_agent_loop(
                         f"and replace it with the summary to free up context space.\n"
                     )
                     try:
-                        confirmed = typer.confirm(
-                            "Proceed with compaction?", default=False
-                        )
+                        from prompt_toolkit import prompt as pt_prompt
+                        from prompt_toolkit.patch_stdout import patch_stdout
+
+                        with patch_stdout():
+                            ans = (
+                                pt_prompt("Proceed with compaction? (y/n) [n]: ")
+                                .strip()
+                                .lower()
+                            )
+                        confirmed = ans in ("y", "yes")
                     except (KeyboardInterrupt, EOFError):
                         _con.print("[dim]Compact cancelled.[/dim]\n")
                         continue
@@ -1088,6 +1224,71 @@ def run_agent_loop(
                             )
 
                 continue
+            elif user_input.strip().lower() == "/recap":
+                from nimcode.ui.output import console
+                from rich.panel import Panel
+
+                _con = console
+                user_messages = [m for m in messages if m.get("role") == "user"]
+                if len(user_messages) < 1:
+                    _con.print(
+                        "[yellow]No conversation history yet. Send at least one message first.[/yellow]\n"
+                    )
+                else:
+                    current_model = (
+                        config.fast_model
+                        if state != AgentState.AWAITING_PLAN_APPROVAL
+                        else config.plan_model
+                    )
+                    _con.print(
+                        "[cyan]Asking Mistral Small to recap the session...[/cyan]"
+                    )
+
+                    recap_prompt = [
+                        {
+                            "role": "user",
+                            "content": "Please provide a very brief, high-level summary of what has happened in this session so far (such as tasks completed, main code files edited, and current status). The summary must be at most 4 to 5 lines long.",
+                        }
+                    ]
+                    pruned_msgs = prune_history(messages, config.context_budget_tokens)
+                    recap_req_messages = list(pruned_msgs) + recap_prompt
+
+                    try:
+                        recap_res = call_nim_with_retry(
+                            client,
+                            recap_req_messages,
+                            None,
+                            "mistralai/mistral-small-4-119b-2603",
+                            config,
+                            timeout=30.0,
+                        )
+                    except Exception:
+                        try:
+                            recap_res = call_nim_with_retry(
+                                client,
+                                recap_req_messages,
+                                None,
+                                current_model,
+                                config,
+                                timeout=30.0,
+                            )
+                        except Exception as e:
+                            _con.print(f"[red]Error generating recap: {e}[/red]\n")
+                            continue
+
+                    recap_text = strip_reasoning_spans(
+                        recap_res.choices[0].message.content or ""
+                    ).strip()
+                    _con.print(
+                        Panel(
+                            recap_text,
+                            title="Session Recap",
+                            border_style="green",
+                            padding=(1, 2),
+                        )
+                    )
+                    _con.print()
+                continue
             elif user_input.lower() == "/skills":
                 from nimcode import skills
 
@@ -1121,12 +1322,14 @@ def run_agent_loop(
 
                         if messages:
                             last_msg = messages[-1]
-                            if last_msg.get("role") == "assistant" and last_msg.get("tool_calls"):
+                            if last_msg.get("role") == "assistant" and last_msg.get(
+                                "tool_calls"
+                            ):
                                 for tc in last_msg["tool_calls"]:
                                     dummy_res = {
                                         "role": "tool",
                                         "tool_call_id": tc.get("id"),
-                                        "content": "Execution aborted due to session suspension."
+                                        "content": "Execution aborted due to session suspension.",
                                     }
                                     messages.append(dummy_res)
                                     log_turn(dummy_res, session_path)
@@ -1150,6 +1353,7 @@ def run_agent_loop(
                     "/test",
                     "/team",
                     "/compact",
+                    "/recap",
                     "/skills",
                     "/init",
                     "/resume",
@@ -1262,7 +1466,10 @@ def run_agent_loop(
                             log_turn(messages[last_user_idx], session_path)
                     else:
                         if messages and messages[-1].get("role") == "tool":
-                            dummy_ack = {"role": "assistant", "content": "Context handoff."}
+                            dummy_ack = {
+                                "role": "assistant",
+                                "content": "Context handoff.",
+                            }
                             messages.append(dummy_ack)
                             if session_path:
                                 log_turn(dummy_ack, session_path)
@@ -1459,10 +1666,9 @@ def run_agent_loop(
                     fg=typer.colors.YELLOW,
                     bold=True,
                 )
-                user_input = (
-                    prompt_user("Resume loop? (y to continue / enter feedback to redirect / q to quit)")
-                    .strip()
-                )
+                user_input = prompt_user(
+                    "Resume loop? (y to continue / enter feedback to redirect / q to quit)"
+                ).strip()
                 if user_input.lower() == "q":
                     break
                 elif user_input.lower() != "y":
@@ -1470,7 +1676,7 @@ def run_agent_loop(
                         cancel_msg = {
                             "role": "tool",
                             "tool_call_id": tc.id,
-                            "content": f"Execution cancelled by user. Feedback: {user_input}"
+                            "content": f"Execution cancelled by user. Feedback: {user_input}",
                         }
                         messages.append(cancel_msg)
                         log_turn(cancel_msg, session_path)
@@ -1495,7 +1701,9 @@ def run_agent_loop(
                     )
                     secho(f"\nWarning: {result}", fg=typer.colors.RED)
                 else:
-                    preview = render_preview(tool_name, args, workspace_root)
+                    preview = render_preview(
+                        tool_name, args, workspace_root, config=config
+                    )
                     echo(preview)
 
                     if state == AgentState.YOLO:
@@ -1572,7 +1780,10 @@ def run_agent_loop(
                 bold=True,
             )
             if messages and messages[-1].get("role") == "tool":
-                dummy_ack = {"role": "assistant", "content": "Tool execution interrupted."}
+                dummy_ack = {
+                    "role": "assistant",
+                    "content": "Tool execution interrupted.",
+                }
                 messages.append(dummy_ack)
                 log_turn(dummy_ack, session_path)
 
@@ -1609,5 +1820,8 @@ def run_agent_loop(
             log_turn(user_msg, session_path)
             continue
 
+    from nimcode.tools.cmd import cleanup_background_processes
+
+    cleanup_background_processes()
     disable_persistent_prompt()
     atexit.unregister(disable_persistent_prompt)

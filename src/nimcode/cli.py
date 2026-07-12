@@ -156,7 +156,11 @@ def _get_client_and_setup() -> tuple[OpenAI, Any, Path, str]:
         )
         raise typer.Exit(code=1)
 
-    base_url = config.api_base_url if config.api_base_url else "https://integrate.api.nvidia.com/v1"
+    base_url = (
+        config.api_base_url
+        if config.api_base_url
+        else "https://integrate.api.nvidia.com/v1"
+    )
 
     client = OpenAI(
         base_url=base_url,

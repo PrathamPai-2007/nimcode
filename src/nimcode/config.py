@@ -22,13 +22,19 @@ def get_project_nimcode_dir(workspace_root: Any) -> Path:
     resolved = workspace_root.resolve()
 
     import hashlib
+
     path_hash = hashlib.md5(str(resolved).encode("utf-8")).hexdigest()[:8]
     project_dir = Path.home() / ".nimcode" / f"{resolved.name}_{path_hash}"
 
     # One-time migration from legacy un-hashed global directory if it exists
     legacy_global = Path.home() / ".nimcode" / resolved.name
-    if legacy_global.exists() and legacy_global.is_dir() and legacy_global != project_dir:
+    if (
+        legacy_global.exists()
+        and legacy_global.is_dir()
+        and legacy_global != project_dir
+    ):
         import shutil
+
         try:
             shutil.copytree(legacy_global, project_dir, dirs_exist_ok=True)
             shutil.rmtree(legacy_global, ignore_errors=True)
@@ -53,8 +59,8 @@ def get_project_nimcode_dir(workspace_root: Any) -> Path:
 
 @dataclass
 class Config:
-    fast_model: str = "nvidia/nemotron-3-nano-30b-a3b"
-    plan_model: str = "nvidia/nemotron-3-nano-30b-a3b"
+    fast_model: str = "nvidia/nemotron-3-ultra-550b-a55b"
+    plan_model: str = "nvidia/nemotron-3-ultra-550b-a55b"
     mode: str = "build"
     temperature_fast: float = 0.7
     temperature_plan: float = 0.2
@@ -63,6 +69,7 @@ class Config:
     timeout: int = 60
     output_cap: int = 100000
     context_budget_tokens: int = 128000
+    max_tokens: int = 4096
     auto_backup: bool = True
     denylist: List[str] = field(default_factory=list)
     pending_summary_injection: bool = False
@@ -315,18 +322,20 @@ def restore_interactive_backup(workspace_root: Path):
     parts = selected_backup.name.split("_", 1)
     guess_name = parts[1] if len(parts) > 1 else selected_backup.name
     if guess_name.startswith("blocks_"):
-        guess_name = guess_name[len("blocks_"):]
-    
+        guess_name = guess_name[len("blocks_") :]
+
     # Simple guess for the original path by replacing first few underscores if it's deeply nested
     # Alternatively we just provide it as the default directly, or replace _ with /
     # For now, let's just guess by replacing all _ with / and stripping .py (wait, no stripping)
     guess_path = guess_name.replace("_", "/")
-    
+
     # Try to see if there's a file matching the exact guess_name just in case it didn't have /
     if (root / guess_name).exists():
         guess_path = guess_name
 
-    target_rel = typer.prompt("Enter target path to restore to (relative to workspace)", default=guess_path)
+    target_rel = typer.prompt(
+        "Enter target path to restore to (relative to workspace)", default=guess_path
+    )
     target_path = (root / target_rel).resolve()
 
     if not str(target_path).startswith(str(root)):
@@ -336,7 +345,9 @@ def restore_interactive_backup(workspace_root: Path):
     try:
         target_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(selected_backup, target_path)
-        console.print(f"[bold green]Successfully restored backup to {target_rel}[/bold green]\n")
+        console.print(
+            f"[bold green]Successfully restored backup to {target_rel}[/bold green]\n"
+        )
     except Exception as e:
         console.print(f"[bold red]Failed to restore backup: {e}[/bold red]\n")
 
@@ -502,22 +513,22 @@ def configure_interactive(config: Config):
 
 
 AVAILABLE_MODELS = {
-    "1": {"name": "Mistral Small", "id": "mistralai/mistral-small-4-119b-2603"},
-    "2": {
-        "name": "Mistral Large",
-        "id": "mistralai/mistral-large-3-675b-instruct-2512",
-    },
+    "1": {"name": "Nemotron 3 Nano 30B", "id": "nvidia/nemotron-3-nano-30b-a3b"},
+    "2": {"name": "DeepSeek V4-Flash", "id": "deepseek-ai/deepseek-v4-flash"},
     "3": {
         "name": "Mixtral 8x7B Instruct",
         "id": "mistralai/mixtral-8x7b-instruct-v0.1",
     },
-    "4": {"name": "DeepSeek V4-Pro", "id": "deepseek-ai/deepseek-v4-pro"},
-    "5": {"name": "DeepSeek V4-Flash", "id": "deepseek-ai/deepseek-v4-flash"},
-    "6": {"name": "Nemotron 3 Nano 30B", "id": "nvidia/nemotron-3-nano-30b-a3b"},
-    "7": {"name": "Nemotron 3 Super 120B", "id": "nvidia/nemotron-3-super-120b-a12b"},
-    "8": {"name": "Nemotron 3 Ultra 550B", "id": "nvidia/nemotron-3-ultra-550b-a55b"},
-    "9": {"name": "MiniMax-M3", "id": "minimaxai/minimax-m3"},
-    "10": {"name": "GLM-5.2", "id": "z-ai/glm-5.2"},
+    "4": {"name": "Mistral Small", "id": "mistralai/mistral-small-4-119b-2603"},
+    "5": {"name": "Nemotron 3 Super 120B", "id": "nvidia/nemotron-3-super-120b-a12b"},
+    "6": {"name": "GLM-5.2", "id": "z-ai/glm-5.2"},
+    "7": {"name": "MiniMax-M3", "id": "minimaxai/minimax-m3"},
+    "8": {
+        "name": "Mistral Large",
+        "id": "mistralai/mistral-large-3-675b-instruct-2512",
+    },
+    "9": {"name": "DeepSeek V4-Pro", "id": "deepseek-ai/deepseek-v4-pro"},
+    "10": {"name": "Nemotron 3 Ultra 550B", "id": "nvidia/nemotron-3-ultra-550b-a55b"},
 }
 
 
@@ -650,7 +661,12 @@ def select_interactive_model(
                     summary_req_messages = list(messages) + summary_prompt
 
                     summary_res = call_nim_with_retry(
-                        client, summary_req_messages, None, old_model, config
+                        client,
+                        summary_req_messages,
+                        None,
+                        old_model,
+                        config,
+                        timeout=300.0,
                     )
                     summary_text = strip_reasoning_spans(
                         summary_res.choices[0].message.content or ""
@@ -673,7 +689,9 @@ def select_interactive_model(
                     console.print(
                         f"\n[bold cyan]⚡ Reusing existing summary.md for context handoff to {selected_model['name']}...[/bold cyan]"
                     )
-                    summary_text = summary_file.read_text(encoding="utf-8") if summary_file else ""
+                    summary_text = (
+                        summary_file.read_text(encoding="utf-8") if summary_file else ""
+                    )
 
                 # Update config models to the new model
                 config.plan_model = new_model_id
@@ -688,7 +706,10 @@ def select_interactive_model(
                 )
 
                 if messages and messages[-1].get("role") == "tool":
-                    dummy_ack = {"role": "assistant", "content": "Tool execution completed."}
+                    dummy_ack = {
+                        "role": "assistant",
+                        "content": "Tool execution completed.",
+                    }
                     messages.append(dummy_ack)
                     if session_path:
                         log_turn(dummy_ack, session_path)
@@ -764,7 +785,7 @@ def generate_summary_with_progress(
     summary_req_messages = list(messages) + summary_prompt
     try:
         summary_res = call_nim_with_retry(
-            client, summary_req_messages, None, current_model, config
+            client, summary_req_messages, None, current_model, config, timeout=300.0
         )
         summary_text = strip_reasoning_spans(
             summary_res.choices[0].message.content or ""
@@ -798,7 +819,9 @@ def select_interactive_session(config, workspace_root):
         / "sessions"
     )
     if not session_dir.exists():
-        console.print("[yellow]No saved sessions found in central project sessions directory[/yellow]\n")
+        console.print(
+            "[yellow]No saved sessions found in central project sessions directory[/yellow]\n"
+        )
         return None
     sessions = sorted(
         [Path(p) for p in glob.glob(str(session_dir / "session_*.json"))],
@@ -806,7 +829,9 @@ def select_interactive_session(config, workspace_root):
         reverse=True,
     )
     if not sessions:
-        console.print("[yellow]No saved sessions found in central project sessions directory[/yellow]\n")
+        console.print(
+            "[yellow]No saved sessions found in central project sessions directory[/yellow]\n"
+        )
         return None
     current_index = 0
 

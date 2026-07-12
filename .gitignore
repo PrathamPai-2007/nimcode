@@ -1,15 +1,34 @@
+# Environment variables & secrets
 .env
 *.env
+
+# Python build & distribution
 __pycache__/
-.ruff_cache/
 *.py[cod]
 *$py.class
-.venv/
-env/
-venv/
 *.egg-info/
 dist/
 build/
-.nimcode/
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Caching & linting tools
+.ruff_cache/
 .pytest_cache/
 .mypy_cache/
+
+# Project-specific local files
+.nimcode/
+.nimcode_backups/
+.nimcode_sessions/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS-specific files
+.DS_Store
+Thumbs.db

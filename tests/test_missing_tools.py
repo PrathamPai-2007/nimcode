@@ -111,5 +111,52 @@ def test_gitignore_matching():
 
     rules_slash = ["src/build"]
     assert is_ignored(Path("src/build/file.txt"), rules_slash, root=Path(".")) is True
-    assert is_ignored(Path("other/src/build/file.txt"), rules_slash, root=Path(".")) is False
+    assert (
+        is_ignored(Path("other/src/build/file.txt"), rules_slash, root=Path("."))
+        is False
+    )
 
+
+def test_gitignore_matching_absolute():
+    from nimcode.context import is_ignored
+    from pathlib import Path
+
+    rules = ["src/build"]
+    abs_path = Path("src/build/file.txt").resolve()
+    rel_root = Path(".")
+    assert is_ignored(abs_path, rules, root=rel_root) is True
+
+
+def test_glob_files_tool_ignores_files(tmp_path):
+    from nimcode.tools.fs import glob_files_tool
+
+    config = Config()
+    ignored_dir = tmp_path / "node_modules"
+    ignored_dir.mkdir()
+    (ignored_dir / "index.js").write_text("console.log(1);", encoding="utf-8")
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "main.js").write_text("console.log(2);", encoding="utf-8")
+
+    (tmp_path / ".gitignore").write_text("node_modules\n", encoding="utf-8")
+
+    res = glob_files_tool({"pattern": "**/*.js"}, tmp_path, config)
+    assert "src/main.js" in res
+    assert "node_modules/index.js" not in res
+
+
+def test_write_file_tool_converts_content_and_preserves_newline(tmp_path):
+    from nimcode.tools.fs import write_file_tool
+
+    config = Config()
+
+    write_file_tool({"path": "dummy.txt", "content": 123}, tmp_path, config)
+    assert (tmp_path / "dummy.txt").read_text(encoding="utf-8") == "123"
+
+    (tmp_path / "crlf.txt").write_bytes(b"line1\r\nline2\r\n")
+    write_file_tool(
+        {"path": "crlf.txt", "content": "line1\nline2\nline3"}, tmp_path, config
+    )
+    content_bytes = (tmp_path / "crlf.txt").read_bytes()
+    assert b"\r\n" in content_bytes

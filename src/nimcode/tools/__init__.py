@@ -4,6 +4,8 @@ from . import fs
 from . import cmd
 from . import patch
 from . import swarm
+from . import browser
+from . import web
 
 # Expose public interfaces
 from .registry import (
@@ -28,6 +30,9 @@ from .swarm import (
 from .cmd import (
     run_tests_tool,
     execute_test_runner,
+    start_background_process_tool,
+    get_process_output_tool,
+    stop_process_tool,
 )
 
 __all__ = [
@@ -35,6 +40,8 @@ __all__ = [
     "cmd",
     "patch",
     "swarm",
+    "browser",
+    "web",
     "TOOL_REGISTRY",
     "AVAILABLE_TOOLS_SPEC",
     "execute_local_tool",
@@ -50,4 +57,7 @@ __all__ = [
     "list_agents_logic",
     "run_tests_tool",
     "execute_test_runner",
+    "start_background_process_tool",
+    "get_process_output_tool",
+    "stop_process_tool",
 ]

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nimcode"
-version = "0.4.0"
+version = "0.6.0"
 description = "Terminal-first AI coding agent driven by NVIDIA NIM"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,6 +15,7 @@ dependencies = [
     "tomli>=2.0.0",
     "rich>=13.0.0",
     "prompt_toolkit>=3.0.0",
+    "playwright>=1.40.0",
 ]
 
 [project.scripts]

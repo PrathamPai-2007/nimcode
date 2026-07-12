@@ -50,17 +50,25 @@ def is_ignored(path: Path, gitignore_rules: list, root: Optional[Path] = None) -
     }:
         return True
 
-    rel_path = (
-        str(path.relative_to(root)).replace("\\", "/")
-        if root and hasattr(path, "is_relative_to") and path.is_relative_to(root)
-        else path.name
-    )
+    if root:
+        if isinstance(root, str):
+            root = Path(root)
+        if isinstance(path, str):
+            path = Path(path)
+        abs_root = root.resolve()
+        abs_path = path.resolve()
+        if abs_path.is_relative_to(abs_root):
+            rel_path = str(abs_path.relative_to(abs_root)).replace("\\", "/")
+        else:
+            rel_path = path.name
+    else:
+        rel_path = path.name
 
     for rule in gitignore_rules:
         rule_clean = rule.strip().rstrip("/")
         if not rule_clean or rule_clean.startswith("#"):
             continue
-        
+
         # If the pattern doesn't contain a slash, it matches any component of the path
         if "/" not in rule_clean:
             if fnmatch.fnmatch(path.name, rule_clean):
@@ -70,13 +78,16 @@ def is_ignored(path: Path, gitignore_rules: list, root: Optional[Path] = None) -
                 return True
         else:
             rule_match = rule_clean.lstrip("/")
-            if fnmatch.fnmatch(rel_path, rule_match) or fnmatch.fnmatch(rel_path, f"{rule_match}/*"):
+            if fnmatch.fnmatch(rel_path, rule_match) or fnmatch.fnmatch(
+                rel_path, f"{rule_match}/*"
+            ):
                 return True
     return False
 
 
 def _extract_python_imports(file_path: Path) -> set:
     import ast
+
     imports = set()
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -91,6 +102,7 @@ def _extract_python_imports(file_path: Path) -> set:
     except Exception:
         pass
     return imports
+
 
 def generate_workspace_map(root_dir: str, max_files: int = 500) -> str:
     root = Path(root_dir).resolve()
@@ -109,7 +121,7 @@ def generate_workspace_map(root_dir: str, max_files: int = 500) -> str:
             pass
 
     file_counter = [0]
-    
+
     # We can do a quick check if workspace is large and we should try AST filtering.
     # For now, we simply keep the tree but maybe tag python files with their internal dependencies if requested, or just do the standard tree for everything but if we hit the limit we try to show important files.
     # The requirement is: "For larger workspaces, use static analysis... to dynamically build a workspace map of files related to the initial user prompt."
@@ -138,15 +150,22 @@ def generate_workspace_map(root_dir: str, max_files: int = 500) -> str:
 
             is_last = i == (len(entries) - 1)
             pointer = "`-- " if is_last else "|-- "
-            
+
             # Simple AST enrichment for Python files
             extra_info = ""
             if entry.is_file() and entry.suffix == ".py":
                 try:
                     size = entry.stat().st_size
-                    if size < 50000: # only parse if reasonably small
+                    if size < 50000:  # only parse if reasonably small
                         imports = _extract_python_imports(entry)
-                        local_imports = [imp for imp in imports if (root / imp).exists() or (root / "src" / imp).exists() or imp == root.name or imp == "nimcode"]
+                        local_imports = [
+                            imp
+                            for imp in imports
+                            if (root / imp).exists()
+                            or (root / "src" / imp).exists()
+                            or imp == root.name
+                            or imp == "nimcode"
+                        ]
                         if local_imports:
                             extra_info = f" (imports: {', '.join(local_imports[:3])})"
                 except Exception:

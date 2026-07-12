@@ -4,7 +4,7 @@ import shutil
 from pathlib import Path
 from typing import Dict, Any
 from nimcode.tools.registry import register_tool
-from nimcode.tools.base import resolve_and_validate_path
+from nimcode.tools.base import resolve_and_validate_path, truncate_output
 
 READ_FILE_SCHEMA = {
     "type": "function",
@@ -98,10 +98,11 @@ def read_file_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> s
         content = header + content
         return content
 
-    if len(content) > config.output_cap:
+    output_cap = getattr(config, "output_cap", 100000) if config is not None else 100000
+    if len(content) > output_cap:
         return (
-            content[: config.output_cap]
-            + f"\n... [Output truncated at {config.output_cap} characters. Use start_line and end_line parameters to read specific sections of the file.]"
+            content[:output_cap]
+            + f"\n... [Output truncated at {output_cap} characters. Use start_line and end_line parameters to read specific sections of the file.]"
         )
     return content
 
@@ -112,6 +113,8 @@ def write_file_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> 
     if not path_str or not isinstance(path_str, str):
         return "Error: Invalid or missing 'path' parameter for write_file."
     content = args.get("content", "")
+    if not isinstance(content, str):
+        content = str(content)
     target_path = resolve_and_validate_path(path_str, workspace_root)
 
     # Auto-backup before overwrite for easy one-command revert
@@ -140,7 +143,17 @@ def write_file_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> 
     # Create parent directories
     target_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(target_path, "w", encoding="utf-8") as f:
+    # Detect original line ending if file exists
+    has_crlf = False
+    if target_path.exists() and target_path.is_file():
+        try:
+            with open(target_path, "rb") as f_bin:
+                has_crlf = b"\r\n" in f_bin.read(4096)
+        except Exception:
+            pass
+
+    newline = "\r\n" if has_crlf else "\n"
+    with open(target_path, "w", encoding="utf-8", newline=newline) as f:
         f.write(content)
     return f"Successfully wrote {len(content)} characters to '{path_str}'."
 
@@ -207,11 +220,7 @@ def list_files_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> 
             return f"Directory '{path_str}' is empty."
         output = "\n".join(result)
         output_cap = getattr(config, "output_cap", 100000)
-        if len(output) > output_cap:
-            output = (
-                output[:output_cap]
-                + f"\n... [Output truncated at {output_cap} characters]"
-            )
+        output = truncate_output(output, output_cap)
         return output
     except Exception as e:
         return f"Error listing directory '{path_str}': {e}"
@@ -220,10 +229,24 @@ def list_files_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> 
 @register_tool("glob_files", GLOB_FILES_SCHEMA)
 def glob_files_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> str:
     from nimcode.tools.registry import ToolSandboxError
+    from nimcode.context import is_ignored
 
     pattern = args.get("pattern")
     if not pattern:
         return "Error: Missing 'pattern' parameter."
+
+    gitignore_rules = []
+    gitignore_path = workspace_root / ".gitignore"
+    if gitignore_path.exists():
+        try:
+            with open(gitignore_path, "r", encoding="utf-8") as f:
+                gitignore_rules = [
+                    line.strip()
+                    for line in f
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+        except Exception:
+            pass
 
     try:
         results = []
@@ -233,6 +256,8 @@ def glob_files_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> 
                     str(p.relative_to(workspace_root)), workspace_root
                 )
                 if resolved.is_file():
+                    if is_ignored(resolved, gitignore_rules, root=workspace_root):
+                        continue
                     results.append(p.relative_to(workspace_root).as_posix())
             except (ToolSandboxError, ValueError):
                 continue
@@ -242,11 +267,7 @@ def glob_files_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> 
 
         output = "\n".join(sorted(results))
         output_cap = getattr(config, "output_cap", 100000)
-        if len(output) > output_cap:
-            output = (
-                output[:output_cap]
-                + f"\n... [Output truncated at {output_cap} characters]"
-            )
+        output = truncate_output(output, output_cap)
         return output
     except Exception as e:
         return f"Error globbing pattern '{pattern}': {e}"
@@ -372,6 +393,7 @@ def patch_file_blocks_logic(
 
     if dry_run:
         import difflib
+
         old_lines = content.splitlines(keepends=True)
         new_lines = new_content.splitlines(keepends=True)
         diff = list(
@@ -401,7 +423,16 @@ def patch_file_blocks_logic(
         except Exception:
             pass
 
-    with open(target_path, "w", encoding="utf-8") as f:
+    # Detect original line ending
+    has_crlf = False
+    try:
+        with open(target_path, "rb") as f_bin:
+            has_crlf = b"\r\n" in f_bin.read(4096)
+    except Exception:
+        pass
+
+    newline = "\r\n" if has_crlf else "\n"
+    with open(target_path, "w", encoding="utf-8", newline=newline) as f:
         f.write(new_content)
 
     return f"Successfully applied {len(matches)} edit block(s) to '{path_str}'."
@@ -514,10 +545,7 @@ def search_grep_tool(args: Dict[str, Any], workspace_root: Path, config: Any) ->
     output_lines = [f"{m[0]}:{m[1]}: {m[2]}" for m in matches]
     output = "\n".join(output_lines)
     output_cap = getattr(config, "output_cap", 100000)
-    if len(output) > output_cap:
-        output = (
-            output[:output_cap] + f"\n... [Output truncated at {output_cap} characters]"
-        )
+    output = truncate_output(output, output_cap)
     return output
 
 
@@ -578,8 +606,5 @@ def search_symbols_tool(args: Dict[str, Any], workspace_root: Path, config: Any)
 
     output = "\n".join(symbols)
     output_cap = getattr(config, "output_cap", 100000)
-    if len(output) > output_cap:
-        output = (
-            output[:output_cap] + f"\n... [Output truncated at {output_cap} characters]"
-        )
+    output = truncate_output(output, output_cap)
     return output

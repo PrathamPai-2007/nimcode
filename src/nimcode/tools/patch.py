@@ -125,7 +125,15 @@ def patch_file_ast_logic(
             pass
 
     new_content_final = "".join(new_lines)
-    with open(target_path, "w", encoding="utf-8") as f:
+    has_crlf = False
+    try:
+        with open(target_path, "rb") as f_bin:
+            has_crlf = b"\r\n" in f_bin.read(4096)
+    except Exception:
+        pass
+
+    newline = "\r\n" if has_crlf else "\n"
+    with open(target_path, "w", encoding="utf-8", newline=newline) as f:
         f.write(new_content_final)
 
     return f"Successfully patched symbol/block '{target_symbol}' in '{path_str}' ({len(new_content_final)} total chars)."

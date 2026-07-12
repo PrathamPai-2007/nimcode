@@ -7,7 +7,6 @@ from nimcode.tools.registry import (
     AVAILABLE_TOOLS_SPEC,
 )
 from nimcode.tools.base import is_valid_tool_call
-from typing import Dict, Any
 
 ACTIVE_SUBAGENTS: Dict[str, Any] = {}
 
@@ -200,7 +199,10 @@ def resume_subagent_thread(agent_id: str, workspace_root: Path, config: Any):
             elif not api_key:
                 api_key = "missing_nvidia_api_key"
 
-            base_url = getattr(config, "api_base_url", None) or "https://integrate.api.nvidia.com/v1"
+            base_url = (
+                getattr(config, "api_base_url", None)
+                or "https://integrate.api.nvidia.com/v1"
+            )
 
             client = OpenAI(
                 base_url=base_url,
@@ -223,7 +225,7 @@ def resume_subagent_thread(agent_id: str, workspace_root: Path, config: Any):
             max_steps = (
                 50
                 if getattr(config, "mode", "") == "yolo"
-                else getattr(config, "max_loop_iterations", 5)
+                else getattr(config, "max_loop_iterations", 10)
             )
 
             for step in range(max_steps):
@@ -242,6 +244,11 @@ def resume_subagent_thread(agent_id: str, workspace_root: Path, config: Any):
                     "messages": normalized_messages,
                     "temperature": 0.3,
                 }
+                if hasattr(config, "max_tokens") and config.max_tokens is not None:
+                    kwargs["max_tokens"] = config.max_tokens
+                else:
+                    kwargs["max_tokens"] = 4096
+
                 if tools_arg:
                     kwargs["tools"] = tools_arg
 

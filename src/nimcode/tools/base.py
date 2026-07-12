@@ -1,4 +1,5 @@
 import json
+import re
 import difflib
 import shlex
 import subprocess
@@ -120,12 +121,72 @@ def is_valid_tool_call(tool_call: Any) -> Tuple[bool, str, Dict[str, Any]]:
             return False, tool_name, args
     elif tool_name == "list_agents":
         pass
+    elif tool_name == "start_background_process":
+        if not args.get("command"):
+            return False, tool_name, args
+    elif tool_name == "get_process_output":
+        if not args.get("process_id"):
+            return False, tool_name, args
+    elif tool_name == "stop_process":
+        if not args.get("process_id"):
+            return False, tool_name, args
+    elif tool_name == "screenshot_page":
+        if not args.get("url") and not args.get("html_file"):
+            return False, tool_name, args
+    elif tool_name == "web_search":
+        if not args.get("query"):
+            return False, tool_name, args
     else:
         return False, tool_name, args
     return True, tool_name, args
 
 
-def render_preview(tool_name: str, args: Dict[str, Any], workspace_root: Path) -> str:
+def scrub_text(text: str) -> str:
+    """
+    Scrub inline secrets (like Bearer tokens, Basic auth, or CLI secret flags) from arbitrary text.
+    """
+    if not text:
+        return text
+    # Mask Bearer tokens
+    text = re.sub(r"(?i)(bearer\s+)[\w\.\-]+", r"\1***REDACTED***", text)
+    # Mask Basic auth strings
+    text = re.sub(r"(?i)(basic\s+)[a-zA-Z0-9\+/=]+", r"\1***REDACTED***", text)
+    # Mask common CLI flags e.g., -p<pass>, --password=<pass>, --token=<token>
+    text = re.sub(
+        r"(?i)(-(?:p|-password|-token|-secret)\s*=?\s*['\"]?)[\w\.\-\+/\=]+",
+        r"\1***REDACTED***",
+        text,
+    )
+    # Mask headers like x-api-key
+    text = re.sub(
+        r"(?i)((?:api-key|x-api-key)\s*:\s*['\"]?)[\w\.\-]+", r"\1***REDACTED***", text
+    )
+    return text
+
+
+def truncate_output(text: str, max_length: int = 100000) -> str:
+    """
+    Smart truncation: keeps the first N and last N chars of the string, dropping the middle.
+    This ensures that both the beginning (context) and the end (stack traces/errors) are preserved.
+    """
+    if len(text) <= max_length:
+        return text
+
+    msg = f"\n... [Output truncated: dropped {len(text) - max_length} chars from the middle] ...\n"
+    budget = max_length - len(msg)
+
+    if budget <= 0:
+        return text[:max_length]
+
+    first_half = budget // 2
+    last_half = budget - first_half
+
+    return text[:first_half] + msg + text[-last_half:]
+
+
+def render_preview(
+    tool_name: str, args: Dict[str, Any], workspace_root: Path, config: Any = None
+) -> str:
     """
     Renders a human-friendly preview of the tool call before requesting approval.
     For write_file, generates a unified diff. For execute_command, shows the exact command.
@@ -161,11 +222,15 @@ def render_preview(tool_name: str, args: Dict[str, Any], workspace_root: Path) -
             return f"\n[Tool Preview: write_file] Path: {path_str}\nError: {e}\n"
 
     elif tool_name == "execute_command":
-        command = args.get("command", "")
+        command = scrub_text(args.get("command", ""))
         use_docker = args.get("use_docker", None)
         if use_docker is None:
             # Will be determined at execution time based on config
-            use_docker = is_docker_available()
+            use_docker = (
+                not getattr(config, "disable_docker", False) and is_docker_available()
+                if config is not None
+                else is_docker_available()
+            )
         if use_docker:
             docker_image = args.get("docker_image", "python:3.11-slim")
             workspace = workspace_root.resolve()
@@ -174,7 +239,7 @@ def render_preview(tool_name: str, args: Dict[str, Any], workspace_root: Path) -
                 f"docker run --rm --init "
                 f"--cap-drop ALL "
                 f"--security-opt no-new-privileges:true "
-                f"-v {shlex.quote(str(workspace))}:/workspace "
+                f"-v {str(workspace)}:/workspace "
                 f"-w /workspace "
                 f"{docker_image} "
                 f"sh -c {shlex.quote(command)}"
@@ -184,10 +249,14 @@ def render_preview(tool_name: str, args: Dict[str, Any], workspace_root: Path) -
             return f"\n[Tool Preview: execute_command (Host)]\n{command}\n"
 
     elif tool_name == "run_tests":
-        command = args.get("command", "pytest")
+        command = scrub_text(args.get("command", "pytest"))
         use_docker = args.get("use_docker", None)
         if use_docker is None:
-            use_docker = is_docker_available()
+            use_docker = (
+                not getattr(config, "disable_docker", False) and is_docker_available()
+                if config is not None
+                else is_docker_available()
+            )
         if use_docker:
             docker_image = args.get("docker_image", "python:3.11-slim")
             workspace = workspace_root.resolve()
@@ -195,7 +264,7 @@ def render_preview(tool_name: str, args: Dict[str, Any], workspace_root: Path) -
                 f"docker run --rm --init "
                 f"--cap-drop ALL "
                 f"--security-opt no-new-privileges:true "
-                f"-v {shlex.quote(str(workspace))}:/workspace "
+                f"-v {str(workspace)}:/workspace "
                 f"-w /workspace "
                 f"{docker_image} "
                 f"sh -c {shlex.quote(command)}"
@@ -218,6 +287,7 @@ def render_preview(tool_name: str, args: Dict[str, Any], workspace_root: Path) -
         rep_code = args.get("replacement_code", "")
         try:
             from nimcode.tools.patch import patch_file_ast_logic
+
             diff_text = patch_file_ast_logic(
                 workspace_root, path_str, target_sym, rep_code, dry_run=True
             )
@@ -230,10 +300,13 @@ def render_preview(tool_name: str, args: Dict[str, Any], workspace_root: Path) -
         edit_blocks = args.get("edit_blocks", "")
         try:
             from nimcode.tools.fs import patch_file_blocks_logic
+
             diff_text = patch_file_blocks_logic(
                 workspace_root, path_str, edit_blocks, dry_run=True
             )
-            return f"\n[Tool Preview: patch_file_blocks] Path: {path_str}\n{diff_text}\n"
+            return (
+                f"\n[Tool Preview: patch_file_blocks] Path: {path_str}\n{diff_text}\n"
+            )
         except Exception as e:
             return f"\n[Tool Preview: patch_file_blocks] Path: {path_str}\nError Proposed Patch: {e}\n"
 
@@ -262,32 +335,49 @@ def render_preview(tool_name: str, args: Dict[str, Any], workspace_root: Path) -
     elif tool_name == "list_agents":
         return "\n[Tool Preview: list_agents]\n"
 
+    elif tool_name == "start_background_process":
+        command = scrub_text(args.get("command", ""))
+        return f"\n[Tool Preview: start_background_process] Start background process: `{command}` (will run detached, use get_process_output to check on it)\n"
+
+    elif tool_name == "get_process_output":
+        process_id = args.get("process_id", "")
+        return f"\n[Tool Preview: get_process_output] Get output/logs for background process '{process_id}'\n"
+
+    elif tool_name == "stop_process":
+        process_id = args.get("process_id", "")
+        return (
+            f"\n[Tool Preview: stop_process] Stop background process '{process_id}'\n"
+        )
+
+    elif tool_name == "screenshot_page":
+        url = args.get("url", "")
+        html_file = args.get("html_file", "")
+        target = url if url else html_file
+        return f"\n[Tool Preview: screenshot_page] Target: {target}\n"
+
+    elif tool_name == "web_search":
+        query = args.get("query", "")
+        return f"\n[Tool Preview: web_search] Query: '{query}'\n"
+
     return f"\n[Tool Preview: {tool_name}] Args: {json.dumps(args, indent=2)}\n"
+
+
+# Compiled regex for detecting sensitive environment variables.
+# This covers common names, abbreviations (_PW, _PWD), and ignores case.
+SENSITIVE_ENV_REGEX = re.compile(
+    r"(API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|_PW|_PWD|CREDENTIAL|PRIVATE_KEY|AUTH_)",
+    re.IGNORECASE,
+)
 
 
 def scrub_env(env: Dict[str, str]) -> Dict[str, str]:
     """
     Remove sensitive environment variables before passing to subprocess.
+    Uses regex to catch common credential patterns and abbreviations.
     """
-    sensitive_keys = {
-        "API_KEY",
-        "TOKEN",
-        "SECRET",
-        "PASSWORD",
-        "PRIVATE_KEY",
-        "ACCESS_TOKEN",
-        "AUTH_TOKEN",
-        "NVIDIA_API_KEY",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "GITHUB_TOKEN",
-        "GITLAB_TOKEN",
-        "DOCKER_TOKEN",
-    }
     scrubbed = {}
     for k, v in env.items():
-        upper_k = k.upper()
-        if any(s in upper_k for s in sensitive_keys):
+        if SENSITIVE_ENV_REGEX.search(k):
             scrubbed[k] = "***REDACTED***"
         else:
             scrubbed[k] = v

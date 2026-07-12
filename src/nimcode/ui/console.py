@@ -35,6 +35,7 @@ def show_help():
         "/changes / /diff", "Check git working tree changes and recent file backups"
     )
     table.add_row("/compact", "Compact conversation history into summary.md")
+    table.add_row("/recap", "Show a quick 4-5 line summary of the session")
     table.add_row("/skills", "Show installed agent skills")
     table.add_row(
         "/install-skill <link>", "Install new skill from raw .md, .zip, or git repo"
@@ -52,10 +53,11 @@ def show_help():
 
 def print_welcome():
     left_text = Text()
-    left_text.append("       _                         _\n", style="bold cyan")
-    left_text.append(" _ __ (_) _ __ ___   ___  ___   __| | ___\n", style="bold cyan")
+    left_text.append("       _                         _      \n", style="bold cyan")
+    left_text.append("      (_)                       | |     \n", style="bold cyan")
+    left_text.append(" _ __  _ _ __ ___   ___ ___   __| | ___ \n", style="bold cyan")
     left_text.append(
-        "| '_ \\| | '_ ` _ \\ / __|/ _ \\ / _` |/ _ \\\n", style="bold cyan"
+        "| '_ \\| | '_ ` _ \\ / __/ _ \\ / _` |/ _ \\\n", style="bold cyan"
     )
     left_text.append("| | | | | | | | | | (_| (_) | (_| |  __/\n", style="bold cyan")
     left_text.append(
@@ -65,7 +67,7 @@ def print_welcome():
 
     bullet = symbol("bullet")
     right_text = Text()
-    right_text.append("\n\n")
+    right_text.append("\n\n\n")
     right_text.append(
         f"{bullet} Shift+Tab to cycle between Plan, Build & YOLO modes\n",
         style="dim",

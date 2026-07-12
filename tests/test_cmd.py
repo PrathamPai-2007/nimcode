@@ -4,6 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from nimcode.tools.cmd import execute_command_tool
+from nimcode.tools.base import truncate_output
 from nimcode.config import Config
 
 
@@ -37,3 +38,13 @@ def test_execute_command_invalid():
     workspace = Path.cwd()
     result = execute_command_tool({"command": ""}, workspace, config)
     assert "Error: No command provided" in result
+
+
+def test_truncate_output():
+    long_string = "START" + ("x" * 200) + "END"
+    # Cap smaller than string length
+    truncated = truncate_output(long_string, max_length=150)
+    assert truncated.startswith("START")
+    assert truncated.endswith("END")
+    assert "dropped" in truncated
+    assert len(truncated) == 150

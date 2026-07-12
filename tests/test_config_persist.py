@@ -71,30 +71,29 @@ def test_get_project_nimcode_dir_hashing_and_migration():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         workspace = Path(tmpdir)
-        
+
         # Test basic directory retrieval (hashed name)
         p_dir = get_project_nimcode_dir(workspace)
         assert p_dir.name.startswith(f"{workspace.name}_")
         assert len(p_dir.name) == len(workspace.name) + 9  # name + _ + 8-char hash
-        
+
         # Test migration from legacy un-hashed directory
         legacy_dir = Path.home() / ".nimcode" / workspace.name
         legacy_dir.mkdir(parents=True, exist_ok=True)
         dummy_file = legacy_dir / "test.txt"
         dummy_file.write_text("hello", encoding="utf-8")
-        
+
         # Clean the hashed project directory if it was created
         if p_dir.exists():
             shutil.rmtree(p_dir)
-            
+
         p_dir = get_project_nimcode_dir(workspace)
         # The hashed dir should have been created, and the file migrated
         assert p_dir.exists()
         assert (p_dir / "test.txt").exists()
         assert (p_dir / "test.txt").read_text(encoding="utf-8") == "hello"
         assert not legacy_dir.exists()
-        
+
         # Cleanup
         if p_dir.exists():
             shutil.rmtree(p_dir)
-
