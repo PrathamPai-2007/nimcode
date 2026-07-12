@@ -760,10 +760,9 @@ def run_agent_loop(
     if existing_messages:
         messages = existing_messages
         print_session_history(messages)
-        if messages:
-            last_msg = messages[-1]
-            if last_msg.get("role") == "assistant" and not last_msg.get("tool_calls"):
-                skip_first_api_call = True
+        # Always wait for user input after loading a session — never auto-fire the agent.
+        # The user should decide whether to continue, redirect, or start fresh.
+        skip_first_api_call = True
     else:
         system_prompt = build_system_prompt(
             str(workspace_root),
@@ -778,19 +777,28 @@ def run_agent_loop(
     loop_count = 0
 
     def prompt_user(text, **kwargs):
-        disable_persistent_prompt()
-        from prompt_toolkit import prompt as pt_prompt
-        from prompt_toolkit.patch_stdout import patch_stdout
+        """Prompt the user for simple y/n/feedback input.
 
+        Uses plain built-in input() to avoid prompt_toolkit deadlocks on Windows
+        when called outside the normal TUI event loop (e.g. after a Rich spinner).
+        """
+        disable_persistent_prompt()
         prompt_text = (
             text
             if text.endswith(": ")
             else (text + " " if text.endswith(":") else text + ": ")
         )
+        # Flush any pending output so the prompt appears before we block on input
         try:
-            with patch_stdout():
-                res = pt_prompt(prompt_text)
-        except (KeyboardInterrupt, EOFError):
+            sys.stdout.flush()
+        except Exception:
+            pass
+        try:
+            res = input(prompt_text)
+        except KeyboardInterrupt:
+            echo("\n")
+            res = "q"
+        except EOFError:
             res = "q"
         enable_persistent_prompt(state, config, workspace_root, res)
         return res
@@ -1320,6 +1328,7 @@ def run_agent_loop(
                         )
                         print_session_history(messages)
 
+                        # Patch up dangling tool calls so the history is valid
                         if messages:
                             last_msg = messages[-1]
                             if last_msg.get("role") == "assistant" and last_msg.get(
@@ -1333,9 +1342,73 @@ def run_agent_loop(
                                     }
                                     messages.append(dummy_res)
                                     log_turn(dummy_res, session_path)
-                                return "__RESUME_AI_LOOP__"
-                            elif last_msg.get("role") in ("user", "tool"):
-                                return "__RESUME_AI_LOOP__"
+
+                        # Show a brief summary of where the session left off
+                        last_non_system = next(
+                            (
+                                m
+                                for m in reversed(messages)
+                                if m.get("role") != "system"
+                            ),
+                            None,
+                        )
+                        if last_non_system:
+                            role = last_non_system.get("role", "?")
+                            snippet = (
+                                str(last_non_system.get("content") or "")
+                                .strip()
+                                .replace("\n", " ")
+                            )
+                            if len(snippet) > 120:
+                                snippet = snippet[:120] + "..."
+                            secho(
+                                f"\nSession last left off with a [{role}] message:",
+                                fg=typer.colors.CYAN,
+                            )
+                            secho(f"  {snippet}", fg=typer.colors.WHITE)
+
+                        secho(
+                            "\nWhat would you like to do?",
+                            fg=typer.colors.CYAN,
+                            bold=True,
+                        )
+                        secho(
+                            "  y          → Continue where it left off (agent picks up from last state)",
+                            fg=typer.colors.GREEN,
+                        )
+                        secho(
+                            "  <message>  → Give the agent new instructions",
+                            fg=typer.colors.GREEN,
+                        )
+                        secho(
+                            "  n / enter  → Stay in session but do nothing (type your own prompt)",
+                            fg=typer.colors.GREEN,
+                        )
+
+                        try:
+                            sys.stdout.flush()
+                            resume_choice = input(
+                                "\nContinue / new instructions / n: "
+                            ).strip()
+                        except (KeyboardInterrupt, EOFError):
+                            resume_choice = ""
+
+                        if resume_choice.lower() == "y":
+                            return "__RESUME_AI_LOOP__"
+                        elif resume_choice.lower() in ("n", ""):
+                            # Stay in session, loop back to get_user_turn for fresh prompt
+                            secho(
+                                "\nSession loaded. Type your instructions below.\n",
+                                fg=typer.colors.CYAN,
+                            )
+                            continue
+                        else:
+                            # Treat whatever they typed as a new user message
+                            user_msg = {"role": "user", "content": resume_choice}
+                            messages.append(user_msg)
+                            log_turn(user_msg, session_path)
+                            return "__RESUME_AI_LOOP__"
+
                     except Exception as e:
                         secho(f"Error loading session: {e}", fg=typer.colors.RED)
                 continue
@@ -1574,14 +1647,46 @@ def run_agent_loop(
 
                 approval = (
                     prompt_user(
-                        "Approve this plan to begin execution? (y/n/yolo for yolo mode/q to quit)"
+                        "Approve this plan to begin execution? (y/n/yolo for yolo mode)"
                     )
                     .strip()
                     .lower()
                 )
-                if approval == "q":
-                    echo("Exiting nimcode session.")
-                    break
+                if approval in ("q", "n", ""):
+                    # Cancel plan — stay in session, let user redirect
+                    secho(
+                        "\nPlan cancelled. You can refine your request or type a new prompt.\n",
+                        fg=typer.colors.YELLOW,
+                        bold=True,
+                    )
+                    cancel_msg = {
+                        "role": "user",
+                        "content": "[Plan rejected/cancelled by user. Awaiting new instructions.]",
+                    }
+                    messages.append(cancel_msg)
+                    log_turn(cancel_msg, session_path)
+                    loop_count = 0
+                    user_input = get_user_turn()
+                    if user_input is None or user_input.lower() in [
+                        "exit",
+                        "quit",
+                        "/exit",
+                        "/quit",
+                    ]:
+                        secho(
+                            "\nExiting nimcode session.",
+                            fg=typer.colors.GREEN,
+                            bold=True,
+                        )
+                        break
+                    if user_input == "__RESUME_AI_LOOP__":
+                        loop_count = 0
+                        continue
+                    user_msg = {"role": "user", "content": user_input}
+                    messages.append(user_msg)
+                    log_turn(user_msg, session_path)
+                    loop_count = 0
+                    continue
                 elif approval == "yolo":
                     state = AgentState.YOLO
                     config.mode = "yolo"
@@ -1667,16 +1772,51 @@ def run_agent_loop(
                     bold=True,
                 )
                 user_input = prompt_user(
-                    "Resume loop? (y to continue / enter feedback to redirect / q to quit)"
+                    "Resume loop? (y to continue / feedback to redirect / n or q to cancel & stay)"
                 ).strip()
-                if user_input.lower() == "q":
-                    break
+                if user_input.lower() in ("q", "n", ""):
+                    # Cancel the current loop — inject cancellation results and hand back to user
+                    secho(
+                        "\nLoop cancelled. You're still in the session — type a new prompt.\n",
+                        fg=typer.colors.YELLOW,
+                        bold=True,
+                    )
+                    for tc in raw_message.tool_calls:
+                        cancel_msg = {
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": "Execution cancelled by user (loop limit reached). Awaiting new instructions.",
+                        }
+                        messages.append(cancel_msg)
+                        log_turn(cancel_msg, session_path)
+                    loop_count = 0
+                    user_input = get_user_turn()
+                    if user_input is None or user_input.lower() in [
+                        "exit",
+                        "quit",
+                        "/exit",
+                        "/quit",
+                    ]:
+                        secho(
+                            "\nExiting nimcode session.",
+                            fg=typer.colors.GREEN,
+                            bold=True,
+                        )
+                        break
+                    if user_input == "__RESUME_AI_LOOP__":
+                        loop_count = 0
+                        continue
+                    user_msg = {"role": "user", "content": user_input}
+                    messages.append(user_msg)
+                    log_turn(user_msg, session_path)
+                    loop_count = 0
+                    continue
                 elif user_input.lower() != "y":
                     for tc in raw_message.tool_calls:
                         cancel_msg = {
                             "role": "tool",
                             "tool_call_id": tc.id,
-                            "content": f"Execution cancelled by user. Feedback: {user_input}",
+                            "content": f"Execution redirected by user. Feedback: {user_input}",
                         }
                         messages.append(cancel_msg)
                         log_turn(cancel_msg, session_path)
@@ -1716,16 +1856,14 @@ def run_agent_loop(
                     else:
                         approval = (
                             prompt_user(
-                                f"Approve execution of {tool_name}? (y/n/q to quit)"
+                                f"Approve execution of {tool_name}? (y/n to skip)"
                             )
                             .strip()
                             .lower()
                         )
                     if approval == "q":
-                        echo("Exiting nimcode session.")
-                        disable_persistent_prompt()
-                        atexit.unregister(disable_persistent_prompt)
-                        return
+                        # Treat q same as n — cancel this tool call, stay in session
+                        approval = "n"
                     elif approval == "y":
                         result = execute_local_tool(
                             tool_name, args, workspace_root, config
