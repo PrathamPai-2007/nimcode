@@ -1260,7 +1260,11 @@ async def _run_agent_loop_tui_internal(
                             "patch_file_ast",
                             "patch_file_blocks",
                         ]:
-                            from nimcode.tools import execute_test_runner, tests_passed
+                            from nimcode.tools import (
+                                execute_test_runner,
+                                no_tests_found,
+                                tests_passed,
+                            )
 
                             tui.add_message(
                                 "system",
@@ -1275,7 +1279,9 @@ async def _run_agent_loop_tui_internal(
                             tui.add_message(
                                 "tool", f"Test Results:\n{test_res}", markdown=False
                             )
-                            if not tests_passed(test_res):
+                            if not tests_passed(test_res) and not no_tests_found(
+                                test_res
+                            ):
                                 result += f"\n\n[CRITICAL WARNING: Auto-run tests failed! Please fix this immediately]\n{test_res}"
                     else:
                         user_feedback = await tui.get_user_input(

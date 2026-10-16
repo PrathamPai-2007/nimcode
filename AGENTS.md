@@ -214,6 +214,11 @@ To satisfy NVIDIA NIM endpoints (notably **MiniMax-M3**, **GLM-5.2**) via the Op
 
 ---
 
+- **Headless:** `nimcode run --headless` drives the same `run_agent_loop_tui()` with `HeadlessTUI` (`ui/headless.py`): stdout output, auto-approve, ends when the agent asks for input or the step budget runs out; `UsageMeter` records real API token usage. Any new TUI method the loop calls must also exist on `HeadlessTUI`.
+- **Auto-tests:** pytest/unittest exit code 5 (nothing collected) is neutral (`no_tests_found()`), not a failure to report to the model.
+
+---
+
 ## 10. Testing & CI Expectations
 
 - **Dev setup:** `uv sync --extra dev` (or `pip install -e .[dev]`) — pins ruff and pytest.

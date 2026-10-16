@@ -162,6 +162,20 @@ def run(
         "-y",
         help="Run directly in YOLO mode (auto-accept edits and commands).",
     ),
+    headless: bool = typer.Option(
+        False,
+        "--headless",
+        help="No TUI: stream to stdout, auto-approve, exit when the agent finishes.",
+    ),
+    model: Optional[str] = typer.Option(
+        None, "--model", help="Model id for this run (sets both fast and plan model)."
+    ),
+    max_steps: int = typer.Option(
+        150, "--max-steps", help="Headless: total agent steps before stopping."
+    ),
+    json_out: Optional[Path] = typer.Option(
+        None, "--json-out", help="Headless: write a JSON run summary here."
+    ),
 ):
     """
     Start the NIM-Engineer agent loop with a specific task prompt.
@@ -170,6 +184,8 @@ def run(
     if mode is not None and mode.lower() not in ("plan", "build", "yolo"):
         raise typer.BadParameter("Mode must be one of: plan, build, yolo.")
     client, config, workspace_root, workspace_map = _get_client_and_setup()
+    if model:
+        config.fast_model = config.plan_model = model
     if yolo or (mode and mode.lower() == "yolo"):
         config.mode = "yolo"
         initial_state = "YOLO"
@@ -186,6 +202,20 @@ def run(
             else ("AWAITING_PLAN_APPROVAL" if config.mode == "plan" else "EXECUTING")
         )
 
+    if headless:
+        raise typer.Exit(
+            _run_headless(
+                client,
+                config,
+                workspace_root,
+                workspace_map,
+                prompt,
+                initial_state,
+                max_steps,
+                json_out,
+            )
+        )
+
     # Create TUI and run async loop
     tui = _make_tui(config=config)
     tui.show_welcome(str(workspace_root))
@@ -200,6 +230,58 @@ def run(
             initial_state=initial_state,
         )
     )
+
+
+def _run_headless(
+    client,
+    config,
+    workspace_root,
+    workspace_map,
+    prompt,
+    initial_state,
+    max_steps,
+    json_out,
+) -> int:
+    """Run the real agent loop with HeadlessTUI. Exit code: 0 finished,
+    2 step limit reached, 1 crashed."""
+    import time
+
+    from nimcode.ui.headless import HeadlessTUI, UsageMeter, write_summary
+
+    per_batch = 50 if initial_state == "YOLO" else max(1, config.max_loop_iterations)
+    tui = HeadlessTUI(config=config, max_resumes=max(0, -(-max_steps // per_batch) - 1))
+    meter = UsageMeter(client)
+    started = time.time()
+    error = None
+    try:
+        tui.show_welcome(str(workspace_root))
+        asyncio.run(
+            run_agent_loop_tui(
+                tui,
+                client,
+                prompt,
+                config,
+                workspace_root,
+                workspace_map,
+                initial_state=initial_state,
+            )
+        )
+    except Exception as e:  # report, don't traceback-spam the benchmark log
+        error = f"{type(e).__name__}: {e}"
+        tui.add_message("error", error)
+    status = "error" if error else (tui.ended_by or "agent_finished")
+    summary = {
+        "status": status,
+        "model": config.fast_model,
+        "mode": initial_state,
+        "duration_s": round(time.time() - started, 2),
+        **meter.as_dict(),
+        "error": error,
+    }
+    if json_out:
+        write_summary(str(json_out), summary)
+    print(f"[summary] {summary}")
+    return {"agent_finished": 0, "step_limit": 2}.get(status, 1)
 
 
 @app.command()

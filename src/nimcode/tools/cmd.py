@@ -687,10 +687,20 @@ def run_tests_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> s
     )
 
 
+def _final_exit_code(output: str):
+    codes = re.findall(r"\[exit code: (-?\d+)\]", output or "")
+    return codes[-1] if codes else None
+
+
 def tests_passed(output: str) -> bool:
     """True iff the final ``[exit code: N]`` marker appended by the runner is 0."""
-    codes = re.findall(r"\[exit code: (-?\d+)\]", output or "")
-    return bool(codes) and codes[-1] == "0"
+    return _final_exit_code(output) == "0"
+
+
+def no_tests_found(output: str) -> bool:
+    """pytest and unittest both exit 5 when nothing was collected; that is not
+    a failure the model should be told to fix."""
+    return _final_exit_code(output) == "5"
 
 
 def execute_test_runner(

@@ -5,7 +5,29 @@ on:
     tags: [ "v*" ]
 
 jobs:
+  version:
+    # A tag must ship wheels of the same version (v0.7.0-rc1 <-> 0.7.0rc1).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tag matches nimcode.__version__
+        run: |
+          python -m pip install packaging
+          python - <<'EOF'
+          import os, re
+          from packaging.version import Version
+          tag = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          src = open("src/nimcode/__init__.py", encoding="utf-8").read()
+          pkg = re.search(r'__version__\s*=\s*"([^"]+)"', src).group(1)
+          assert Version(tag) == Version(pkg), f"tag {tag} != package {pkg}"
+          print("version OK:", pkg)
+          EOF
+
   wheels:
+    needs: version
     name: wheel (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -88,6 +110,7 @@ jobs:
           path: dist/*.whl
 
   sdist:
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -116,3 +139,5 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          # v1.2.0-rc1, v1.2.0-beta... are pre-releases
+          prerelease: ${{ contains(github.ref_name, '-') }}

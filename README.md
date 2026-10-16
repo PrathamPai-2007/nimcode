@@ -330,6 +330,14 @@ This file is re-loaded on every CLI boot so `/model` switches survive restarts.
 
 All commands are defined in `src/nimcode/cli.py:137` as `typer.Typer` subcommands. Available: `run`, `start`, `status`, `config`, `refresh-models`, `resume`, `init`, `stats`, plus `nimcode --version` / `-V`.
 
+### `nimcode run --headless` (scripts, CI, benchmarks)
+
+```bash
+nimcode run --headless --yolo --model <model-id> --max-steps 150 --json-out run.json "fix the failing test"
+```
+
+Runs the real agent loop with no TUI: messages stream to stdout as `[role] text`, every approval is auto-accepted, and the run ends when the agent hands control back (finishes) or after `--max-steps`. Exit code `0` = finished, `2` = step limit, `1` = error. `--json-out` writes `{status, model, mode, duration_s, api_calls, prompt_tokens, completion_tokens, total_tokens, error}`, with token counts taken from the API's reported usage. No Rust sidecar is needed.
+
 ### `nimcode config`
 
 Prints every setting with its value and where it came from: `[default]`, `[nimcode.toml]`, `[model.json]` or `[cwd]`.
