@@ -20,10 +20,10 @@ nimcode/
 │   └── nimcode/
 │       ├── __init__.py             # __version__ (single source; pyproject reads it dynamically)
 │       ├── __main__.py             # python -m nimcode → cli.app
-│       ├── cli.py                  # Typer CLI: run / start / status / refresh-models / resume / init / stats
+│       ├── cli.py                  # Typer CLI: run / start / status / config / refresh-models / resume / init / stats; --version
 │       ├── config.py               # Config dataclass, load/save/validate, AVAILABLE_MODELS, model.json persistence, show_changes(), select_interactive_session()
 │       ├── config_models.py        # Live NIM model catalog (fetch/cache/filter), MODEL_CONTEXT_TOKENS, apply_model_context(), effective_budget()
-│       ├── context.py              # is_ignored(), load_gitignore_rules(), generate_workspace_map()
+│       ├── context.py              # is_ignored(), load_gitignore_rules() (nested .gitignore + .git/info/exclude, cached), generate_workspace_map() (git ls-files, entry points + recent first)
 │       ├── skills.py               # fetch_skill() → preview → commit_skill() / discard_skill(); install_skill(), list_skills(), get_skill_content() → ~/.nimcode/skills/
 │       ├── bin/                    # nim-tui sidecar binary — gitignored, built per-platform by release.yml
 │       ├── core/
@@ -42,10 +42,10 @@ nimcode/
 │       │   ├── browser.py          # screenshot_page via Playwright + per-request SSRF route guard
 │       │   └── web.py              # web_search via DuckDuckGo HTML parser
 │       └── ui/
-│           ├── console.py          # show_help() + print_welcome() banner
+│           ├── console.py          # KEY_BINDINGS + COMMAND_HELP (single source for /help), show_help(), print_welcome()
 │           ├── output.py           # Console singleton, symbol(), unicode/color detection, TUI_INSTANCE routing, safe_text()
 │           └── rust_bridge.py      # RustTUI — loopback-socket NDJSON bridge to the nim-tui sidecar (sole TUI); find_rust_binary(), poll_events()
-├── tui-rs/                         # Rust sidecar source (ratatui/crossterm)
+├── tui-rs/                         # Rust sidecar: main.rs (I/O loop), app.rs (state, input, history), ui.rs (drawing), theme.rs (palette + glyph tables); snapshots/ = TestBackend layouts
 ├── tests/                          # pytest suite (~145 tests); protocol_samples.json + fake_sidecar.py pin the Python↔Rust wire format
 ├── pyproject.toml                  # PEP 517 metadata; [dev] extra pins ruff/pytest
 ├── setup.py                        # Bare setup() shim
@@ -66,7 +66,7 @@ nimcode/
    - All file-path arguments **must** flow through `resolve_and_validate_path()` (`tools/base.py`) — it resolves against `workspace_root` and rejects escapes. Backups go through shared `backup_file()`, which also records the original path in `backups/manifest.jsonl` — never re-implement backup logic per tool; read backups via `list_backups()`.
    - Every subprocess inherits `scrub_env()` (which **drops** sensitive variables) and its command preview + output pass `scrub_text()` to mask Bearer/`Authorization: Basic` tokens, `--password`/`--token` flags, `KEY=value` env lines, AWS/NVIDIA/OpenAI/GitHub/Slack/Google keys, JWTs, `scheme://user:pass@` URLs, and 32+ char alphanumeric keys.
    - Any outbound fetch of a user/model-supplied URL must pass `_is_url_allowed()` (`tools/base.py`), including every redirect hop.
-3. **Consolidated Global Config:** All persistent state (chat histories `sessions/`, backups `backups/`, `process_logs/`, `model.json`, `summary.md`, optional `AGENTS.md` copy) **must** reside under `get_project_nimcode_dir(workspace_root)` → `~/.nimcode/<name>_<hash>/`. Never write these into the user's repository.
+3. **Consolidated Global Config:** All persistent state (chat histories `sessions/`, subagent transcripts `subagents/`, backups `backups/`, `process_logs/`, `model.json`, `summary.md`, optional `AGENTS.md` copy) **must** reside under `get_project_nimcode_dir(workspace_root)` → `~/.nimcode/<name>_<hash>/`. Never write these into the user's repository.
 4. **Three-Mode State Machine** (`core/state.py`):
    - `AWAITING_PLAN_APPROVAL` (Plan): `tools_arg = None` — model must emit `<plan>...</plan>`; no tool calls are sent or recorded.
    - `EXECUTING` (Build): full `AVAILABLE_TOOLS_SPEC` with preview gate; cap `max_loop_iterations` (default 20).
@@ -94,6 +94,8 @@ Global `BACKGROUND_PROCESSES` is terminated via an `atexit` hook and `/kill`.
 
 ### Visual Verification Loop — `screenshot_page` (`tools/browser.py`)
 
+The result includes a `[screenshot: <path>]` line; with `vision_screenshots = true` the PNG is attached to the next model call as an image part (the session log keeps only the path).
+
 For any frontend/UI task the agent **must**:
 
 1. `start_background_process` the dev server.
@@ -111,6 +113,7 @@ Playwright retries: 3 attempts, `+5s` timeout backoff, viewport `1280×720`, `do
 - **Autonomy:** Swarm threads spawned by `spawn_agent` execute tools **without** the human gate and **without** `render_preview()`. They run the full NIM loop (`resume_subagent_thread()`) for `max_steps = 50` in YOLO else `max_loop_iterations`, via `execute_local_tool()` directly, pruning history to `effective_budget()` each step.
 - **Docker-only execution:** Subagents can never run shell commands on the host. If Docker is unavailable or disabled, `execute_command` / `run_tests` / `start_background_process` return `SUBAGENT_HOST_REFUSAL`; if Docker is available, a subagent's `use_docker: false` is ignored.
 - **Lifecycle:** `spawn_agent_logic()` seeds `ACTIVE_SUBAGENTS[agent_id]`, then `resume_subagent_thread()` drives the model → tool cycle. `send_message_to_agent_logic()` puts messages in the agent's `inbox`, drained at the start of each step (no lost messages). `kill_agent_logic()` sets `KILLED`. `list_agents_logic()` renders `id | role | status | snippet`.
+- **Time limit & transcripts:** each run has a `subagent_timeout_s` wall-clock budget (default 900; `TIMED_OUT` when exceeded). Transcripts go to `subagents/<id>.jsonl`; ended agents are reaped from `ACTIVE_SUBAGENTS` after 10 minutes.
 - **Caps:** at most 10 **RUNNING** subagents (finished/killed ones don't count), checked atomically with the insert under `_SUBAGENTS_LOCK`.
 - **Monitoring:** `/team` in the TUI lists live subagents; the sidebar polls `ACTIVE_SUBAGENTS` every turn.
 - **Depth:** each agent record carries `depth`; threads run on a `copy.copy()` of config stamped with `_subagent_depth`, so the depth-3 cap accumulates across generations. Never mutate the shared `config` from a swarm thread.
@@ -201,6 +204,9 @@ To satisfy NVIDIA NIM endpoints (notably **MiniMax-M3**, **GLM-5.2**) via the Op
 
 - **Live prompt injection:** `run_agent_loop_tui()` rebuilds `messages[0]` every turn with a fresh `generate_workspace_map()` + `build_system_prompt()` so renames, deletes, and `AGENTS.md` edits apply without restart.
 - **TUI routing:** When `TUI_INSTANCE` is set (`ui/output.py`), `echo`/`secho`/`print_text` route to the sidecar TUI buffer; otherwise to `rich`/`typer`. It is cleared on session exit. Markdown is rendered inside the Rust sidecar (`tui-rs/src/main.rs`).
+- **Design ("Nim"):** no boxes; coloured speaker gutters; the context gauge is a 1-3-5-7 Nim matchstick board; mode colours the prompt (Plan wisteria, Build pine, YOLO sulfur); one fuse animation while working. Keep the palette in `tui-rs/src/theme.rs`, keep the board the only bold element, and update `tui-rs/snapshots/` (`cargo test`) when layout changes.
+- **Keys:** `KEY_BINDINGS` in `ui/console.py` must match the bindings in `tui-rs/src/app.rs`.
+- **Ctrl+D is sticky:** once requested, every prompt returns immediately and the interrupt flag stays set, so the loop reaches its exit check even from an approval prompt.
 - **Wire protocol:** NDJSON over loopback, UTF-8 both ways (Rust emits ASCII-escaped JSON). Any new message type must be added to `tests/protocol_samples.json`, which both `cargo test` and `tests/test_bridge_protocol.py` validate.
 - **Mode sync:** `config.mode` is synced into `state` at the top of each turn and between tool calls, so `Shift+Tab` and `/model` side-effects apply immediately.
 - **Cancellation:** Long NIM calls run in a worker thread polled every 50ms for `TUI_INSTANCE._interrupted` → `KeyboardInterrupt("ESC_CANCELLED")`. Interrupted tool batches get cancellation results via `close_dangling_tool_calls()` so history stays valid.

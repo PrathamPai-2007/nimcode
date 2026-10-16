@@ -1,0 +1,24 @@
+
+ ▎ model selector
+
+   › model-0  [128k ctx]
+     model-1  [128k ctx]
+     model-2  [128k ctx]
+     model-3  [128k ctx]
+     model-4  [128k ctx]
+     model-5  [128k ctx]
+     model-6  [128k ctx]
+     model-7  [128k ctx]
+     model-8  [128k ctx]
+     model-9  [128k ctx]
+     model-10  [128k ctx]
+     model-11  [128k ctx]
+     model-12  [128k ctx]
+     model-13  [128k ctx]
+     model-14  [128k ctx]
+     model-15  [128k ctx]
+     model-16  [128k ctx]
+     ↓ 23 more
+────────────────────────────────────────────────────────────────────────────────
+ deepseek-v4-flash                                                     41k/128k
+ ›                                          ↑↓ move · enter choose · esc cancel

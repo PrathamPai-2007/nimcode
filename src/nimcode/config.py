@@ -110,6 +110,12 @@ class Config:
     docker_cpus: str = "2"
     docker_network: str = "bridge"  # "bridge" or "none"; "host" is rejected
     api_base_url: Optional[str] = None
+    # Wall-clock limit per subagent run; on expiry the agent is TIMED_OUT.
+    subagent_timeout_s: int = 900
+    # Attach screenshot_page PNGs to the conversation as image_url parts.
+    vision_screenshots: bool = False
+    # SearXNG base URL used as web_search fallback; "" disables it.
+    searxng_url: str = ""
 
 
 _DOCKER_LIMIT_KEYS = (
@@ -224,6 +230,9 @@ def save_config(config: Config, workspace_root: Optional[Path] = None):
             f"docker_cpus = {q(str(config.docker_cpus or ''))}",
             f"docker_network = {q(str(config.docker_network or ''))}",
             f"denylist = {_json.dumps(list(config.denylist or []))}",
+            f"subagent_timeout_s = {_num(config.subagent_timeout_s, 900)}",
+            f"vision_screenshots = {'true' if config.vision_screenshots else 'false'}",
+            f"searxng_url = {q(str(config.searxng_url or ''))}",
         ]
         if getattr(config, "api_base_url", None):
             lines.append(f"api_base_url = {q(str(config.api_base_url))}")
@@ -339,12 +348,28 @@ def _validate_config(cfg: Config) -> None:
         cfg.docker_expose_ports = valid_ports
 
     # Bools: a TOML/JSON string "false" is truthy, so parse it explicitly.
-    for name in ("auto_backup", "disable_native_tools", "disable_docker"):
+    for name in (
+        "auto_backup",
+        "disable_native_tools",
+        "disable_docker",
+        "vision_screenshots",
+    ):
         val = getattr(cfg, name)
         if isinstance(val, str):
             setattr(cfg, name, val.strip().lower() in ("1", "true", "yes", "on"))
         elif not isinstance(val, bool):
             setattr(cfg, name, bool(val))
+
+    cfg.subagent_timeout_s = _coerce(cfg.subagent_timeout_s, int, 900)
+    if isinstance(cfg.subagent_timeout_s, bool) or cfg.subagent_timeout_s <= 0:
+        warnings.warn("subagent_timeout_s must be a positive integer. Using 900.")
+        cfg.subagent_timeout_s = 900
+
+    url = str(cfg.searxng_url or "").strip().rstrip("/")
+    if url and not re.match(r"https?://", url):
+        warnings.warn(f"searxng_url '{url}' must start with http(s)://. Disabled.")
+        url = ""
+    cfg.searxng_url = url
 
     # String lists: a bare string would be iterated char-by-char as docker args.
     for name in ("denylist", "docker_extra_args"):
@@ -405,6 +430,8 @@ def load_config(path: Optional[Any] = None) -> Config:
         config_path = Path("nimcode.toml")
         workspace_root = Path.cwd()
 
+    # Where each non-default value came from (shown by `nimcode config`).
+    sources: dict = {}
     if not config_path.exists():
         cfg = Config()
     else:
@@ -421,6 +448,7 @@ def load_config(path: Optional[Any] = None) -> Config:
             filtered = {}
         try:
             cfg = Config(**filtered)
+            sources = dict.fromkeys(filtered, "nimcode.toml")
         except TypeError:
             cfg = Config()
 
@@ -435,30 +463,46 @@ def load_config(path: Optional[Any] = None) -> Config:
                 mdata = json.load(mf)
                 if not isinstance(mdata, dict):
                     mdata = {}
+
+                def _set(key, value):
+                    setattr(cfg, key, value)
+                    sources[key] = "model.json"
+
                 if isinstance(mdata.get("model"), str) and mdata["model"]:
-                    cfg.fast_model = mdata["model"]
-                    cfg.plan_model = mdata["model"]
-                if isinstance(mdata.get("fast_model"), str) and mdata["fast_model"]:
-                    cfg.fast_model = mdata["fast_model"]
-                if isinstance(mdata.get("plan_model"), str) and mdata["plan_model"]:
-                    cfg.plan_model = mdata["plan_model"]
-                if "docker_image" in mdata:
-                    cfg.docker_image = mdata["docker_image"]
-                if "docker_expose_ports" in mdata:
-                    cfg.docker_expose_ports = mdata["docker_expose_ports"]
-                if "docker_extra_args" in mdata:
-                    cfg.docker_extra_args = mdata["docker_extra_args"]
-                if "disable_docker" in mdata:
-                    cfg.disable_docker = mdata["disable_docker"]
-                for key in _DOCKER_LIMIT_KEYS:
+                    _set("fast_model", mdata["model"])
+                    _set("plan_model", mdata["model"])
+                for key in ("fast_model", "plan_model"):
+                    if isinstance(mdata.get(key), str) and mdata[key]:
+                        _set(key, mdata[key])
+                for key in (
+                    "docker_image",
+                    "docker_expose_ports",
+                    "docker_extra_args",
+                    "disable_docker",
+                    *_DOCKER_LIMIT_KEYS,
+                ):
                     if key in mdata:
-                        setattr(cfg, key, mdata[key])
+                        _set(key, mdata[key])
     except Exception:
         pass
 
     # Validate after the model.json merge so its values are coerced too.
     _validate_config(cfg)
+    sources["workspace_root"] = "cwd"
+    cfg._sources = sources
     return cfg
+
+
+def config_sources(cfg: Config) -> List[tuple]:
+    """(key, value, source) for every Config field; source is "default",
+    "nimcode.toml", "model.json" or "cwd" (as recorded by load_config)."""
+    import dataclasses
+
+    recorded = getattr(cfg, "_sources", {})
+    return [
+        (f.name, getattr(cfg, f.name), recorded.get(f.name, "default"))
+        for f in dataclasses.fields(cfg)
+    ]
 
 
 def _backup_label(b: dict) -> str:

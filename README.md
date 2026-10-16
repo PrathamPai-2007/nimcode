@@ -275,6 +275,9 @@ Place an optional `nimcode.toml` in your **workspace root** (the directory you r
 | `docker_cpus` | `str` | `"2"` | `--cpus` limit (`""` disables) |
 | `docker_network` | `str` | `"bridge"` | `bridge` or `none` (`host` rejected) |
 | `disable_native_tools` | `bool` | `false` | Force prompt-based XML `<tool_call>` mode (auto-set if server rejects `auto` tool choice) |
+| `subagent_timeout_s` | `int` | `900` | Wall-clock limit per subagent run (`TIMED_OUT` when exceeded) |
+| `vision_screenshots` | `bool` | `false` | Attach `screenshot_page` PNGs as image parts for vision models |
+| `searxng_url` | `str` | `""` | SearXNG instance used when DuckDuckGo blocks or fails (`format=json` must be enabled) |
 | `api_base_url` | `str \| null` | `null` | Override OpenAI base URL (defaults to `https://integrate.api.nvidia.com/v1`) |
 | `denylist` | `list[str]` | `[]` | Reserved for future denylist enforcement |
 
@@ -325,7 +328,11 @@ This file is re-loaded on every CLI boot so `/model` switches survive restarts.
 
 ## 8. CLI Reference
 
-All commands are defined in `src/nimcode/cli.py:137` as `typer.Typer` subcommands. Available: `run`, `start`, `status`, `refresh-models`, `resume`, `init`, `stats`.
+All commands are defined in `src/nimcode/cli.py:137` as `typer.Typer` subcommands. Available: `run`, `start`, `status`, `config`, `refresh-models`, `resume`, `init`, `stats`, plus `nimcode --version` / `-V`.
+
+### `nimcode config`
+
+Prints every setting with its value and where it came from: `[default]`, `[nimcode.toml]`, `[model.json]` or `[cwd]`.
 
 ### `nimcode` (no args) → `nimcode start`
 
@@ -396,7 +403,43 @@ Shim via `src/nimcode/__main__.py:1` — identical to `nimcode`.
 
 ## 9. TUI & Slash Commands
 
-The TUI is the Rust sidecar `nim-tui` (`tui-rs/`, bundled in release wheels, override via `NIM_TUI_BIN`), driven by `run_agent_loop_tui()` (`src/nimcode/core/agent_tui.py:78`) through the `RustTUI` bridge (`src/nimcode/ui/rust_bridge.py`). Python speaks NDJSON to the sidecar over a loopback socket; the sidecar owns the terminal (raw mode + alternate screen), so keystrokes are handled exactly once. If the binary is missing, `nimcode` exits with rebuild instructions instead of starting a degraded UI.
+The TUI is the Rust sidecar `nim-tui` (`tui-rs/`, bundled in release wheels, override via `NIM_TUI_BIN`), driven by `run_agent_loop_tui()` through the `RustTUI` bridge (`src/nimcode/ui/rust_bridge.py`). Python speaks NDJSON to the sidecar over a loopback socket; the sidecar owns the terminal (raw mode + alternate screen), so keystrokes are handled exactly once. If the binary is missing, `nimcode` exits with rebuild instructions instead of starting a degraded UI.
+
+#### Design: "Nim"
+
+*Nim* is the old game of taking matchsticks from heaps (classic start: 1-3-5-7), and the context window plays the same way. The sidebar's context gauge is that board: 16 sticks, each 1/16 of the budget; unused sticks keep a sulfur head, spent ones are struck to a dim `╎`. Under it, a plain "41k of 128k" (sulfur from 75%).
+
+- **No boxes.** One vertical rule separates the conversation from the sidebar; one horizontal rule sits above the input.
+- **Who is speaking** is a coloured left gutter `▎`: wisteria for you, pine for nimcode, sulfur for tools, ash for system notes, red only for errors. Text wraps at 100 columns.
+- **Mode** colours the mode word and the `›` prompt: Plan = wisteria, Build = pine, YOLO = sulfur.
+- **Tool output** is dimmed and folded past 12 lines (`Ctrl+O` expands); diffs use pine `+` and sulfur `-`.
+- **Working** shows a burning fuse `━━━━╸` with the working message and elapsed seconds; when the turn ends, the reply's gutter flashes once.
+- **Empty state:** the board drawn large with "Describe a task, or type / for commands."
+- Hints at the bottom right change with context (typing, selector, approval, scrolled, working). Below 90 columns the sidebar hides and the status line shows `41k/128k`.
+- `NO_COLOR` / `NIMCODE_PLAIN` disable all colour; `NIMCODE_ASCII` switches to ASCII glyphs. Layout is covered by TestBackend snapshots in `tui-rs/snapshots/`.
+
+#### Keys
+
+The list lives in `KEY_BINDINGS` (`src/nimcode/ui/console.py`) and is shown by `/help`:
+
+| Key | Action |
+|---|---|
+| Enter | Send (with the `/` popup open: send the highlighted command) |
+| Ctrl+J / Shift+Enter | Newline (Ctrl+J works in every terminal; Alt+Enter is taken by Windows Terminal) |
+| ←/→, Home/End, Ctrl+←/→ | Move the cursor / by word |
+| Ctrl+W, Ctrl+Backspace | Delete the previous word |
+| Ctrl+U | Delete to the start of the line |
+| ↑/↓ | Input history (moves between lines in multi-line input) |
+| PgUp/PgDn, Ctrl+↑/↓, mouse wheel | Scroll the conversation ("↑ N more" shows while scrolled) |
+| Esc | Back to the latest message / dismiss the popup |
+| Tab | Complete a `/command` |
+| Shift+Tab / Ctrl+T | Cycle Plan → Build → YOLO (applies between tool calls too) |
+| Ctrl+O | Expand / fold long tool output |
+| Ctrl+C | Clear the input, or interrupt the turn when it is empty |
+| Ctrl+D | Exit (when the input is empty), even mid-turn |
+| Shift+drag | Select text (mouse capture is on for wheel scrolling) |
+
+Pasted text is inserted, never sent.
 
 #### In-TUI Slash Commands
 
@@ -414,15 +457,15 @@ All commands are dispatched by `handle_command()` (`src/nimcode/core/agent_tui.p
 | `/changes` | `/diff` | `git status -s` + recent backups | `src/nimcode/config.py:391` |
 | `/restore` | — | Inline backup picker → restore to the original path recorded in `backups/manifest.jsonl` | `restore_backup()` in `src/nimcode/ui/rust_bridge.py` |
 | `/test [cmd]` | — | `execute_test_runner()` auto-detects `pytest`/`npm test`/`cargo test`/`go test` | `src/nimcode/tools/cmd.py:653` |
-| `/team` | — | List `ACTIVE_SUBAGENTS` (id/role/status, lock-safe snapshot) | `src/nimcode/core/agent_tui.py:309` + `swarm.py:12` |
+| `/team` | — | List subagents (id/role/status) with each transcript path | `src/nimcode/core/agent_tui.py` + `swarm.py` |
 | `/kill` | — | `cleanup_background_processes()` — stops all bg procs | `src/nimcode/tools/cmd.py:76` |
-| `/compact` | — | `prune_history()` compaction (`agent_tui.py:336`); reports honestly when history is already within budget | `src/nimcode/core/agent.py:256` |
+| `/compact` | — | Summarise the session with the fast model into `summary.md`, continue from the summary, and log a marker so `resume` starts there | `generate_summary()` in `src/nimcode/ui/rust_bridge.py` |
 | `/stats` | — | `aggregate_session_stats()` + `render_stats_rich()` | `src/nimcode/core/agent.py:803` |
 | `/recap` | — | Not yet implemented in TUI mode | `src/nimcode/core/agent_tui.py:359` |
 | `/skills` | — | `skills.list_skills()` | `src/nimcode/skills.py:178` |
 | `/install-skill <url>` | — | Download raw `.md` / `.zip` / git repo to staging, show a preview (files, size, sha256, first 40 lines), install only on confirmation | `fetch_skill()` / `commit_skill()` in `src/nimcode/skills.py` |
 | `/init` | — | `run_init_command()` — (re)generate `AGENTS.md` | `src/nimcode/core/agent.py:935` |
-| `/resume` | — | Inline session picker (`select_session()`), then restart with `nimcode resume` to load | `src/nimcode/ui/rust_bridge.py:364` |
+| `/resume` | — | Inline session picker; loads the chosen session in place and keeps appending to it | `src/nimcode/core/agent_tui.py` |
 | `/<skill> [args]` | — | Inject installed skill content as `<skill_context>` and continue the turn | `src/nimcode/skills.py:193` |
 | `/exit`, `/quit`, `q`, `done`, `exit`, `quit` | — | End session gracefully | `src/nimcode/core/agent_tui.py:183` |
 
@@ -474,7 +517,7 @@ All tools are registered via `@register_tool` (`src/nimcode/tools/registry.py:13
 | `list_files` | optional `path` (default `.`) | Sorted directory listing with `(File)`/`(Directory)` suffixes; `.gitignore`-aware; 2000-entry cap |
 | `glob_files` | `pattern` | `Path.glob()` with `.gitignore` filtering via shared `load_gitignore_rules()`; 2000-match cap |
 | `patch_file_blocks` | `path`, `edit_blocks` | Preferred edit path: Aider-style `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` multi-block patch; rejects empty/ambiguous SEARCH; dry-run diff preview |
-| `search_grep` | `query` (+ optional `path`) | Recursive regex (falls back to substring on invalid patterns) search, case-insensitive, symlink-safe with depth/visited guards, 1 MB file cap, 5000-match cap |
+| `search_grep` | `query` (+ optional `path`, `include` glob, `case_sensitive`) | Uses `rg --json` when ripgrep is on PATH, else a Python walk; regex with substring fallback on invalid patterns, case-insensitive by default, honours ignore rules, 1 MB file cap, 5000-match cap |
 | `search_symbols` | `query` | AST parse of `.py` files for `ClassDef`/`FunctionDef` name matching; symlink/depth/IO-guarded walker; skips >1 MB files; 5000-symbol cap |
 
 #### Code Patch (`src/nimcode/tools/patch.py:118`)
@@ -508,8 +551,8 @@ All tools are registered via `@register_tool` (`src/nimcode/tools/registry.py:13
 
 | Tool | Required args | Description |
 |---|---|---|
-| `web_search` | `query` (+ optional `max_results` default 5, clamped 1–10) | Pure-Python DuckDuckGo HTML scrape (`html.duckduckgo.com`) with 4 fallback parse strategies, redirect unwrapping (`uddg=`), 3× retry + 30 s overall timeout, 20 k output cap (`src/nimcode/tools/web.py:149`) |
-| `screenshot_page` | `url` **or** `html_file` (+ optional `full_page`) | Playwright Chromium 1280×720 screenshot → saved PNG under `screenshots/` + capped base64 preview (`src/nimcode/tools/browser.py:118`); static files go `html_file` → `file://` via sandboxed `resolve_and_validate_path` |
+| `web_search` | `query` (+ optional `max_results` default 5, clamped 1–10) | Pure-Python DuckDuckGo HTML scrape (`html.duckduckgo.com`) with 4 fallback parse strategies, redirect unwrapping (`uddg=`), 3× retry + 30 s overall timeout, 20 k output cap; falls back to SearXNG (`searxng_url`) on a bot check or error |
+| `screenshot_page` | `url` **or** `html_file` (+ optional `full_page`) | Playwright Chromium 1280×720 screenshot → saved PNG under `screenshots/`, reported on a `[screenshot: <path>]` line, + capped base64 preview (attached as an image when `vision_screenshots` is on); static files go `html_file` → `file://` via sandboxed `resolve_and_validate_path` |
 
 #### Validation & Preview (`src/nimcode/tools/base.py`)
 
@@ -781,7 +824,10 @@ Also supports `screenshot_page({"html_file": "dist/index.html"})` → resolves t
 
 - `spawn_agent_logic(role, task_prompt, workspace_root, config)` builds a fresh `messages = [system + role suffix, user task_prompt]` with a live `workspace_map`, seeds `ACTIVE_SUBAGENTS[agent_id]` (`id = sub_<8-hex-uuid>`, with per-agent `depth`), caps at 10 active subagents / nesting depth 3 (fork-bomb guard), and spawns `resume_subagent_thread()`.
 - `resume_subagent_thread()` (`:178`) runs on a **thread-local config copy** carrying the agent's depth, so the depth cap accumulates across generations (sibling threads never race on shared state). It loops `max_steps` (50 in YOLO, else `max_loop_iterations`) calling the NIM API (same `AVAILABLE_TOOLS_SPEC` + `normalize_messages`), executing tools via `execute_local_tool()` directly (no human gate), and appending `assistant` / `tool` turns to `sub["messages"]`. Aborts after 5 consecutive invalid tool calls; empty model responses mark `ERROR` (no zombie `RUNNING`); cooperative `KILLED` stays `KILLED` (never overwritten to `ERROR`). Thread safety via `sub["lock"]` (`threading.Lock`) + `_SUBAGENTS_LOCK` (`RLock`, `:13`).
-- Monitor live with `/team` (sidebar also polls `ACTIVE_SUBAGENTS` every turn via `update_sidebar_data()`, `src/nimcode/core/agent_tui.py:526`).
+- Monitor live with `/team` (sidebar also polls `ACTIVE_SUBAGENTS` every turn).
+- Each run has a wall-clock budget (`subagent_timeout_s`, default 900 s); exceeding it marks the agent `TIMED_OUT`.
+- Transcripts are appended to `~/.nimcode/<project>_<hash>/subagents/<id>.jsonl`; finished, killed and timed-out agents are dropped from `ACTIVE_SUBAGENTS` 10 minutes after they end (transcripts stay).
+- Subagents run shell commands only inside Docker.
 - Interact with `send_message_to_agent` (injects a new `user` message and resumes the thread) or terminate with `kill_agent`.
 
 ---

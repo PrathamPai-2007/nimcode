@@ -1,0 +1,24 @@
+
+ ▎  40  def line_40(): ...
+
+ ▎ nimcode
+ ▎ Found it. The plan:
+ ▎
+ ▎ 1. add  --json  to  status
+ ▎ 2. print  json.dumps(cfg)
+ ▎
+ ▎ This is a long sentence that should wrap neatly inside the hundred column
+ ▎ measure without ever touching the sidebar rule.
+
+ ▎ write_file  src/nimcode/cli.py
+ ▎ --- a/src/nimcode/cli.py
+ ▎ +++ b/src/nimcode/cli.py
+ ▎ @@ -1,3 +1,4 @@
+ ▎  import typer
+ ▎ -def status():
+
+   /help
+   /history
+────────────────────────────────────────────────────────────────────────────────
+ deepseek-v4-flash                                                     41k/128k
+ › /h                                                tab complete · esc dismiss

@@ -219,3 +219,25 @@ def test_get_skill_content_returns_none_on_error(skills_dir):
     (skills_dir / "big.md").write_text("x" * 300_000)
     for name in ("missing", "empty", "big", "../etc", "", None):
         assert skills.get_skill_content(name) is None
+
+
+def test_split_form_denied_flag_drops_its_value():
+    from types import SimpleNamespace
+
+    from nimcode.tools.cmd import _safe_docker_extra_args
+
+    cfg = SimpleNamespace(
+        docker_extra_args=[
+            "--privileged",
+            "-e",
+            "A=1",
+            "-v",
+            "/:/host",
+            "--mount",
+            "type=bind,src=/,dst=/h",
+            "-itv",
+            "/:/x",
+            "--rm",
+        ]
+    )
+    assert _safe_docker_extra_args(cfg) == ["-e", "A=1", "--rm"]

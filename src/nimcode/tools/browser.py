@@ -231,7 +231,8 @@ def screenshot_page(args: Dict[str, Any], workspace_root: Path, config: Any) -> 
             saved_path = ""
         cap = 100_000
         b64_img = base64.b64encode(screenshot_bytes).decode("utf-8")
-        loc = f"Saved to: {saved_path}\n" if saved_path else ""
+        # Track P parses this line to attach the PNG for vision models.
+        loc = f"\n[screenshot: {saved_path}]\n" if saved_path else ""
         if len(b64_img) > cap:
             # A cut-off base64 PNG is undecodable; it only burned ~25k tokens.
             return (

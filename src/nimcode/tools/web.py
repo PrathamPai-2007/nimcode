@@ -174,23 +174,40 @@ def web_search(args: Dict[str, Any], workspace_root: Path, config: Any) -> str:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
+    ddg_error = ""
+    html = ""
     try:
         html = _fetch_with_overall_timeout(
             url, headers, max_retries=3, timeout=15, overall_timeout=30
         )
     except Exception as e:
-        return f"Error fetching search results after retries: {e}"
-    if not html:
-        return "No results found (empty response)."
+        ddg_error = f"Error fetching search results after retries: {e}"
 
-    try:
-        results = _parse_duckduckgo_results(html, max_results)
-    except Exception as e:
-        return f"Error parsing search results: {e}"
+    results: list = []
+    if html:
+        try:
+            results = _parse_duckduckgo_results(html, max_results)
+        except Exception as e:
+            ddg_error = f"Error parsing search results: {e}"
+    bot_check = not results and ("anomaly" in html.lower() or "captcha" in html.lower())
+
+    if not results and (bot_check or ddg_error):
+        searx = str(getattr(config, "searxng_url", "") or "").strip()
+        if searx:
+            try:
+                results = _search_searxng(searx, query, max_results, headers)
+            except Exception as e:
+                ddg_error = (ddg_error or "DuckDuckGo bot-check") + (
+                    f"; SearXNG fallback failed: {e}"
+                )
 
     if not results:
-        if "anomaly" in html.lower() or "captcha" in html.lower():
+        if ddg_error:
+            return ddg_error
+        if bot_check:
             return "No results: DuckDuckGo served a bot-check page; retry later."
+        if not html:
+            return "No results found (empty response)."
         return "No results found."
 
     output = []
@@ -199,3 +216,30 @@ def web_search(args: Dict[str, Any], workspace_root: Path, config: Any) -> str:
             f"{i}. {r['title']}\n   URL: {r['url']}\n   Snippet: {r['snippet']}\n"
         )
     return truncate_output("\n".join(output), 20000)
+
+
+def _search_searxng(base_url: str, query: str, max_results: int, headers: dict):
+    """Query a user-configured SearXNG instance's JSON API (format=json must be
+    enabled in its settings.yml). Trusted config, so no SSRF guard: a local
+    instance on localhost is the common setup."""
+    import json
+
+    url = (
+        base_url.rstrip("/")
+        + "/search?"
+        + urllib.parse.urlencode({"q": query, "format": "json"})
+    )
+    data = json.loads(
+        _fetch_with_overall_timeout(
+            url, headers, max_retries=2, timeout=10, overall_timeout=25
+        )
+    )
+    return [
+        {
+            "title": _clean_text(str(r.get("title", ""))),
+            "url": str(r.get("url", "")),
+            "snippet": _clean_text(str(r.get("content", ""))),
+        }
+        for r in data.get("results", [])
+        if r.get("url")
+    ][:max_results]

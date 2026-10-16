@@ -414,6 +414,14 @@ SEARCH_GREP_SCHEMA = {
                     "type": "string",
                     "description": "Relative path to search under. Defaults to '.' (workspace root).",
                 },
+                "include": {
+                    "type": "string",
+                    "description": "Optional glob limiting which files are searched, e.g. '*.py' (matches file names) or 'src/**/*.ts' (matches relative paths).",
+                },
+                "case_sensitive": {
+                    "type": "boolean",
+                    "description": "Match case exactly. Defaults to false (case-insensitive).",
+                },
             },
             "required": ["query"],
         },
@@ -437,6 +445,36 @@ SEARCH_SYMBOLS_SCHEMA = {
         },
     },
 }
+
+
+def _closest_window_hint(content: str, search: str) -> str:
+    """Most similar window of len(search) lines in `content`, with 1-based line
+    numbers, so the model can fix its SEARCH text without re-reading the file."""
+    import difflib
+
+    lines = content.split("\n")
+    n = len(search.split("\n"))
+    if len(lines) > 20000:
+        return ""  # ponytail: O(lines) ratio scan; no hint on huge files
+    sm = difflib.SequenceMatcher(autojunk=False)
+    sm.set_seq2(search)
+    best, best_i = 0.0, -1
+    for i in range(max(1, len(lines) - n + 1)):
+        sm.set_seq1("\n".join(lines[i : i + n]))
+        # Cheap upper bounds first; full ratio() only for real contenders.
+        if sm.real_quick_ratio() <= best or sm.quick_ratio() <= best:
+            continue
+        r = sm.ratio()
+        if r > best:
+            best, best_i = r, i
+    if best_i < 0 or best < 0.4:
+        return ""
+    window = lines[best_i : best_i + n]
+    body = "\n".join(f"{best_i + k + 1:>5}| {ln}" for k, ln in enumerate(window))
+    return (
+        f"\nClosest match (lines {best_i + 1}-{best_i + len(window)}, "
+        f"{best:.0%} similar):\n{body}"
+    )
 
 
 @register_tool("patch_file_blocks", PATCH_FILE_BLOCKS_SCHEMA)
@@ -504,7 +542,10 @@ def patch_file_blocks_logic(
             return f"Error in block #{idx + 1}: empty SEARCH block."
         count = new_content.count(search_str)
         if count == 0:
-            return f"Error in block #{idx + 1}: SEARCH block not found in the file. Make sure lines match exactly including leading spaces."
+            return (
+                f"Error in block #{idx + 1}: SEARCH block not found in the file. Make sure lines match exactly including leading spaces."
+                + _closest_window_hint(new_content, search_str)
+            )
         if count > 1:
             return f"Error in block #{idx + 1}: SEARCH block matches multiple locations ({count} found). Make the search block more unique."
 
@@ -536,10 +577,111 @@ def patch_file_blocks_logic(
     return f"Successfully applied {len(matches)} edit block(s) to '{path_str}'."
 
 
+def _include_regex(include: str):
+    """ripgrep --glob semantics: no '/' -> match the file name, else the rel path."""
+    include = include.replace("\\", "/").strip().lstrip("/")
+    parts = [p for p in include.split("/") if p not in ("", ".")]
+    if not parts:
+        return None
+    return ("/" in include, _glob_to_regex(parts))
+
+
+def _include_match(include_rx, path: Path, root: Path) -> bool:
+    by_path, rx = include_rx
+    return bool(rx.match(path.relative_to(root).as_posix() if by_path else path.name))
+
+
+def _ripgrep(
+    query: str, search_path: Path, root: Path, include: str, case_sensitive: bool
+):
+    """Search with `rg --json`. Returns [(rel, line, text)], or None so the
+    caller falls back to the Python walk (rg missing, timeout, regex error...)."""
+    import json
+    import shutil
+    import subprocess
+    import threading
+    from nimcode.context import BINARY_SUFFIXES, DEFAULT_EXCLUDES
+    from nimcode.tools.base import scrub_env
+
+    rg = shutil.which("rg")
+    if not rg:
+        return None
+    # Mirror the Python path's ignore rules: hidden files searched, .gitignore
+    # honoured even outside a git repo, nothing from outside the workspace
+    # (parent dirs, global excludes, .ignore files).
+    cmd = [rg, "--json", "--hidden", "--no-require-git", "--no-ignore-parent"]
+    cmd += ["--no-ignore-global", "--no-ignore-dot"]
+    if search_path.is_dir():  # an explicit file may be up to 5MB, as below
+        cmd += ["--max-filesize", "1M"]
+    cmd += ["--case-sensitive" if case_sensitive else "--ignore-case"]
+    for name in sorted(DEFAULT_EXCLUDES):
+        cmd += ["--glob", f"!{name}"]
+    for suffix in sorted(BINARY_SUFFIXES):
+        cmd += ["--glob", f"!*{suffix}"]
+    if include:
+        cmd += ["--glob", include.replace("\\", "/")]
+    rel_target = (
+        "." if search_path == root else search_path.relative_to(root).as_posix()
+    )
+    cmd += ["-e", query, "--", rel_target]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            env=scrub_env(dict(os.environ)),
+        )
+    except OSError:
+        return None
+    timer = threading.Timer(30, proc.kill)
+    timer.start()
+    matches = []
+    try:
+        for raw in proc.stdout:
+            try:
+                ev = json.loads(raw)
+            except ValueError:
+                continue
+            if ev.get("type") != "match":
+                continue
+            data = ev.get("data", {})
+            path_text = data.get("path", {}).get("text")
+            text = data.get("lines", {}).get("text")
+            if path_text is None or text is None:
+                continue  # non-UTF-8 path/line (rg sends base64 bytes)
+            try:
+                rel = (root / path_text).resolve().relative_to(root).as_posix()
+            except (ValueError, OSError):
+                continue
+            matches.append((rel, data.get("line_number", 0), text.strip()[:500]))
+            if len(matches) > 5000:
+                proc.kill()
+                break
+        proc.wait()
+    finally:
+        timer.cancel()
+        proc.stdout.close()
+    matches.sort()  # rg searches in parallel; keep output deterministic
+    if len(matches) > 5000:
+        return matches
+    # 0 = matches, 1 = none; anything else (2 = error, killed) -> fall back.
+    return matches if proc.returncode in (0, 1) else None
+
+
 @register_tool("search_grep", SEARCH_GREP_SCHEMA)
 def search_grep_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> str:
     query = args.get("query", "")
     path_str = args.get("path", ".")
+    include = args.get("include") or ""
+    if not isinstance(include, str):
+        return "Error: 'include' must be a glob string."
+    case_sensitive = args.get("case_sensitive", False)
+    if isinstance(case_sensitive, str):
+        case_sensitive = case_sensitive.strip().lower() in ("1", "true", "yes", "on")
+    case_sensitive = bool(case_sensitive)
 
     try:
         search_path = resolve_and_validate_path(path_str, workspace_root)
@@ -555,15 +697,26 @@ def search_grep_tool(args: Dict[str, Any], workspace_root: Path, config: Any) ->
     if not isinstance(query, str) or not query:
         return "Error: Missing 'query' parameter."
 
+    root = workspace_root.resolve()
+    rg_matches = _ripgrep(query, search_path, root, include, case_sensitive)
+    if rg_matches is not None:
+        if not rg_matches:
+            return f"No matches found for query '{query}'."
+        output = "\n".join(f"{m[0]}:{m[1]}: {m[2]}" for m in rg_matches[:5000])
+        return truncate_output(output, coerce_output_cap(config))
+
     gitignore_rules = load_gitignore_rules(workspace_root)
+    include_rx = _include_regex(include)
 
     regex_note = ""
     try:
-        compiled_regex = re.compile(query, re.IGNORECASE)
+        compiled_regex = re.compile(query, 0 if case_sensitive else re.IGNORECASE)
     except re.error:
         compiled_regex = None
         regex_note = (
-            "[Note: invalid regex, falling back to case-insensitive substring match]\n"
+            "[Note: invalid regex, falling back to {} substring match]\n".format(
+                "case-sensitive" if case_sensitive else "case-insensitive"
+            )
         )
 
     matches = []
@@ -571,8 +724,7 @@ def search_grep_tool(args: Dict[str, Any], workspace_root: Path, config: Any) ->
     visited: set[tuple[int, int]] = set()
     # search_path is resolved; relative_to() against an unresolved root
     # (relative path, symlinked/8.3 dir) raised and silently dropped every match.
-    root = workspace_root.resolve()
-    query_lower = query.lower()
+    query_cmp = query if case_sensitive else query.lower()
 
     def grep_file(file_path: Path) -> None:
         with open(file_path, "rb") as fb:
@@ -586,7 +738,7 @@ def search_grep_tool(args: Dict[str, Any], workspace_root: Path, config: Any) ->
             if compiled_regex:
                 hit = compiled_regex.search(line)
             else:
-                hit = query_lower in line.lower()
+                hit = query_cmp in (line if case_sensitive else line.lower())
             if hit:
                 matches.append((rel, line_num, line.strip()[:500]))
                 if len(matches) > 5000:
@@ -621,6 +773,8 @@ def search_grep_tool(args: Dict[str, Any], workspace_root: Path, config: Any) ->
             if entry.is_dir():
                 walk_and_search(entry, depth + 1)
             elif entry.is_file():
+                if include_rx and not _include_match(include_rx, entry, root):
+                    continue
                 try:
                     file_size = entry.stat().st_size
                 except OSError:

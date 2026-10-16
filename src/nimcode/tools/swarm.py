@@ -12,6 +12,51 @@ from nimcode.tools.base import is_valid_tool_call
 ACTIVE_SUBAGENTS: Dict[str, Any] = {}
 _SUBAGENTS_LOCK = threading.RLock()
 
+# Ended agents (any status but RUNNING) leave ACTIVE_SUBAGENTS this long
+# after they end; their JSONL transcripts stay on disk.
+REAP_AFTER_S = 600
+
+
+def _transcript_path(workspace_root: Path, agent_id: str) -> Path:
+    from nimcode.config import get_project_nimcode_dir
+
+    return get_project_nimcode_dir(workspace_root) / "subagents" / f"{agent_id}.jsonl"
+
+
+def _log(sub: Dict[str, Any], msg: Dict[str, Any]) -> None:
+    """Append one message to the agent's JSONL transcript (if it has one)."""
+    path = sub.get("transcript")
+    if path:
+        from nimcode.core.agent import log_turn
+
+        log_turn(msg, Path(path))
+
+
+def _record(sub: Dict[str, Any], msg: Dict[str, Any]) -> None:
+    # Caller holds _SUBAGENTS_LOCK.
+    sub["messages"].append(msg)
+    _log(sub, msg)
+
+
+def reap_finished_subagents(now: float = None) -> int:
+    """Drop agents that ended more than REAP_AFTER_S ago. Returns #removed."""
+    import time
+
+    now = time.time() if now is None else now
+    with _SUBAGENTS_LOCK:
+        stale = [
+            aid
+            for aid, s in ACTIVE_SUBAGENTS.items()
+            if s.get("status") != "RUNNING"
+            and s.get("runner") is None
+            and s.get("ended_at") is not None
+            and now - s["ended_at"] >= REAP_AFTER_S
+        ]
+        for aid in stale:
+            del ACTIVE_SUBAGENTS[aid]
+    return len(stale)
+
+
 SPAWN_AGENT_SCHEMA = {
     "type": "function",
     "function": {
@@ -155,12 +200,13 @@ def spawn_agent_logic(
         {"role": "user", "content": task_prompt},
     ]
 
+    reap_finished_subagents()
     with _SUBAGENTS_LOCK:
         # Check + insert under one lock hold (no check-then-act race), and
         # count only live agents: finished ones stay listed for /team.
         if _running_count() >= 10:
             return "Error: too many active subagents (max 10). Kill one first."
-        ACTIVE_SUBAGENTS[agent_id] = {
+        sub = ACTIVE_SUBAGENTS[agent_id] = {
             "id": agent_id,
             "role": role,
             "status": "RUNNING",
@@ -174,7 +220,11 @@ def spawn_agent_logic(
             # Nesting level of this agent; threads inherit it so depth
             # accumulates across generations (fork-bomb guard).
             "depth": depth + 1,
+            # JSONL transcript (task prompt onwards; the system prompt is
+            # not logged, like main sessions).
+            "transcript": str(_transcript_path(workspace_root, agent_id)),
         }
+        _log(sub, messages[1])
 
     resume_subagent_thread(agent_id, workspace_root, config)
 
@@ -190,7 +240,8 @@ def _drain_inbox(sub: Dict[str, Any]) -> None:
     # Caller holds _SUBAGENTS_LOCK.
     inbox = sub.get("inbox")
     if inbox:
-        sub["messages"].extend(inbox)
+        for msg in inbox:
+            _record(sub, msg)
         inbox.clear()
 
 
@@ -208,6 +259,25 @@ def resume_subagent_thread(agent_id: str, workspace_root: Path, config: Any):
         sub["runner"] = token
         sub["status"] = "RUNNING"
         sub["output"] = "Execution in progress..."
+        sub.pop("ended_at", None)
+
+    import time
+
+    # Wall-clock budget per run (a follow-up message starts a fresh one).
+    try:
+        timeout_s = max(1, int(getattr(config, "subagent_timeout_s", 900)))
+    except (TypeError, ValueError):
+        timeout_s = 900
+    deadline = time.monotonic() + timeout_s
+
+    def _timed_out() -> bool:
+        return time.monotonic() >= deadline
+
+    def _mark_timed_out() -> None:
+        with _SUBAGENTS_LOCK:
+            if sub["status"] != "KILLED":
+                sub["status"] = "TIMED_OUT"
+                sub["output"] = f"Timed out after {timeout_s}s (subagent_timeout_s)."
 
     def _thread_target(config):
         try:
@@ -290,6 +360,9 @@ def resume_subagent_thread(agent_id: str, workspace_root: Path, config: Any):
                     messages = list(sub["messages"])
                 if status == "KILLED":
                     break
+                if _timed_out():
+                    _mark_timed_out()
+                    break
                 # Long runs would otherwise overflow the context window.
                 messages = prune_history(messages, budget)
                 tools_arg = None if disable_native else AVAILABLE_TOOLS_SPEC
@@ -312,6 +385,8 @@ def resume_subagent_thread(agent_id: str, workspace_root: Path, config: Any):
 
                 if tools_arg:
                     kwargs["tools"] = tools_arg
+                # A hung request must not outlive the wall-clock budget.
+                kwargs["timeout"] = max(1.0, deadline - time.monotonic())
 
                 response = client.chat.completions.create(**kwargs)
                 if not response or not response.choices:
@@ -339,7 +414,7 @@ def resume_subagent_thread(agent_id: str, workspace_root: Path, config: Any):
                         for tc in raw_msg.tool_calls
                     ]
                 with _SUBAGENTS_LOCK:
-                    sub["messages"].append(msg_dict)
+                    _record(sub, msg_dict)
                     if not raw_msg.tool_calls:
                         if sub.get("inbox") and sub["status"] != "KILLED":
                             continue  # answer follow-ups that arrived mid-turn
@@ -367,12 +442,13 @@ def resume_subagent_thread(agent_id: str, workspace_root: Path, config: Any):
                             tname, targs, workspace_root, config
                         )
                     with _SUBAGENTS_LOCK:
-                        sub["messages"].append(
+                        _record(
+                            sub,
                             {
                                 "role": "tool",
                                 "tool_call_id": tc.id,
                                 "content": str(tool_res),
-                            }
+                            },
                         )
                     if consecutive_invalid >= 5:
                         break
@@ -392,6 +468,8 @@ def resume_subagent_thread(agent_id: str, workspace_root: Path, config: Any):
                 # Cooperative kill / cancel still lands here; mark KILLED, not ERROR.
                 if sub.get("status") == "KILLED":
                     sub["output"] = "Killed by agent tool call."
+                elif _timed_out():
+                    _mark_timed_out()  # e.g. the per-request timeout fired
                 else:
                     sub["status"] = f"ERROR: {e}"
                     sub["output"] = f"Subagent failed: {e}"
@@ -399,6 +477,8 @@ def resume_subagent_thread(agent_id: str, workspace_root: Path, config: Any):
             with _SUBAGENTS_LOCK:
                 if sub.get("runner") is token:
                     sub["runner"] = None
+                if sub.get("status") != "RUNNING":
+                    sub["ended_at"] = time.time()
 
     import copy
 
@@ -451,6 +531,7 @@ def kill_agent_logic(agent_id: str, workspace_root: Path, config: Any) -> str:
 
 
 def list_agents_logic(workspace_root: Path, config: Any) -> str:
+    reap_finished_subagents()
     with _SUBAGENTS_LOCK:
         if not ACTIVE_SUBAGENTS:
             return "No subagents spawned."

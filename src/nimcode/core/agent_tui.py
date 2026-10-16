@@ -3,6 +3,8 @@ TUI-aware async agent loop - replaces the old ANSI-based run_agent_loop.
 """
 
 import asyncio
+import base64
+import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
@@ -29,14 +31,17 @@ from nimcode.core.agent import (
     SESSION_DIR,
     migrate_legacy_session,
     open_session_path,
+    load_session,
+    prepare_resumed_messages,
+    COMPACT_MARKER_KEY,
     count_message_tokens,
     aggregate_session_stats,
     render_stats_rich,
 )
 from nimcode.config_models import effective_budget
 from nimcode.context import generate_workspace_map
-from nimcode.ui.rust_bridge import RustTUI
-from nimcode.tools.swarm import ACTIVE_SUBAGENTS
+from nimcode.ui.rust_bridge import RustTUI, generate_summary
+from nimcode.tools.swarm import ACTIVE_SUBAGENTS, reap_finished_subagents
 from nimcode.tools.cmd import BACKGROUND_PROCESSES
 
 # Authoritative slash-command catalog: every entry must have a branch in
@@ -70,6 +75,71 @@ SLASH_COMMANDS: List[str] = [
 # Empty model turns (no text and no tool calls): re-drive the model this
 # many times before handing back to the user instead of going silent.
 MAX_EMPTY_TURNS = 2
+
+
+_SCREENSHOT_RE = re.compile(r"^\s*\[screenshot:\s*(.+?)\s*\]\s*$", re.M | re.I)
+
+
+def parse_screenshot_path(result: Any) -> Optional[str]:
+    """PNG path from a screenshot_page result's `[screenshot: <path>]` line."""
+    m = _SCREENSHOT_RE.search(str(result or ""))
+    return m.group(1).strip("`'\"") if m else None
+
+
+def screenshot_messages(
+    result: Any, workspace_root: Path
+) -> Optional[tuple[Dict[str, Any], Dict[str, Any], Path]]:
+    """(live message, log message, path) attaching a screenshot for vision.
+
+    The live message carries the PNG as a base64 data URL; the logged copy
+    carries the file path instead so session files stay small. None when the
+    result names no readable PNG.
+    """
+    raw = parse_screenshot_path(result)
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        path = Path(workspace_root) / path
+    try:
+        data = base64.b64encode(path.read_bytes()).decode("ascii")
+    except OSError:
+        return None
+    text = {"type": "text", "text": f"Screenshot from screenshot_page ({path}):"}
+
+    def _msg(url: str) -> Dict[str, Any]:
+        return {
+            "role": "user",
+            "content": [text, {"type": "image_url", "image_url": {"url": url}}],
+        }
+
+    return _msg(f"data:image/png;base64,{data}"), _msg(str(path)), path
+
+
+def _text_of(content: Any) -> str:
+    """Display text of a message content (str, or multimodal part list)."""
+    if isinstance(content, list):
+        return "\n".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+    return str(content or "")
+
+
+def render_history(tui: Any, messages: List[Dict[str, Any]]) -> None:
+    """Re-display a loaded session (startup resume and in-place /resume)."""
+    for msg in messages:
+        role = msg.get("role")
+        content = _text_of(msg.get("content"))
+        if role == "user":
+            tui.add_message("user", content, markdown=False)
+        elif role == "assistant":
+            tui.add_message("assistant", content, markdown=True)
+            for tc in msg.get("tool_calls") or []:
+                name = (tc.get("function") or {}).get("name", "unknown")
+                tui.add_message("tool", f"Tool Call: {name}", markdown=False)
+        elif role == "tool":
+            snippet = content.strip().replace("\n", " ")
+            if len(snippet) > 80:
+                snippet = snippet[:80] + "..."
+            tui.add_message("tool", snippet, markdown=False)
 
 
 def is_empty_turn(content: Any, tool_calls: Any) -> bool:
@@ -109,6 +179,21 @@ def close_dangling_tool_calls(
             log_turn(msg, session_path)
         added += 1
     return added
+
+
+def _ready_history(
+    loaded: List[Dict[str, Any]], session_path: Path
+) -> List[Dict[str, Any]]:
+    """Loaded session messages -> live history for the loop."""
+    messages = prepare_resumed_messages(loaded)
+    # The system prompt is never logged, so a resumed session lacks it;
+    # without messages[0] the per-turn refresh never runs and the model
+    # would operate with no system prompt at all.
+    if not messages or messages[0].get("role") != "system":
+        messages.insert(0, {"role": "system", "content": ""})
+    # A crash mid tool-batch leaves unanswered tool_calls the API rejects.
+    close_dangling_tool_calls(messages, session_path)
+    return messages
 
 
 async def run_agent_loop_tui(
@@ -219,6 +304,11 @@ async def _run_agent_loop_tui_internal(
             else config.fast_model
         )
         return effective_budget(config, model)
+
+    def _adopt_history(name: str, loaded: List[Dict[str, Any]]):
+        """(session_path, messages) for continuing a loaded session file."""
+        path = open_session_path(session_dir, name, loaded)
+        return path, _ready_history(loaded, path)
 
     async def handle_command(user_input: str) -> str:
         nonlocal state, messages, session_path, loop_count, skip_first_api_call
@@ -360,6 +450,7 @@ async def _run_agent_loop_tui_internal(
             return "command"
 
         elif cmd_lower == "/team":
+            reap_finished_subagents()
             if not ACTIVE_SUBAGENTS:
                 tui.add_message(
                     "system",
@@ -372,9 +463,10 @@ async def _run_agent_loop_tui_internal(
                     status = sub.get("status", "UNKNOWN")
                     role = sub.get("role", "Unknown")
                     output = str(sub.get("output") or "")[:100]
-                    tui.add_message(
-                        "system", f"  • {aid}: {role} ({status}) — {output}"
-                    )
+                    line = f"  • {aid}: {role} ({status}) — {output}"
+                    if sub.get("transcript"):
+                        line += f"\n    transcript: {sub['transcript']}"
+                    tui.add_message("system", line, markdown=False)
             loop_count = 0
             return "command"
 
@@ -387,18 +479,47 @@ async def _run_agent_loop_tui_internal(
             return "command"
 
         elif cmd_lower == "/compact":
-            tui.add_message("system", "Compacting session history...")
-            before = len(messages)
-            messages = prune_history(messages, _budget())
-            freed = before - len(messages)
-            if freed:
+            if not any(m.get("role") == "user" for m in messages):
+                tui.add_message("system", "Nothing to compact yet.")
+                return "command"
+            try:
+                summary = await generate_summary(
+                    tui,
+                    client,
+                    messages,
+                    config.fast_model,
+                    config,
+                    workspace_root,
+                    "Compacting session into summary.md...",
+                )
+            except (Exception, KeyboardInterrupt) as e:
+                summary = ""
+                tui.add_message("system", f"Compact failed: {e}")
+            if summary:
+                before = count_message_tokens(messages)
+                head = messages[:1] if messages[0].get("role") == "system" else []
+                summary_msg = {
+                    "role": "user",
+                    "content": "<compacted_context>\n"
+                    f"{summary}\n</compacted_context>\n\n"
+                    "The earlier conversation was compacted into the summary "
+                    "above (also saved as summary.md). Continue from it.",
+                }
+                messages = head + [summary_msg]
+                # Marker: resume starts here instead of replaying old turns.
+                log_turn(
+                    {"role": "system", "content": "", COMPACT_MARKER_KEY: True},
+                    session_path,
+                )
+                log_turn(summary_msg, session_path)
                 tui.add_message(
-                    "system", f"History compacted ({freed} older turns removed)."
+                    "system",
+                    f"Compacted {before:,} tokens of history into summary.md "
+                    f"(now ~{count_message_tokens(messages):,}).",
                 )
             else:
                 tui.add_message(
-                    "system",
-                    "History already within budget — nothing to compact.",
+                    "system", "Compact skipped (no summary): history unchanged."
                 )
             loop_count = 0
             return "command"
@@ -441,13 +562,23 @@ async def _run_agent_loop_tui_internal(
             return "command"
 
         elif cmd_lower == "/resume":
-            selected_session = await tui.select_session(config, workspace_root)
-            if selected_session:
-                tui.add_message("system", f"Resuming session: {selected_session.name}")
-                tui.add_message(
-                    "system",
-                    "Please restart nimcode with 'nimcode resume' to load this session.",
-                )
+            selected = await tui.select_session(config, workspace_root)
+            if selected:
+                try:
+                    loaded = await asyncio.to_thread(load_session, selected)
+                except Exception as e:
+                    loaded = None
+                    tui.add_message("system", f"Error loading {selected.name}: {e}")
+                if loaded == []:
+                    tui.add_message("system", f"{selected.name} is empty.")
+                elif loaded:
+                    session_path, messages = _adopt_history(selected.name, loaded)
+                    tui.clear_messages()
+                    render_history(tui, messages)
+                    tui.add_message(
+                        "system",
+                        f"Resumed {selected.name} ({len(loaded)} messages).",
+                    )
             loop_count = 0
             return "command"
 
@@ -525,34 +656,8 @@ async def _run_agent_loop_tui_internal(
         return "command"
 
     if existing_messages:
-        messages = existing_messages
-        # Render existing session history
-        for msg in messages:
-            role = msg.get("role")
-            content = msg.get("content") or ""
-            if role == "system":
-                continue
-            elif role == "user":
-                tui.add_message("user", content, markdown=False)
-            elif role == "assistant":
-                tui.add_message("assistant", content, markdown=True)
-                if msg.get("tool_calls"):
-                    for tc in msg["tool_calls"]:
-                        func = tc.get("function", {})
-                        name = func.get("name", "unknown")
-                        tui.add_message("tool", f"Tool Call: {name}", markdown=False)
-            elif role == "tool":
-                snippet = content.strip().replace("\n", " ")
-                if len(snippet) > 80:
-                    snippet = snippet[:80] + "..."
-                tui.add_message("tool", snippet, markdown=False)
-        # The system prompt is never logged, so a resumed session lacks it;
-        # without messages[0] the per-turn refresh below never runs and the
-        # model would operate with no system prompt at all.
-        if messages[0].get("role") != "system":
-            messages.insert(0, {"role": "system", "content": ""})
-        # A crash mid tool-batch leaves unanswered tool_calls the API rejects.
-        close_dangling_tool_calls(messages, session_path)
+        messages = _ready_history(existing_messages, session_path)
+        render_history(tui, messages)
         skip_first_api_call = True
     else:
         system_prompt = build_system_prompt(
@@ -627,6 +732,7 @@ async def _run_agent_loop_tui_internal(
     # Update subagents and background procs periodically
     def update_sidebar_data():
         try:
+            reap_finished_subagents()
             subs = list(ACTIVE_SUBAGENTS.items())
         except Exception:
             subs = []
@@ -1060,6 +1166,9 @@ async def _run_agent_loop_tui_internal(
 
             # Process tool calls
             cancelled_mid_tools = False
+            # Screenshot image messages wait until the whole batch is answered:
+            # a user message between tool results would break the pairing.
+            pending_images = []
             pending_calls = list(raw_message.tool_calls)
             for _call_idx, tool_call in enumerate(pending_calls):
                 # Apply Shift+Tab / Ctrl+C pressed during the previous tool:
@@ -1183,6 +1292,21 @@ async def _run_agent_loop_tui_internal(
                 }
                 messages.append(tool_result_msg)
                 log_turn(tool_result_msg, session_path)
+                if (
+                    is_valid
+                    and tool_name == "screenshot_page"
+                    and getattr(config, "vision_screenshots", False)
+                ):
+                    shot = screenshot_messages(result, workspace_root)
+                    if shot:
+                        pending_images.append(shot)
+
+            for live_msg, logged_msg, shot_path in pending_images:
+                messages.append(live_msg)
+                log_turn(logged_msg, session_path)
+                tui.add_message(
+                    "system", f"Attached screenshot {shot_path.name} for the model."
+                )
 
             messages = prune_history(messages, _budget())
             if cancelled_mid_tools:

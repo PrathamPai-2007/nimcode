@@ -102,3 +102,22 @@ def test_close_dangling_tool_calls():
     assert close_dangling_tool_calls(msgs) == 0
     # Non-trailing / non-tool assistant turns are left alone.
     assert close_dangling_tool_calls([{"role": "user", "content": "x"}]) == 0
+
+
+def test_eof_at_approval_answers_every_later_prompt(monkeypatch):
+    """Ctrl+D at an approval prompt must not leave the feedback prompt waiting."""
+    tui = _tui(monkeypatch)
+    # reader thread behaviour on {"type": "eof"}
+    tui._interrupted = True
+    tui._eof_requested = True
+    tui._events.put({"type": "eof"})
+
+    async def run():
+        first = await asyncio.wait_for(tui.get_user_confirmation("Approve?"), 1)
+        feedback = await asyncio.wait_for(tui.get_user_input("Feedback:"), 1)
+        picked = await asyncio.wait_for(tui._select("pick", ["a"]), 1)
+        return first, feedback, picked
+
+    assert asyncio.run(run()) == ("", None, None)
+    assert tui._interrupted  # the tool loop sees the cancel
+    assert tui.consume_eof()  # and the loop's exit check still fires

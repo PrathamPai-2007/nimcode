@@ -1,81 +1,82 @@
 from typing import Optional, Any
 from rich.align import Align
 from rich.columns import Columns
-from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from nimcode.ui.output import console, symbol
 
 
+# Single source for /help. Track the sidecar's real bindings here.
+KEY_BINDINGS = [
+    ("Enter", "Send (with the / popup open: send the highlighted command)"),
+    ("Ctrl+J / Shift+Enter", "Insert a newline (Ctrl+J works in every terminal)"),
+    ("Left/Right, Home/End", "Move the cursor"),
+    ("Ctrl+Left/Right", "Move by word"),
+    ("Ctrl+W / Ctrl+Backspace", "Delete the previous word"),
+    ("Ctrl+U", "Delete to the start of the line"),
+    ("Up/Down", "Input history (moves between lines in multi-line input)"),
+    ("PgUp/PgDn, Ctrl+Up/Down, mouse wheel", "Scroll the conversation"),
+    ("Esc", "Jump back to the latest message / dismiss the popup"),
+    ("Tab", "Complete a /command"),
+    ("Shift+Tab / Ctrl+T", "Cycle Plan / Build / YOLO"),
+    ("Ctrl+O", "Expand or fold long tool output"),
+    ("Ctrl+C", "Clear the input, or interrupt the turn when it is empty"),
+    ("Ctrl+D", "Exit (when the input is empty)"),
+    ("Shift+drag", "Select text (the mouse wheel scrolls the conversation)"),
+]
+
+# Every SLASH_COMMANDS entry must appear here (tests/test_ux_help.py).
+COMMAND_HELP = [
+    ("? / /help", "Show this help"),
+    ("/plan / /build / /yolo", "Switch mode directly"),
+    ("/model", "Choose the active model (hands context over via summary.md)"),
+    ("/models-refresh", "Refresh the model catalog from the NIM API"),
+    ("/config", "Edit runtime settings"),
+    ("/changes / /diff", "Git working-tree changes and recent backups"),
+    ("/restore", "Restore a file from a backup"),
+    ("/test [cmd]", "Run the test suite in the sandbox"),
+    ("/team", "List subagents and their transcript files"),
+    ("/kill", "Stop all background processes"),
+    ("/compact", "Summarise the session into summary.md and continue from it"),
+    ("/stats", "Usage statistics across sessions"),
+    ("/recap", "Session recap (not yet available in the TUI)"),
+    ("/skills", "List installed skills"),
+    ("/install-skill <url>", "Install a skill from a .md, .zip or git repo"),
+    ("/<skill> [text]", "Run an installed skill"),
+    ("/init", "Create or update AGENTS.md"),
+    ("/resume", "Load a saved session in place"),
+    ("/exit / /quit", "Exit nimcode"),
+]
+
+_DOCKER_NOTE = (
+    "Shell commands and tests run in a sandboxed Docker container by default. "
+    "Set 'disable_docker = true' in nimcode.toml to run them on the host."
+)
+
+
 def show_help(tui: Optional[Any] = None):
     if tui is not None:
-        help_md = (
-            "**Keyboard Shortcuts & Commands**\n\n"
-            "| Shortcut / Command | Action |\n"
-            "| --- | --- |\n"
-            "| **Shift + Tab** | Cycle between [ Plan Mode ], [ Build Mode ], and [ YOLO Mode ] |\n"
-            "| **?** or **/help** | Show this help menu |\n"
-            "| **/plan** / **/build** / **/yolo** | Switch active mode directly (or cycle with Shift+Tab) |\n"
-            "| **/test [cmd]** | Run test suite inside validation sandbox |\n"
-            "| **/team** | Monitor or inspect active background subagents |\n"
-            "| **/resume** | Show and access old chat sessions |\n"
-            "| **/model** | Choose active AI model (Mistral, DeepSeek, etc.) |\n"
-            "| **/config** | View or modify nimcode runtime configuration settings |\n"
-            "| **/changes** / **/diff** | Check git working tree changes and recent file backups |\n"
-            "| **/compact** | Compact conversation history into summary.md |\n"
-            "| **/recap** | Show a quick 4-5 line summary of the session |\n"
-            "| **/skills** | Show installed agent skills |\n"
-            "| **/install-skill <link>** | Install new skill from raw .md, .zip, or git repo |\n"
-            "| **/exit** / **/quit** | Exit the nimcode application |\n"
-            "| **Ctrl + C / ESC** | Cancel the current prompt / exit |\n\n"
-            "*Note: Shell commands and tests run inside a sandboxed Docker container by default. "
-            "To execute commands directly on the host, set 'disable_docker = true' in nimcode.toml.*"
-        )
-        tui.add_message("system", help_md, markdown=True)
+        lines = ["**Commands**", "", "| Command | Action |", "| --- | --- |"]
+        lines += [f"| `{c}` | {d} |" for c, d in COMMAND_HELP]
+        lines += ["", "**Keys**", "", "| Key | Action |", "| --- | --- |"]
+        lines += [f"| {k} | {d} |" for k, d in KEY_BINDINGS]
+        lines += ["", f"*{_DOCKER_NOTE}*"]
+        tui.add_message("system", "\n".join(lines), markdown=True)
         return
 
-    table = Table(
-        title="Keyboard Shortcuts & Commands",
-        border_style="cyan",
-        show_header=True,
-        header_style="bold cyan",
-    )
-    table.add_column("Shortcut / Command", style="bold")
-    table.add_column("Action", style="dim")
-    table.add_row(
-        "Shift + Tab",
-        "Cycle between [ Plan Mode ], [ Build Mode ], and [ YOLO Mode ]",
-    )
-    table.add_row("?", "Show this help and keyboard shortcuts menu")
-    table.add_row("/help", "Show this help menu")
-    table.add_row(
-        "/plan / /build / /yolo",
-        "Switch active mode directly (or cycle with Shift+Tab)",
-    )
-    table.add_row("/test [cmd]", "Run test suite inside validation sandbox")
-    table.add_row("/team", "Monitor or inspect active background subagents")
-    table.add_row("/resume", "Show and access old chat sessions")
-    table.add_row("/model", "Choose active AI model (Mistral, DeepSeek, etc.)")
-    table.add_row("/config", "View or modify nimcode runtime configuration settings")
-    table.add_row(
-        "/changes / /diff", "Check git working tree changes and recent file backups"
-    )
-    table.add_row("/compact", "Compact conversation history into summary.md")
-    table.add_row("/recap", "Show a quick 4-5 line summary of the session")
-    table.add_row("/skills", "Show installed agent skills")
-    table.add_row(
-        "/install-skill <link>", "Install new skill from raw .md, .zip, or git repo"
-    )
-    table.add_row("/exit / /quit", "Exit the nimcode application")
-    table.add_row("Ctrl + C / ESC", "Cancel the current prompt / exit")
-
-    panel = Panel(table, border_style="cyan", padding=(1, 2))
-    console.print(panel)
-    console.print(
-        "[dim]Note: Shell commands and tests run inside a sandboxed Docker container by default.\n"
-        "To execute commands directly on the host, set 'disable_docker = true' in nimcode.toml.[/dim]\n"
-    )
+    for title, rows in (("Commands", COMMAND_HELP), ("Keys", KEY_BINDINGS)):
+        table = Table(
+            title=title,
+            border_style="cyan",
+            show_header=False,
+        )
+        table.add_column("", style="bold")
+        table.add_column("", style="dim")
+        for a, b in rows:
+            table.add_row(a, b)
+        console.print(table)
+    console.print(f"[dim]{_DOCKER_NOTE}[/dim]\n")
 
 
 def print_welcome():

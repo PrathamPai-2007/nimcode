@@ -120,8 +120,26 @@ def _get_client_and_setup() -> tuple[OpenAI, Any, Path, str]:
     return client, config, workspace_root, workspace_map
 
 
+def _print_version(value: bool):
+    if value:
+        from nimcode import __version__
+
+        typer.echo(f"nimcode {__version__}")
+        raise typer.Exit()
+
+
 @app.callback(invoke_without_command=True)
-def main_callback(ctx: typer.Context):
+def main_callback(
+    ctx: typer.Context,
+    version: bool = typer.Option(
+        False,
+        "--version",
+        "-V",
+        callback=_print_version,
+        is_eager=True,
+        help="Show the nimcode version and exit.",
+    ),
+):
     """
     An open-source, terminal-first AI coding agent driven by NVIDIA NIM (DeepSeek V4).
     Run without arguments (`nimcode`) to boot into the interactive TUI.
@@ -148,11 +166,10 @@ def run(
     """
     Start the NIM-Engineer agent loop with a specific task prompt.
     """
-    # Validate before setup/clear so a typo doesn't wipe the screen first.
+    # Validate before setup so a typo fails fast.
     if mode is not None and mode.lower() not in ("plan", "build", "yolo"):
         raise typer.BadParameter("Mode must be one of: plan, build, yolo.")
     client, config, workspace_root, workspace_map = _get_client_and_setup()
-    typer.clear()
     if yolo or (mode and mode.lower() == "yolo"):
         config.mode = "yolo"
         initial_state = "YOLO"
@@ -191,7 +208,6 @@ def start():
     Start an interactive nimcode session by prompting for the initial task with a beautiful TUI.
     """
     client, config, workspace_root, workspace_map = _get_client_and_setup()
-    typer.clear()
 
     tui = _make_tui(config=config)
     tui.show_welcome(str(workspace_root))
@@ -271,6 +287,23 @@ def status():
     typer.echo(
         f"  • Harvested Files:    ~{max(0, line_count - 1)} entries across workspace tree"
     )
+    typer.echo("")
+
+
+@app.command(name="config")
+def show_config():
+    """
+    Print the merged configuration and where each value came from
+    (default, nimcode.toml or model.json).
+    """
+    from nimcode.config import config_sources
+
+    config = load_config()
+    typer.secho("\nnimcode configuration", fg=typer.colors.CYAN, bold=True)
+    rows = config_sources(config)
+    width = max(len(k) for k, _, _ in rows)
+    for key, value, source in rows:
+        typer.echo(f"  {key:<{width}}  = {value!r:<40}  [{source}]")
     typer.echo("")
 
 

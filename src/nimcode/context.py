@@ -28,29 +28,32 @@ DEFAULT_EXCLUDES = {
 }
 
 
+BINARY_SUFFIXES = {
+    ".exe",
+    ".dll",
+    ".so",
+    ".pyc",
+    ".pyo",
+    ".bin",
+    ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".ico",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".7z",
+    ".whl",
+}
+
+
 def is_ignored(path: Path, gitignore_rules: list, root: Optional[Path] = None) -> bool:
     path = Path(path)
     if path.name in DEFAULT_EXCLUDES or path.name == ".git" or ".git" in path.parts:
         return True
-    if path.is_file() and path.suffix.lower() in {
-        ".exe",
-        ".dll",
-        ".so",
-        ".pyc",
-        ".pyo",
-        ".bin",
-        ".pdf",
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".gif",
-        ".ico",
-        ".zip",
-        ".tar",
-        ".gz",
-        ".7z",
-        ".whl",
-    }:
+    if path.suffix.lower() in BINARY_SUFFIXES and path.is_file():
         return True
 
     rel_path = path.name
@@ -152,20 +155,89 @@ def _compile_rule(rule: str):
         return None
 
 
-def load_gitignore_rules(workspace_root: Path) -> list:
-    """Read .gitignore into rule lines. Empty list when missing/unreadable."""
-    gitignore_path = Path(workspace_root) / ".gitignore"
-    if not gitignore_path.exists():
-        return []
+# (path, mtime_ns) -> rule lines; an ignore file is re-read only when edited.
+_IGNORE_FILE_CACHE: dict = {}
+# root -> (monotonic time, [(ignore_file, dir_prefix)]). Every tool call loads
+# rules, so the discovery walk runs at most once per TTL per workspace.
+# ponytail: 5s TTL, a brand-new NESTED .gitignore can take that long to apply.
+_DISCOVERY_CACHE: dict = {}
+_DISCOVERY_TTL_S = 5.0
+
+
+def _read_ignore_file(path: Path) -> list:
     try:
-        with open(gitignore_path, "r", encoding="utf-8") as f:
-            return [
-                line.strip()
-                for line in f
-                if line.strip() and not line.strip().startswith("#")
-            ]
-    except Exception:
+        key = (str(path), path.stat().st_mtime_ns)
+    except OSError:
         return []
+    lines = _IGNORE_FILE_CACHE.get(key)
+    if lines is None:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
+        lines = [ln.strip() for ln in text.splitlines()]
+        lines = [ln for ln in lines if ln and not ln.startswith("#")]
+        _IGNORE_FILE_CACHE[key] = lines
+    return lines
+
+
+def _rebase_rule(rule: str, prefix: str) -> str:
+    """Rewrite a rule from `<prefix>/.gitignore` relative to the root:
+    `*.log` -> `prefix/**/*.log`; `/build` or `a/b` -> `prefix/build`, `prefix/a/b`."""
+    if not prefix:
+        return rule
+    neg = rule.startswith("!")
+    r = rule[1:] if neg else rule
+    if r.startswith("\\"):  # escaped leading `!`/`#` no longer leads
+        r = r[1:]
+    anchored = "/" in r.rstrip("/")
+    r = prefix + "/" + (r.lstrip("/") if anchored else "**/" + r)
+    return ("!" if neg else "") + r
+
+
+def _top_ignore_files(root: Path) -> list:
+    """Always-fresh (not TTL-cached) ignore files: info/exclude, root .gitignore."""
+    return [(root / ".git" / "info" / "exclude", ""), (root / ".gitignore", "")]
+
+
+def _discover_nested_ignore_files(root: Path) -> list:
+    import time
+
+    hit = _DISCOVERY_CACHE.get(str(root))
+    if hit and time.monotonic() - hit[0] < _DISCOVERY_TTL_S:
+        return hit[1]
+    found = []
+    rules = [r for p, _ in _top_ignore_files(root) for r in _read_ignore_file(p)]
+    for dirpath, dirnames, filenames in os.walk(root):
+        d = Path(dirpath)
+        rel = d.relative_to(root).as_posix()
+        if rel != "." and ".gitignore" in filenames:
+            found.append((d / ".gitignore", rel))
+            rules.extend(
+                _rebase_rule(r, rel) for r in _read_ignore_file(d / ".gitignore")
+            )
+        if rel.count("/") >= 25:
+            dirnames[:] = []
+            continue
+        # Prune ignored dirs (node_modules, build/...) so they're never walked.
+        dirnames[:] = [
+            n
+            for n in dirnames
+            if not (d / n).is_symlink() and not is_ignored(d / n, rules, root=root)
+        ]
+    _DISCOVERY_CACHE[str(root)] = (time.monotonic(), found)
+    return found
+
+
+def load_gitignore_rules(workspace_root: Path) -> list:
+    """All ignore rules as root-relative lines in git precedence order (later
+    wins): .git/info/exclude, root .gitignore, then nested .gitignore files
+    rebased onto their directory. Empty list when there are none."""
+    root = Path(workspace_root).resolve()
+    rules: list = []
+    for path, prefix in _top_ignore_files(root) + _discover_nested_ignore_files(root):
+        rules.extend(_rebase_rule(r, prefix) for r in _read_ignore_file(path))
+    return rules
 
 
 # (path, mtime_ns, size) -> imports. The map is rebuilt every agent turn, so
@@ -205,59 +277,141 @@ def _parse_python_imports(file_path: Path) -> set:
     return imports
 
 
+_ENTRY_POINT_RE = re.compile(
+    r"(__main__\.py|(main|cli|app|index|server)\.[^.]+|manage\.py|setup\.py"
+    r"|package\.json|pyproject\.toml|Cargo\.toml|go\.mod)\Z",
+    re.IGNORECASE,
+)
+
+
+def _git_list_files(root: Path) -> Optional[list]:
+    """Tracked + untracked-not-ignored files via git (honours every ignore
+    source git knows). None when not a repo, git is missing, or it fails."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("git"):
+        return None
+    from nimcode.tools.base import scrub_env
+
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files", "-co", "--exclude-standard", "-z"],
+            cwd=str(root),
+            capture_output=True,
+            timeout=5,
+            env=scrub_env(dict(os.environ)),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = []
+    for rel in proc.stdout.decode("utf-8", errors="replace").split("\0"):
+        if not rel or any(p in DEFAULT_EXCLUDES for p in rel.split("/")):
+            continue
+        if Path(rel).suffix.lower() in BINARY_SUFFIXES:
+            continue
+        out.append(rel)
+    return out
+
+
+def _walk_list_files(root: Path, cap: int) -> list:
+    rules = load_gitignore_rules(root)
+    out: list = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        d = Path(dirpath)
+        rel_dir = d.relative_to(root).as_posix()
+        depth = 0 if rel_dir == "." else rel_dir.count("/") + 1
+        dirnames[:] = sorted(
+            n
+            for n in dirnames
+            if depth < 8
+            and not (d / n).is_symlink()
+            and not is_ignored(d / n, rules, root=root)
+        )
+        for name in sorted(filenames):
+            if not is_ignored(d / name, rules, root=root):
+                out.append(name if depth == 0 else f"{rel_dir}/{name}")
+        if len(out) >= cap:
+            break
+    return out
+
+
 def generate_workspace_map(root_dir: str, max_files: int = 500) -> str:
+    """Tree of up to `max_files` files: likely entry points first (shallowest
+    first), then the most recently modified; rendered in path order."""
     root = Path(root_dir).resolve()
+    # ponytail: candidates capped (one stat per file each turn); a huge repo
+    # only ranks its first 20 x max_files paths in listing order.
+    cap = max_files * 20
+    files = _git_list_files(root)
+    if files is None:
+        files = _walk_list_files(root, cap)
 
-    gitignore_rules = load_gitignore_rules(root)
-    file_counter = [0]
-
-    def build_tree(dir_path: Path, prefix: str = "", depth: int = 0) -> list:
-        lines: list[str] = []
-        if depth > 8 or file_counter[0] >= max_files:
-            return lines
-
+    ranked = []
+    for rel in files[:cap]:
         try:
-            entries = sorted(dir_path.iterdir(), key=lambda x: (x.is_file(), x.name))
-        except (PermissionError, OSError):
-            return lines
+            st = (root / rel).stat()
+        except OSError:
+            continue  # deleted but still tracked
+        if not os.path.isfile(root / rel):
+            continue
+        name = rel.rsplit("/", 1)[-1]
+        if _ENTRY_POINT_RE.match(name):
+            key = (0, rel.count("/"))
+        else:
+            key = (1, -st.st_mtime_ns)
+        ranked.append((key, rel, st.st_size))
+    ranked.sort()
+    chosen = ranked[:max_files]
+    omitted = len(ranked) - len(chosen)
 
-        entries = [e for e in entries if not is_ignored(e, gitignore_rules, root=root)]
+    tree: dict = {}
+    sizes = {}
+    for _, rel, size in chosen:
+        node = tree
+        parts = rel.split("/")
+        for part in parts[:-1]:
+            node = node.setdefault(part + "/", {})
+        node[parts[-1]] = None
+        sizes[rel] = size
 
-        for i, entry in enumerate(entries):
-            if file_counter[0] >= max_files:
-                lines.append(prefix + "`-- ... [Tree truncated - max files reached]")
-                break
+    def enrich(rel: str) -> str:
+        # Simple AST enrichment for reasonably small Python files.
+        if not rel.endswith(".py") or sizes[rel] >= 50000:
+            return ""
+        local = [
+            imp
+            for imp in _extract_python_imports(root / rel)
+            if (root / imp).exists()
+            or (root / "src" / imp).exists()
+            or imp == root.name
+            or imp == "nimcode"
+        ]
+        return f" (imports: {', '.join(local[:3])})" if local else ""
 
-            is_last = i == (len(entries) - 1)
-            pointer = "`-- " if is_last else "|-- "
-
-            # Simple AST enrichment for Python files
-            extra_info = ""
-            if entry.is_file() and entry.suffix == ".py":
-                try:
-                    size = entry.stat().st_size
-                    if size < 50000:  # only parse if reasonably small
-                        imports = _extract_python_imports(entry)
-                        local_imports = [
-                            imp
-                            for imp in imports
-                            if (root / imp).exists()
-                            or (root / "src" / imp).exists()
-                            or imp == root.name
-                            or imp == "nimcode"
-                        ]
-                        if local_imports:
-                            extra_info = f" (imports: {', '.join(local_imports[:3])})"
-                except Exception:
-                    pass
-
-            lines.append(prefix + pointer + entry.name + extra_info)
-            file_counter[0] += 1
-
-            if entry.is_dir():
-                extension = "    " if is_last else "|   "
-                lines.extend(build_tree(entry, prefix + extension, depth + 1))
+    def render(node: dict, prefix: str, rel_prefix: str) -> list:
+        lines: list = []
+        # Directories before files, then by name (as before).
+        keys = sorted(node, key=lambda k: (not k.endswith("/"), k.rstrip("/")))
+        for i, key in enumerate(keys):
+            is_last = i == len(keys) - 1
+            name = key.rstrip("/")
+            rel = rel_prefix + name
+            if node[key] is None:
+                lines.append(
+                    prefix + ("`-- " if is_last else "|-- ") + name + enrich(rel)
+                )
+            else:
+                lines.append(prefix + ("`-- " if is_last else "|-- ") + name)
+                ext = "    " if is_last else "|   "
+                lines.extend(render(node[key], prefix + ext, rel + "/"))
         return lines
 
-    tree = build_tree(root)
-    return f"{root.name}/\n" + "\n".join(tree)
+    lines = render(tree, "", "")
+    if omitted:
+        lines.append(
+            f"`-- ... [{omitted} more file(s) not shown; entry points and recently modified files listed first]"
+        )
+    return f"{root.name}/\n" + "\n".join(lines)

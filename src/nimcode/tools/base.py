@@ -131,6 +131,12 @@ def is_valid_tool_call(tool_call: Any) -> Tuple[bool, str, Dict[str, Any]]:
     elif tool_name == "search_grep":
         if not args.get("query"):
             return False, tool_name, args
+        if args.get("include") is not None and not isinstance(args["include"], str):
+            return False, tool_name, args
+        if args.get("case_sensitive") is not None and not isinstance(
+            args["case_sensitive"], (bool, str)
+        ):
+            return False, tool_name, args
     elif tool_name == "search_symbols":
         if not args.get("query"):
             return False, tool_name, args
@@ -492,7 +498,12 @@ def render_preview(
     elif tool_name == "search_grep":
         query = args.get("query", "")
         path = args.get("path", ".")
-        return f"\n[Tool Preview: search_grep] Query: '{query}', Path: {path}\n"
+        extra = ""
+        if args.get("include"):
+            extra += f", Include: {args['include']}"
+        if args.get("case_sensitive") not in (None, False, "", "false"):
+            extra += ", Case-sensitive"
+        return f"\n[Tool Preview: search_grep] Query: '{query}', Path: {path}{extra}\n"
 
     elif tool_name == "search_symbols":
         query = args.get("query", "")

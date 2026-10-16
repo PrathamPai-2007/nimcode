@@ -54,6 +54,45 @@ def make_tui(config=None):
     return RustTUI(config)
 
 
+SUMMARY_PROMPT = (
+    "Summarize our conversation, workspace state, and key decisions so far "
+    "as markdown for a summary.md handoff to a new model."
+)
+
+
+async def generate_summary(
+    tui, client, messages, model: str, config, workspace_root, status: str = ""
+) -> str:
+    """Ask `model` to summarise `messages`; write it to summary.md.
+
+    Shared by the /model handoff and /compact. Returns the stripped summary
+    ("" when the model returned nothing, in which case no file is written).
+    """
+    from nimcode.config import get_project_nimcode_dir
+    from nimcode.core.agent import call_nim_with_retry
+    from nimcode.core.prompts import strip_reasoning_spans
+
+    tui.set_working(True, status or "Generating summary.md...")
+    try:
+        res = await asyncio.to_thread(
+            call_nim_with_retry,
+            client,
+            list(messages) + [{"role": "user", "content": SUMMARY_PROMPT}],
+            None,
+            model,
+            config,
+            timeout=300.0,
+        )
+    finally:
+        tui.set_working(False)
+    text = strip_reasoning_spans(res.choices[0].message.content or "").strip()
+    if text:
+        summary_file = get_project_nimcode_dir(workspace_root) / "summary.md"
+        summary_file.parent.mkdir(parents=True, exist_ok=True)
+        summary_file.write_text(text, encoding="utf-8")
+    return text
+
+
 class RustTUI:
     """The nimcode TUI, backed by the Rust sidecar."""
 
@@ -345,13 +384,8 @@ class RustTUI:
         return False
 
     def show_welcome(self, workspace_root=None):
-        self.add_message(
-            "system",
-            "## nimcode\nNVIDIA NIM Coding Agent\n\n"
-            f"Workspace: `{workspace_root}`\n\n"
-            "- `Shift+Tab` cycles Plan / Build / YOLO\n"
-            "- `Ctrl+C` cancels, `Ctrl+D` exits\n",
-        )
+        # One line only: the sidecar's empty state draws the art and hints.
+        self.add_message("system", f"Working in {workspace_root}", markdown=False)
 
     def add_message(self, role: str, content: str, markdown: bool = True):
         if len(content) > 60000:
@@ -443,6 +477,13 @@ class RustTUI:
     async def get_user_input(
         self, prompt: str = "", _drop_typeahead: bool = False
     ) -> Optional[str]:
+        # Ctrl+D is sticky: once requested, every prompt (approval, rejection
+        # feedback, plan revisions) answers None immediately and the interrupt
+        # flag stays set, so the loop unwinds to its exit check instead of
+        # blocking on a follow-up prompt.
+        if self._eof_requested:
+            self._interrupted = True
+            return None
         self._drain_stale(drop_inputs=_drop_typeahead)
         if prompt:
             self.add_message("system", prompt)
@@ -453,18 +494,25 @@ class RustTUI:
             t = ev.get("type")
             if t == "input":
                 return ev.get("text")
-            elif t in ("interrupt", "eof"):
+            elif t == "eof":
+                self._interrupted = True
+                return None
+            elif t == "interrupt":
                 return None
             elif t == "mode_cycle" and self.config:
                 self.update_mode(ev.get("mode", self.mode))
 
     async def get_user_confirmation(self, prompt: str) -> str:
         if prompt:
-            self.add_message("system", prompt + " (y/n)")
+            self.add_message(
+                "system", prompt if "(y/n" in prompt else prompt + " (y/n)"
+            )
         res = await self.get_user_input(_drop_typeahead=True)
         return (res or "").strip().lower()
 
     async def _select(self, title: str, items: List[str]) -> Optional[int]:
+        if self._eof_requested:
+            return None
         self._drain_stale(drop_inputs=True)
         self._send({"type": "prompt_select", "title": title, "items": items})
         while True:
@@ -503,7 +551,7 @@ class RustTUI:
     async def select_model(
         self, config, client, messages, session_path, workspace_root
     ) -> Optional[str]:
-        from nimcode.config import get_project_nimcode_dir, save_last_used_model
+        from nimcode.config import save_last_used_model
         from nimcode.config_models import get_model_catalog, apply_model_context
         from nimcode.core.agent import call_nim_with_retry, log_turn
         from nimcode.core.prompts import strip_reasoning_spans
@@ -546,34 +594,18 @@ class RustTUI:
                 client is not None
                 and len([m for m in messages if m.get("role") == "user"]) >= 1
             ):
-                summary_file = get_project_nimcode_dir(workspace_root) / "summary.md"
-                self.set_working(True, "Generating summary.md for model handoff...")
-                try:
-                    summary_res = await asyncio.to_thread(
-                        call_nim_with_retry,
+                summary_text = (
+                    await generate_summary(
+                        self,
                         client,
-                        list(messages)
-                        + [
-                            {
-                                "role": "user",
-                                "content": "Summarize our conversation, workspace state, and key decisions so far as markdown for a summary.md handoff to a new model.",
-                            }
-                        ],
-                        None,
+                        messages,
                         old_model,
                         config,
-                        timeout=300.0,
+                        workspace_root,
+                        "Generating summary.md for model handoff...",
                     )
-                finally:
-                    self.set_working(False)
-                summary_text = (
-                    strip_reasoning_spans(
-                        summary_res.choices[0].message.content or ""
-                    ).strip()
                     or "# Summary\nPrevious session context handoff."
                 )
-                summary_file.parent.mkdir(parents=True, exist_ok=True)
-                summary_file.write_text(summary_text, encoding="utf-8")
                 handoff = {
                     "role": "user",
                     "content": f"<model_handoff_context>\nModel switched from {old_model} to {new_id}. Summary:\n\n{summary_text}\n</model_handoff_context>\n\nAcknowledge briefly you are ready to continue.",

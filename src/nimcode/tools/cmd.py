@@ -162,10 +162,16 @@ def _safe_docker_extra_args(config: Any) -> List[str]:
     """
     out: List[str] = []
     pending_ns = False
+    skip_value = False
     for extra in getattr(config, "docker_extra_args", None) or []:
         if not isinstance(extra, str) or not extra.strip():
             continue
         arg = extra.strip()
+        if skip_value:
+            # Value of a dropped split-form flag (["-v", "/:/host"]): drop it
+            # too, or docker would parse it as the image name.
+            skip_value = False
+            continue
         if pending_ns:
             pending_ns = False
             if _is_host_ns(arg):
@@ -173,10 +179,13 @@ def _safe_docker_extra_args(config: Any) -> List[str]:
                 continue
         flag, sep, value = arg.lower().partition("=")
         flag = flag.split()[0]
+        bare = not sep and " " not in arg
         if flag in _DOCKER_DENY_FLAGS:
+            skip_value = bare and flag != "--privileged"
             continue
         # Any short-flag cluster containing 'v' may carry a bind mount.
         if flag.startswith("-") and not flag.startswith("--") and "v" in flag:
+            skip_value = bare and flag.endswith("v")
             continue
         if flag in _DOCKER_NS_FLAGS:
             rest = value if sep else arg[len(flag) :]

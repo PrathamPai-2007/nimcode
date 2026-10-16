@@ -1,0 +1,36 @@
+                                                                                         │
+ ▎ model selector                                                                        │
+                                                                                         │        ╎
+   › model-0  [128k ctx]                                                                 │
+     model-1  [128k ctx]                                                                 │      ╎ ╎ ╎
+     model-2  [128k ctx]                                                                 │    ▄ ▄ ▄ ▄
+     model-3  [128k ctx]                                                                 │    ┃ ┃ ┃ ┃ ╎
+     model-4  [128k ctx]                                                                 │  ▄ ▄ ▄ ▄ ▄ ▄ ▄
+     model-5  [128k ctx]                                                                 │  ┃ ┃ ┃ ┃ ┃ ┃ ┃
+     model-6  [128k ctx]                                                                 │
+     model-7  [128k ctx]                                                                 │  41k of 128k
+     model-8  [128k ctx]                                                                 │
+     model-9  [128k ctx]                                                                 │  Build
+     model-10  [128k ctx]                                                                │  deepseek-v4-flash
+     model-11  [128k ctx]                                                                │  /home/dev/projects/nimcode
+     model-12  [128k ctx]                                                                │
+     model-13  [128k ctx]                                                                │  todo
+     model-14  [128k ctx]                                                                │   ✓ read cli.py
+     model-15  [128k ctx]                                                                │   ○ add --json flag
+     model-16  [128k ctx]                                                                │
+     model-17  [128k ctx]                                                                │  agents
+     model-18  [128k ctx]                                                                │   reviewer           running
+     model-19  [128k ctx]                                                                │
+     model-20  [128k ctx]                                                                │  processes
+     model-21  [128k ctx]                                                                │   bg_1  npm run dev
+     model-22  [128k ctx]                                                                │
+     model-23  [128k ctx]                                                                │
+     model-24  [128k ctx]                                                                │
+     model-25  [128k ctx]                                                                │
+     model-26  [128k ctx]                                                                │
+     model-27  [128k ctx]                                                                │
+     model-28  [128k ctx]                                                                │
+     model-29  [128k ctx]                                                                │
+     ↓ 10 more                                                                           │
+─────────────────────────────────────────────────────────────────────────────────────────┴──────────────────────────────
+ ›                                                                                  ↑↓ move · enter choose · esc cancel

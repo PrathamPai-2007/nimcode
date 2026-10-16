@@ -187,7 +187,15 @@ def normalize_messages(
         if can_merge:
             last_content = last.get("content") or ""
             msg_content = msg.get("content") or ""
-            if last_content and msg_content:
+            if isinstance(last_content, list) or isinstance(msg_content, list):
+                # Multimodal (image_url) parts: concatenate part lists.
+                def _parts(c):
+                    if isinstance(c, list):
+                        return c
+                    return [{"type": "text", "text": c}] if c else []
+
+                last["content"] = _parts(last_content) + _parts(msg_content)
+            elif last_content and msg_content:
                 last["content"] = f"{last_content}\n\n{msg_content}"
             elif msg_content:
                 last["content"] = msg_content
@@ -242,7 +250,18 @@ def count_message_tokens(
     estimator = _get_token_estimator(model)
     total = 0
     for msg in messages:
-        content = str(msg.get("content", ""))
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            # ponytail: flat ~1k tokens per image instead of counting base64;
+            # use the provider's per-tile formula if budgets get tight.
+            texts = [str(p.get("text", "")) for p in content if isinstance(p, dict)]
+            total += 1000 * sum(
+                1
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "image_url"
+            )
+            content = "\n".join(texts)
+        content = str(content)
         tool_calls = str(msg.get("tool_calls", ""))
         total += estimator(content) + estimator(tool_calls)
         # Add overhead for message structure
@@ -741,6 +760,41 @@ def load_session(path: Path) -> List[Dict[str, Any]]:
                 break
             raise
     return messages
+
+
+COMPACT_MARKER_KEY = "nimcode_compact"
+
+
+def prepare_resumed_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """History to continue from after loading a session file.
+
+    - Starts at the last /compact marker (an empty system message that then
+      serves as messages[0]), so compacted turns are not replayed.
+    - Logged screenshot parts carry a file path instead of base64; they are
+      flattened to text so the API never sees a non-URL image_url.
+    """
+    start = 0
+    for i, m in enumerate(messages):
+        if m.get(COMPACT_MARKER_KEY):
+            start = i
+    out = []
+    for m in messages[start:]:
+        content = m.get("content")
+        if isinstance(content, list):
+            parts = []
+            for p in content:
+                if not isinstance(p, dict):
+                    continue
+                if p.get("type") == "image_url":
+                    url = str((p.get("image_url") or {}).get("url", ""))
+                    if url.startswith("data:"):
+                        url = "(inline image)"
+                    parts.append(f"[screenshot: {url}]")
+                else:
+                    parts.append(str(p.get("text", "")))
+            m = dict(m, content="\n".join(parts))
+        out.append(m)
+    return out
 
 
 def open_session_path(
