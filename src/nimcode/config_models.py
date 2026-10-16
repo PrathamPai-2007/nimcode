@@ -191,6 +191,70 @@ def fetch_models(client: Any, timeout: float = 20.0) -> List[Dict[str, Any]]:
     return catalog
 
 
+NGC_CATALOG_URL = "https://api.ngc.nvidia.com/v2/search/catalog/resources/ENDPOINT"
+
+
+def fetch_free_ids(timeout: float = 15.0) -> set:
+    """Ids of hosted models NVIDIA labels "Free Endpoint" (public catalog).
+
+    ``/v1/models`` carries no pricing, but build.nvidia.com's catalog marks
+    free-tier endpoints. Never raises — returns an empty set on any failure.
+    """
+    try:
+        import httpx
+
+        free: set = set()
+        page = 0
+        while page < 10:
+            query = {
+                "query": "",
+                "page": page,
+                "pageSize": 100,
+                "filters": [{"field": "nimType", "value": "nim_type_preview"}],
+            }
+            r = httpx.get(
+                NGC_CATALOG_URL,
+                params={"q": json.dumps(query)},
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            body = r.json()
+            for group in body.get("results", []):
+                for res in group.get("resources", []):
+                    labels = {
+                        lab.get("key"): lab.get("values") or []
+                        for lab in res.get("labels", [])
+                    }
+                    publisher = (labels.get("publisher") or [""])[0]
+                    name = res.get("name")
+                    if (
+                        publisher
+                        and name
+                        and "Free Endpoint" in sum(labels.values(), [])
+                    ):
+                        free.add(f"{publisher}/{name}")
+            page += 1
+            if page >= int(body.get("resultPageTotal") or 1):
+                break
+        return free
+    except Exception:
+        return set()
+
+
+def fetch_catalog(client: Any) -> List[Dict[str, Any]]:
+    """Live models, each tagged ``free`` (kept from the cache if the lookup fails)."""
+    fetched = fetch_models(client)
+    if not fetched:
+        return []
+    free = fetch_free_ids()
+    if not free:
+        cached, _ = load_models_cache()
+        free = {m["id"] for m in cached or [] if m.get("free")}
+    for m in fetched:
+        m["free"] = m["id"] in free
+    return fetched
+
+
 def load_models_cache() -> Tuple[Optional[List[Dict[str, Any]]], float]:
     """Return (models or None, age_seconds or inf)."""
     try:
@@ -342,7 +406,7 @@ def refresh_models_blocking(client: Any) -> Tuple[List[Dict[str, Any]], str]:
             return get_model_catalog(), "Refresh already in progress."
         _refresh_inflight = True
     try:
-        fetched = fetch_models(client)
+        fetched = fetch_catalog(client)
         if not fetched:
             return (
                 get_model_catalog(),
@@ -362,7 +426,7 @@ def refresh_models_background(client: Any) -> None:
 
     def _worker() -> None:
         try:
-            fetched = fetch_models(client)
+            fetched = fetch_catalog(client)
             if fetched:
                 save_models_cache(fetched)
         except Exception:

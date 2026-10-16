@@ -192,6 +192,8 @@ class RustTUI:
             except Exception:
                 pass
             return
+        # Small NDJSON lines: Nagle + delayed ACK would hold each one back ~40-200ms.
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._sock = conn
         # Explicit UTF-8: the locale default (cp1252 on Windows) would raise on
         # non-ASCII text and kill the reader thread / drop writes.
@@ -567,6 +569,7 @@ class RustTUI:
                 if m.get("context_tokens")
                 else ""
             )
+            + ("  [free]" if m.get("free") else "")
             + ("  (current)" if m["id"] == config.fast_model else "")
             for m in models
         ]

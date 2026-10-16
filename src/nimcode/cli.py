@@ -416,7 +416,8 @@ def refresh_models():
     for m in catalog[:20]:
         ctx = m.get("context_tokens")
         ctx_str = f"{ctx:,} tokens" if ctx else "unknown window"
-        typer.echo(f"  • {m.get('name')} ({m.get('id')}) — {ctx_str}")
+        tag = " [free]" if m.get("free") else ""
+        typer.echo(f"  • {m.get('name')} ({m.get('id')}) — {ctx_str}{tag}")
     if len(catalog) > 20:
         typer.echo(f"  … and {len(catalog) - 20} more")
     typer.echo("")

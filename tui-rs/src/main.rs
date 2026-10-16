@@ -4,11 +4,10 @@ mod ui;
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use crossterm::{execute, terminal::*};
-use futures::{FutureExt, StreamExt};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -306,6 +305,7 @@ async fn main() -> R {
         .and_then(|p| p.parse::<u16>().ok())
     {
         let stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+        let _ = stream.set_nodelay(true);
         let (rh, wh) = stream.into_split();
         out = Channel::Socket(wh);
         tokio::spawn(read_task(tokio::io::BufReader::new(rh), tx.clone()));
@@ -324,7 +324,16 @@ async fn main() -> R {
     if std::env::args().any(|a| a == "--demo") {
         demo(&mut app);
     }
-    let mut reader = EventStream::new();
+    // A plain thread feeding a channel: crossterm's Windows EventStream missed
+    // wakeups inside select!, so keys were only seen on the next 1s idle tick.
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Event>();
+    std::thread::spawn(move || {
+        while let Ok(e) = crossterm::event::read() {
+            if ev_tx.send(e).is_err() {
+                break;
+            }
+        }
+    });
     let mut input_closed = false;
     let mut redraw = true;
 
@@ -341,10 +350,9 @@ async fn main() -> R {
         }
         let was_flashing = app.flashing();
         tokio::select! {
-            ev = reader.next(), if !input_closed => {
+            ev = ev_rx.recv(), if !input_closed => {
                 let first = match ev {
-                    Some(Ok(e)) => e,
-                    Some(Err(_)) => continue,
+                    Some(e) => e,
                     None => {
                         input_closed = true;
                         continue;
@@ -354,13 +362,13 @@ async fn main() -> R {
                 // mean a paste (Windows consoles have no bracketed paste).
                 let mut evs = vec![first];
                 while evs.len() < 8192 {
-                    match reader.next().now_or_never() {
-                        Some(Some(Ok(e))) => evs.push(e),
-                        Some(None) => {
+                    match ev_rx.try_recv() {
+                        Ok(e) => evs.push(e),
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
                             input_closed = true;
                             break;
                         }
-                        _ => break,
+                        Err(_) => break,
                     }
                 }
                 // Windows reports key release too; only presses/repeats count.

@@ -156,3 +156,69 @@ def test_static_catalog_shape():
     assert len(catalog) == 10
     for m in catalog:
         assert m["id"] and m["name"]
+
+
+def test_fetch_free_ids_parses_ngc_labels(monkeypatch):
+    import httpx
+
+    body = {
+        "resultPageTotal": 1,
+        "results": [
+            {
+                "resources": [
+                    {
+                        "name": "big-model",
+                        "labels": [
+                            {"key": "publisher", "values": ["acme"]},
+                            {"key": "general", "values": ["Free Endpoint"]},
+                        ],
+                    },
+                    {
+                        "name": "paid-model",
+                        "labels": [
+                            {"key": "publisher", "values": ["acme"]},
+                            {"key": "general", "values": ["Download Available"]},
+                        ],
+                    },
+                ]
+            }
+        ],
+    }
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return body
+
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp())
+    assert cm.fetch_free_ids() == {"acme/big-model"}
+
+
+def test_fetch_free_ids_failure_is_empty(monkeypatch):
+    import httpx
+
+    def boom(*a, **k):
+        raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr(httpx, "get", boom)
+    assert cm.fetch_free_ids() == set()
+
+
+def test_refresh_tags_free_and_keeps_tags_when_lookup_fails(monkeypatch, tmp_path):
+    _isolate_cache(monkeypatch, tmp_path)
+    client = _FakeClient([_Obj(id="acme/big-model"), _Obj(id="acme/other")])
+    monkeypatch.setattr(cm, "fetch_free_ids", lambda: {"acme/big-model"})
+    catalog, _ = cm.refresh_models_blocking(client)
+    assert {m["id"]: m["free"] for m in catalog} == {
+        "acme/big-model": True,
+        "acme/other": False,
+    }
+    # Catalog lookup down: tags survive from the cache instead of vanishing.
+    monkeypatch.setattr(cm, "fetch_free_ids", lambda: set())
+    catalog, _ = cm.refresh_models_blocking(client)
+    assert [m["id"] for m in catalog if m["free"]] == ["acme/big-model"]
+    assert [m["id"] for m in cm.get_model_catalog() if m.get("free")] == [
+        "acme/big-model"
+    ]
