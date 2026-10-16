@@ -1,20 +1,33 @@
 import os
 import sys
 import json
+import asyncio
 import typer
 from dotenv import load_dotenv
 from openai import OpenAI
 from pathlib import Path
 from typing import Optional, Any
 
-from nimcode.ui.tui import NimcodeTUI
 from nimcode.config import (
     load_config,
     get_project_nimcode_dir,
     select_interactive_session,
 )
 from nimcode.context import generate_workspace_map
-from nimcode.core.agent import run_agent_loop, run_init_command
+from nimcode.core.agent import run_init_command
+from nimcode.core.agent_tui import run_agent_loop_tui
+
+
+def _make_tui(config=None):
+    """Create the nimcode TUI (Rust sidecar). Exits cleanly if the binary is missing."""
+    from nimcode.ui.rust_bridge import make_tui as _factory
+
+    try:
+        return _factory(config=config)
+    except RuntimeError as e:
+        typer.secho(f"Error: {e}", fg=typer.colors.RED, bold=True)
+        raise typer.Exit(code=1)
+
 
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -22,116 +35,20 @@ if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-def patch_completions_menu_above():
-    """
-    Monkeypatches prompt_toolkit's FloatContainer._draw_float to force the
-    autocomplete completion menus to always render above the cursor line.
-    """
-    try:
-        from prompt_toolkit.layout.containers import FloatContainer
-        from prompt_toolkit.layout.menus import (
-            CompletionsMenu,
-            MultiColumnCompletionsMenu,
-        )
-        from prompt_toolkit.layout.containers import ConditionalContainer
-        from prompt_toolkit.application.current import get_app
-
-        original_draw_float = FloatContainer._draw_float
-
-        def patched_draw_float(
-            self, fl, screen, mouse_handlers, write_position, style, erase_bg, z_index
-        ):
-            content = fl.content
-            while isinstance(content, ConditionalContainer):
-                content = content.content
-
-            # Identify if this float represents standard or multi-column completions menus
-            is_menu = (
-                isinstance(content, (CompletionsMenu, MultiColumnCompletionsMenu))
-                or "CompletionsMenu" in type(content).__name__
-            )
-
-            if is_menu and fl.ycursor:
-                try:
-                    cpos = screen.get_menu_position(
-                        fl.attach_to_window or get_app().layout.current_window
-                    )
-                    cursor_y = cpos.y - write_position.ypos
-
-                    # Calculate preferred width/height of the completion menu
-                    fl_width = fl.get_width()
-                    if fl_width is None:
-                        width = fl.content.preferred_width(
-                            write_position.width
-                        ).preferred
-                        width = min(write_position.width, width)
-                    else:
-                        width = fl_width
-
-                    height = fl.content.preferred_height(
-                        width, write_position.height
-                    ).preferred
-
-                    # Force the height to fit the space above the cursor
-                    height = min(height, cursor_y)
-                    ypos = cursor_y - height
-
-                    # Temporarily override Float attributes to absolute coordinates above the cursor
-                    orig_ycursor = fl.ycursor
-                    orig_top = fl.top
-                    orig_bottom = fl.bottom
-                    orig_height = fl.height
-
-                    fl.ycursor = False
-                    fl.top = ypos
-                    fl.bottom = None
-                    fl.height = height
-
-                    try:
-                        original_draw_float(
-                            self,
-                            fl,
-                            screen,
-                            mouse_handlers,
-                            write_position,
-                            style,
-                            erase_bg,
-                            z_index,
-                        )
-                    finally:
-                        # Restore original values to prevent side effects on subsequent renders
-                        fl.ycursor = orig_ycursor
-                        fl.top = orig_top
-                        fl.bottom = orig_bottom
-                        fl.height = orig_height
-                    return
-                except Exception:
-                    pass
-
-            # Fallback to standard rendering logic
-            original_draw_float(
-                self,
-                fl,
-                screen,
-                mouse_handlers,
-                write_position,
-                style,
-                erase_bg,
-                z_index,
-            )
-
-        FloatContainer._draw_float = patched_draw_float
-    except Exception:
-        pass
-
-
-# Run patch at startup
-patch_completions_menu_above()
-
 app = typer.Typer(
     name="nimcode",
     help="An open-source, terminal-first AI coding agent driven by NVIDIA NIM (DeepSeek V4).",
 )
+
+
+def _safe_timeout(config) -> float:
+    try:
+        t = float(getattr(config, "timeout", 60))
+    except (TypeError, ValueError):
+        t = 60.0
+    if t <= 0:
+        t = 60.0
+    return min(t, 600.0)
 
 
 def _get_client_and_setup() -> tuple[OpenAI, Any, Path, str]:
@@ -165,23 +82,32 @@ def _get_client_and_setup() -> tuple[OpenAI, Any, Path, str]:
     client = OpenAI(
         base_url=base_url,
         api_key=api_key,
-        timeout=float(config.timeout),
+        timeout=_safe_timeout(config),
         max_retries=0,
     )
 
     workspace_root = Path(config.workspace_root).resolve()
     config.workspace_root = str(workspace_root)
+    # model.json is already merged (and validated) by load_config().
 
-    # Ensure any persisted model across sessions for this workspace_root is loaded
+    # Live model catalog: instant start from cache/static, then refresh in the
+    # background. Reconciles retired saved models and fits the context budget
+    # to the active model's window (unless the user customized it).
+    # The cache holds the NVIDIA catalog; a custom endpoint must neither
+    # overwrite it nor have its models "retired" against it.
     try:
-        model_file = get_project_nimcode_dir(workspace_root) / "model.json"
-        if model_file.exists():
-            with open(model_file, "r", encoding="utf-8") as mf:
-                mdata = json.load(mf)
-                if "fast_model" in mdata and mdata["fast_model"]:
-                    config.fast_model = mdata["fast_model"]
-                if "plan_model" in mdata and mdata["plan_model"]:
-                    config.plan_model = mdata["plan_model"]
+        from nimcode import config_models as _cm
+
+        if not config.api_base_url:
+            _catalog = _cm.get_model_catalog()
+            _notice = _cm.reconcile_saved_model(config, _catalog)
+            if _notice:
+                typer.secho(f"Note: {_notice}", fg=typer.colors.YELLOW)
+        _changed, _msg = _cm.apply_model_context(config, config.fast_model)
+        if _changed:
+            typer.secho(f"Note: {_msg}", fg=typer.colors.CYAN)
+        if not config.api_base_url:
+            _cm.refresh_models_background(client)
     except Exception:
         pass
 
@@ -218,6 +144,9 @@ def run(
     """
     Start the NIM-Engineer agent loop with a specific task prompt.
     """
+    # Validate before setup/clear so a typo doesn't wipe the screen first.
+    if mode is not None and mode.lower() not in ("plan", "build", "yolo"):
+        raise typer.BadParameter("Mode must be one of: plan, build, yolo.")
     client, config, workspace_root, workspace_map = _get_client_and_setup()
     typer.clear()
     if yolo or (mode and mode.lower() == "yolo"):
@@ -235,13 +164,20 @@ def run(
             if config.mode == "yolo"
             else ("AWAITING_PLAN_APPROVAL" if config.mode == "plan" else "EXECUTING")
         )
-    run_agent_loop(
-        client,
-        prompt,
-        config,
-        workspace_root,
-        workspace_map,
-        initial_state=initial_state,
+
+    # Create TUI and run async loop
+    tui = _make_tui(config=config)
+    tui.show_welcome(str(workspace_root))
+    asyncio.run(
+        run_agent_loop_tui(
+            tui,
+            client,
+            prompt,
+            config,
+            workspace_root,
+            workspace_map,
+            initial_state=initial_state,
+        )
     )
 
 
@@ -253,45 +189,26 @@ def start():
     client, config, workspace_root, workspace_map = _get_client_and_setup()
     typer.clear()
 
-    tui = NimcodeTUI(config=config)
-    tui.show_welcome(workspace_root)
+    tui = _make_tui(config=config)
+    tui.show_welcome(str(workspace_root))
 
-    prompt, mode = tui.get_prompt()
-
-    if prompt and prompt.startswith("<RESUME_SESSION> "):
-        session_file_name = prompt.split(" ", 1)[1]
-        session_path = (
-            get_project_nimcode_dir(workspace_root) / "sessions" / session_file_name
-        )
-        with open(session_path, "r", encoding="utf-8") as f:
-            existing_messages = json.load(f)
-        run_agent_loop(
+    # Now run the full agent loop with the initial prompt empty, which will automatically prompt the user in TUI
+    if config.mode == "yolo":
+        initial_state = "YOLO"
+    elif config.mode == "plan":
+        initial_state = "AWAITING_PLAN_APPROVAL"
+    else:
+        initial_state = "EXECUTING"
+    asyncio.run(
+        run_agent_loop_tui(
+            tui,
             client,
             "",
             config,
             workspace_root,
             workspace_map,
-            existing_messages=existing_messages,
-            session_file_name=session_file_name,
+            initial_state=initial_state,
         )
-        return
-
-    if not prompt or not prompt.strip():
-        typer.echo("No prompt provided. Exiting.")
-        raise typer.Exit()
-
-    initial_state = (
-        "AWAITING_PLAN_APPROVAL"
-        if mode == "Plan Mode"
-        else ("YOLO" if mode == "YOLO Mode" else "EXECUTING")
-    )
-    run_agent_loop(
-        client,
-        prompt.strip(),
-        config,
-        workspace_root,
-        workspace_map,
-        initial_state=initial_state,
     )
 
 
@@ -312,21 +229,74 @@ def status():
     typer.secho("\nnimcode Status Check", fg=typer.colors.CYAN, bold=True)
     typer.echo(f"  • Workspace Root:     {workspace_root}")
     typer.echo(f"  • API Key Set:        {'Yes' if api_key else 'No'}")
+    _base = config.api_base_url or "https://integrate.api.nvidia.com/v1"
+    typer.echo(
+        f"  • Endpoint:           {_base}"
+        + ("" if config.api_base_url else " (default)")
+    )
     typer.echo(f"  • Fast Model:         {config.fast_model}")
     typer.echo(f"  • Plan Model:         {config.plan_model}")
     typer.echo(f"  • Active Mode:        {config.mode}")
     typer.echo(f"  • Loop Iteration Cap: {config.max_loop_iterations}")
+    try:
+        from nimcode import config_models as _cm
+
+        _catalog = _cm.get_model_catalog()
+        _, _age = _cm.load_models_cache()
+        _fresh = (
+            "live cache"
+            if _age < _cm._ttl_seconds()
+            else ("stale cache" if _age != float("inf") else "static table")
+        )
+        typer.echo(f"  • Model Catalog:      {len(_catalog)} models ({_fresh})")
+    except Exception:
+        pass
     session_dir = get_project_nimcode_dir(workspace_root) / "sessions"
     session_count = len(list(session_dir.glob("*.json"))) if session_dir.exists() else 0
     typer.echo(
         f"  • Session Logs:       {'Active (' + str(session_count) + ' sessions)' if session_count > 0 else 'None'}"
     )
 
-    workspace_map = generate_workspace_map(str(workspace_root))
+    try:
+        workspace_map = generate_workspace_map(str(workspace_root))
+    except Exception as e:
+        typer.echo(f"  • Harvested Files:    (unavailable: {e})")
+        typer.echo("")
+        return
     line_count = len(workspace_map.splitlines())
     typer.echo(
-        f"  • Harvested Files:    ~{line_count - 1} entries across workspace tree"
+        f"  • Harvested Files:    ~{max(0, line_count - 1)} entries across workspace tree"
     )
+    typer.echo("")
+
+
+@app.command(name="refresh-models")
+def refresh_models():
+    """
+    Force a live refresh of the model catalog from the NIM API.
+    """
+    client, config, workspace_root, _ = _get_client_and_setup()
+    from nimcode import config_models as _cm
+
+    if config.api_base_url:
+        # Custom endpoint: list live, but don't clobber the shared NVIDIA cache.
+        catalog = _cm.fetch_models(client)
+        msg = f"Endpoint lists {len(catalog)} models (not cached)."
+    else:
+        catalog, msg = _cm.refresh_models_blocking(client)
+    typer.secho(f"\n{msg}", fg=typer.colors.CYAN, bold=True)
+    notice = None if config.api_base_url else _cm.reconcile_saved_model(config, catalog)
+    if notice:
+        typer.secho(f"Note: {notice}", fg=typer.colors.YELLOW)
+    changed, ctx_msg = _cm.apply_model_context(config, config.fast_model)
+    if changed:
+        typer.secho(f"Note: {ctx_msg}", fg=typer.colors.CYAN)
+    for m in catalog[:20]:
+        ctx = m.get("context_tokens")
+        ctx_str = f"{ctx:,} tokens" if ctx else "unknown window"
+        typer.echo(f"  • {m.get('name')} ({m.get('id')}) — {ctx_str}")
+    if len(catalog) > 20:
+        typer.echo(f"  … and {len(catalog) - 20} more")
     typer.echo("")
 
 
@@ -344,14 +314,23 @@ def resume(
 
     legacy_session = workspace_root / ".nimcode_session.json"
     if legacy_session.exists():
-        session_dir.mkdir(parents=True, exist_ok=True)
-        import shutil
+        try:
+            session_dir.mkdir(parents=True, exist_ok=True)
+            import shutil
+            import time as _t
 
-        shutil.move(str(legacy_session), str(session_dir / "legacy_session.json"))
-        typer.secho(
-            f"\nMigrated legacy session to {session_dir}/legacy_session.json",
-            fg=typer.colors.CYAN,
-        )
+            # Must match the picker's "session_*.json" glob or it is invisible.
+            dest = session_dir / f"session_legacy_{int(_t.time())}.json"
+            shutil.move(str(legacy_session), str(dest))
+            typer.secho(
+                f"\nMigrated legacy session to {dest}",
+                fg=typer.colors.CYAN,
+            )
+        except Exception as e:
+            typer.secho(
+                f"Warning: could not migrate legacy session: {e}",
+                fg=typer.colors.YELLOW,
+            )
 
     if not session_dir.exists() or not list(session_dir.glob("*.json")):
         typer.secho(
@@ -360,9 +339,21 @@ def resume(
         )
         raise typer.Exit()
 
-    sessions = sorted(
-        list(session_dir.glob("*.json")), key=lambda x: x.stat().st_mtime, reverse=True
-    )
+    try:
+        sessions = sorted(
+            list(session_dir.glob("*.json")),
+            key=lambda x: x.stat().st_mtime,
+            reverse=True,
+        )
+    except FileNotFoundError:
+        typer.secho(
+            "No active sessions found. Use 'start' or 'run' to begin a new session.",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit()
+    except OSError as e:
+        typer.secho(f"Error listing sessions: {e}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
 
     if latest:
         selected_session = sessions[0]
@@ -377,18 +368,27 @@ def resume(
     except Exception as e:
         typer.secho(f"Error loading session log: {e}", fg=typer.colors.RED)
         raise typer.Exit(code=1)
+    if not isinstance(existing_messages, list):
+        typer.secho(
+            "Session file is corrupt (not a message list). Starting a new session.",
+            fg=typer.colors.YELLOW,
+        )
+        existing_messages = []
 
     if not existing_messages:
         typer.secho(
             "Session file is empty. Starting a new session.", fg=typer.colors.YELLOW
         )
-        run_agent_loop(
-            client,
-            "Hello, continue from where we left off.",
-            config,
-            workspace_root,
-            workspace_map,
-            session_file_name=selected_session.name,
+        asyncio.run(
+            run_agent_loop_tui(
+                _make_tui(config=config),
+                client,
+                "Hello, continue from where we left off.",
+                config,
+                workspace_root,
+                workspace_map,
+                session_file_name=selected_session.name,
+            )
         )
     else:
         typer.secho(
@@ -396,14 +396,17 @@ def resume(
             fg=typer.colors.GREEN,
             bold=True,
         )
-        run_agent_loop(
-            client,
-            "",
-            config,
-            workspace_root,
-            workspace_map,
-            existing_messages=existing_messages,
-            session_file_name=selected_session.name,
+        asyncio.run(
+            run_agent_loop_tui(
+                _make_tui(config=config),
+                client,
+                "",
+                config,
+                workspace_root,
+                workspace_map,
+                existing_messages=existing_messages,
+                session_file_name=selected_session.name,
+            )
         )
 
 
@@ -414,6 +417,27 @@ def init():
     """
     client, config, workspace_root, workspace_map = _get_client_and_setup()
     run_init_command(config, client=client, workspace_root=workspace_root)
+
+
+@app.command()
+def stats():
+    """
+    Show usage statistics and analytics from historical sessions.
+    """
+    load_dotenv()
+    global_env = Path.home() / ".nimcode" / ".env"
+    if global_env.exists() and not os.environ.get("NVIDIA_API_KEY"):
+        load_dotenv(dotenv_path=global_env)
+
+    config = load_config()
+    workspace_root = Path(config.workspace_root).resolve()
+    config.workspace_root = str(workspace_root)
+
+    from nimcode.ui.output import console
+    from nimcode.core.agent import aggregate_session_stats, render_stats_rich
+
+    stats = aggregate_session_stats(workspace_root)
+    render_stats_rich(stats, console)
 
 
 if __name__ == "__main__":

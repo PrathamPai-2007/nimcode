@@ -1,22 +1,6 @@
-from setuptools import setup, find_packages
+# Legacy shim for `pip install -e .` on old tooling. All metadata (version,
+# dependencies, package data, entry points) lives in pyproject.toml so the
+# two can't drift.
+from setuptools import setup
 
-setup(
-    name="nimcode",
-    version="0.6.0",
-    package_dir={"": "src"},
-    packages=find_packages(where="src"),
-    install_requires=[
-        "typer>=0.9.0",
-        "openai>=1.0.0",
-        "python-dotenv>=1.0.0",
-        "tomli>=2.0.0",
-        "rich>=13.0.0",
-        "prompt_toolkit>=3.0.0",
-        "playwright>=1.40.0",
-    ],
-    entry_points={
-        "console_scripts": [
-            "nimcode = nimcode.cli:app",
-        ],
-    },
-)
+setup()

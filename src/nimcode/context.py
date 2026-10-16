@@ -1,5 +1,7 @@
 from pathlib import Path
-import fnmatch
+import functools
+import os
+import re
 from typing import Optional
 
 
@@ -27,7 +29,8 @@ DEFAULT_EXCLUDES = {
 
 
 def is_ignored(path: Path, gitignore_rules: list, root: Optional[Path] = None) -> bool:
-    if path.name in DEFAULT_EXCLUDES or path.name.startswith(".git"):
+    path = Path(path)
+    if path.name in DEFAULT_EXCLUDES or path.name == ".git" or ".git" in path.parts:
         return True
     if path.is_file() and path.suffix.lower() in {
         ".exe",
@@ -50,42 +53,140 @@ def is_ignored(path: Path, gitignore_rules: list, root: Optional[Path] = None) -
     }:
         return True
 
+    rel_path = path.name
     if root:
-        if isinstance(root, str):
-            root = Path(root)
-        if isinstance(path, str):
-            path = Path(path)
-        abs_root = root.resolve()
-        abs_path = path.resolve()
-        if abs_path.is_relative_to(abs_root):
-            rel_path = str(abs_path.relative_to(abs_root)).replace("\\", "/")
-        else:
-            rel_path = path.name
-    else:
-        rel_path = path.name
+        root = Path(root)
+        # Lexical fast path (no syscalls) — build_tree passes entries already
+        # under the resolved root; resolve() per entry was slow on big repos.
+        try:
+            rel = path.relative_to(root)
+            if ".." in rel.parts:
+                raise ValueError
+        except ValueError:
+            try:
+                rel = path.resolve().relative_to(root.resolve())
+            except (ValueError, OSError):
+                rel = None
+        if rel is not None and rel.parts:
+            rel_path = rel.as_posix()
 
-    for rule in gitignore_rules:
-        rule_clean = rule.strip().rstrip("/")
-        if not rule_clean or rule_clean.startswith("#"):
-            continue
-
-        # If the pattern doesn't contain a slash, it matches any component of the path
-        if "/" not in rule_clean:
-            if fnmatch.fnmatch(path.name, rule_clean):
-                return True
-            path_parts = Path(rel_path).parts
-            if any(fnmatch.fnmatch(part, rule_clean) for part in path_parts):
-                return True
-        else:
-            rule_match = rule_clean.lstrip("/")
-            if fnmatch.fnmatch(rel_path, rule_match) or fnmatch.fnmatch(
-                rel_path, f"{rule_match}/*"
-            ):
-                return True
+    # gitignore semantics: last matching rule wins; `!` re-includes; and a
+    # file inside an ignored directory can never be re-included, so each
+    # ancestor is evaluated first.
+    parts = rel_path.split("/")
+    compiled = [c for c in map(_compile_rule, gitignore_rules) if c]
+    if not compiled:
+        return False
+    path_is_dir: Optional[bool] = None
+    for depth in range(1, len(parts) + 1):
+        sub = "/".join(parts[:depth])
+        ignored = False
+        for negate, dir_only, rx in compiled:
+            if dir_only and depth == len(parts):
+                if path_is_dir is None:
+                    path_is_dir = path.is_dir()
+                if not path_is_dir:
+                    continue
+            if rx.match(sub):
+                ignored = not negate
+        if ignored:
+            return True
     return False
 
 
+@functools.lru_cache(maxsize=2048)
+def _compile_rule(rule: str):
+    """Translate one .gitignore line to (negate, dir_only, regex) or None.
+
+    Unlike fnmatch, `*` and `?` never cross `/`, `**` spans directories, a
+    pattern with a slash is anchored to the root, and a trailing `/` matches
+    directories only. (`build/**` used to match the entire workspace.)
+    """
+    r = rule.strip()
+    if not r or r.startswith("#"):
+        return None
+    negate = r.startswith("!")
+    if negate:
+        r = r[1:]
+    if r.startswith("\\"):  # escaped leading `!` or `#`
+        r = r[1:]
+    dir_only = r.endswith("/")
+    r = r.rstrip("/")
+    if not r:
+        return None
+    anchored = "/" in r
+    r = r.lstrip("/")
+    out = []
+    i = 0
+    while i < len(r):
+        if r.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif r.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif r[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif r[i] == "?":
+            out.append("[^/]")
+            i += 1
+        elif r[i] == "[" and "]" in r[i + 2 :]:
+            j = r.index("]", i + 2)
+            body = r[i + 1 : j]
+            if body.startswith("!"):
+                body = "^" + body[1:]
+            out.append("[" + body.replace("\\", "\\\\") + "]")
+            i = j + 1
+        else:
+            out.append(re.escape(r[i]))
+            i += 1
+    pattern = "".join(out) + r"\Z"
+    if not anchored:
+        pattern = "(?:.*/)?" + pattern
+    # Windows/macOS filesystems are case-insensitive (fnmatch behaved so too).
+    flags = re.IGNORECASE if os.name == "nt" else 0
+    try:
+        return negate, dir_only, re.compile(pattern, flags)
+    except re.error:
+        return None
+
+
+def load_gitignore_rules(workspace_root: Path) -> list:
+    """Read .gitignore into rule lines. Empty list when missing/unreadable."""
+    gitignore_path = Path(workspace_root) / ".gitignore"
+    if not gitignore_path.exists():
+        return []
+    try:
+        with open(gitignore_path, "r", encoding="utf-8") as f:
+            return [
+                line.strip()
+                for line in f
+                if line.strip() and not line.strip().startswith("#")
+            ]
+    except Exception:
+        return []
+
+
+# (path, mtime_ns, size) -> imports. The map is rebuilt every agent turn, so
+# re-parsing up to 500 files each turn was pure waste.
+# ponytail: unbounded dict, bounded in practice by max_files per workspace.
+_IMPORTS_CACHE: dict = {}
+
+
 def _extract_python_imports(file_path: Path) -> set:
+    try:
+        st = file_path.stat()
+        key = (str(file_path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return set()
+    cached = _IMPORTS_CACHE.get(key)
+    if cached is None:
+        cached = _IMPORTS_CACHE[key] = _parse_python_imports(file_path)
+    return cached
+
+
+def _parse_python_imports(file_path: Path) -> set:
     import ast
 
     imports = set()
@@ -107,29 +208,8 @@ def _extract_python_imports(file_path: Path) -> set:
 def generate_workspace_map(root_dir: str, max_files: int = 500) -> str:
     root = Path(root_dir).resolve()
 
-    gitignore_rules = []
-    gitignore_path = root / ".gitignore"
-    if gitignore_path.exists():
-        try:
-            with open(gitignore_path, "r", encoding="utf-8") as f:
-                gitignore_rules = [
-                    line.strip()
-                    for line in f
-                    if line.strip() and not line.strip().startswith("#")
-                ]
-        except Exception:
-            pass
-
+    gitignore_rules = load_gitignore_rules(root)
     file_counter = [0]
-
-    # We can do a quick check if workspace is large and we should try AST filtering.
-    # For now, we simply keep the tree but maybe tag python files with their internal dependencies if requested, or just do the standard tree for everything but if we hit the limit we try to show important files.
-    # The requirement is: "For larger workspaces, use static analysis... to dynamically build a workspace map of files related to the initial user prompt."
-    # Since we don't have the initial user prompt here directly (it takes only root_dir), we can at least just enrich the output with AST info or prioritize python files that are part of the local package.
-    # A simple AST enhancement is to just do standard build_tree but maybe we can't fully do it without the prompt.
-    # But wait, the feature requests: "For larger workspaces, use static analysis (e.g. ast imports in Python, package.json entry points) to dynamically build a workspace map of files related to the initial user prompt."
-    # Since we can't easily change the signature of generate_workspace_map everywhere (it's called in cli.py, agent.py without the prompt), let's just make generate_workspace_map smarter by prioritizing python files that import each other or just extracting the AST structure (classes/functions) for the map if it's small enough, or just sticking to the tree.
-    # Let's just implement a basic AST summary for python files at the root level if we are under the limit.
 
     def build_tree(dir_path: Path, prefix: str = "", depth: int = 0) -> list:
         lines: list[str] = []

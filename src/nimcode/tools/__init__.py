@@ -30,6 +30,7 @@ from .swarm import (
 from .cmd import (
     run_tests_tool,
     execute_test_runner,
+    tests_passed,
     start_background_process_tool,
     get_process_output_tool,
     stop_process_tool,
@@ -57,6 +58,7 @@ __all__ = [
     "list_agents_logic",
     "run_tests_tool",
     "execute_test_runner",
+    "tests_passed",
     "start_background_process_tool",
     "get_process_output_tool",
     "stop_process_tool",

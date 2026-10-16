@@ -14,6 +14,7 @@ ASCII_SYMBOLS = {
     "arrow": "->",
     "tool": "[tool]",
     "warn": "!",
+    "assistant": "AI",
 }
 
 UNICODE_SYMBOLS = {
@@ -23,6 +24,7 @@ UNICODE_SYMBOLS = {
     "arrow": "↳",
     "tool": "🔧",
     "warn": "⚠",
+    "assistant": "🤖",
 }
 
 
@@ -109,14 +111,23 @@ def get_console() -> Console:
 console = get_console()
 
 
+TUI_INSTANCE: Optional[Any] = None
+
+
 def print_text(
     message: Any = "", *, style: Optional[str] = None, **kwargs: Any
 ) -> None:
-    get_console().print(safe_text(message), style=style, **kwargs)
+    if TUI_INSTANCE is not None:
+        TUI_INSTANCE.add_message("system", safe_text(message), markdown=False)
+    else:
+        get_console().print(safe_text(message), style=style, **kwargs)
 
 
 def echo(message: Any = "", **kwargs: Any) -> None:
-    typer.echo(safe_text(message), **kwargs)
+    if TUI_INSTANCE is not None:
+        TUI_INSTANCE.add_message("system", safe_text(message), markdown=False)
+    else:
+        typer.echo(safe_text(message), **kwargs)
 
 
 def secho(
@@ -127,10 +138,13 @@ def secho(
     bold: Optional[bool] = None,
     **kwargs: Any,
 ) -> None:
-    if color_enabled():
-        typer.secho(safe_text(message), fg=fg, bg=bg, bold=bold, **kwargs)
+    if TUI_INSTANCE is not None:
+        TUI_INSTANCE.add_message("system", safe_text(message), markdown=False)
     else:
-        typer.echo(safe_text(message), **kwargs)
+        if color_enabled():
+            typer.secho(safe_text(message), fg=fg, bg=bg, bold=bold, **kwargs)
+        else:
+            typer.echo(safe_text(message), **kwargs)
 
 
 def terminal_diagnostics() -> dict[str, Any]:

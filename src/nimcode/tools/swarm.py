@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 from typing import Dict, Any
+import threading
 from nimcode.tools.registry import (
     register_tool,
     execute_local_tool,
@@ -9,6 +10,7 @@ from nimcode.tools.registry import (
 from nimcode.tools.base import is_valid_tool_call
 
 ACTIVE_SUBAGENTS: Dict[str, Any] = {}
+_SUBAGENTS_LOCK = threading.RLock()
 
 SPAWN_AGENT_SCHEMA = {
     "type": "function",
@@ -118,12 +120,22 @@ def spawn_agent_logic(
 ) -> str:
     if isinstance(workspace_root, str):
         workspace_root = Path(workspace_root)
-    import threading
     import time
+    import uuid
 
-    agent_id = (
-        f"sub_{int(time.time() * 1000) % 100000}_{role.lower().replace(' ', '_')[:10]}"
-    )
+    if not isinstance(task_prompt, str) or not task_prompt.strip():
+        return "Error: spawn_agent requires a non-empty 'task_prompt'."
+    if not isinstance(role, str) or not role.strip():
+        role = "Subagent"
+    depth = getattr(config, "_subagent_depth", 0) if config is not None else 0
+    try:
+        depth = int(depth)
+    except Exception:
+        depth = 0
+    if depth >= 3:
+        return "Error: spawn_agent denied: maximum subagent nesting depth reached."
+
+    agent_id = f"sub_{uuid.uuid4().hex[:8]}"
 
     from nimcode.context import generate_workspace_map
     from nimcode.core.prompts import build_system_prompt
@@ -143,38 +155,68 @@ def spawn_agent_logic(
         {"role": "user", "content": task_prompt},
     ]
 
-    ACTIVE_SUBAGENTS[agent_id] = {
-        "id": agent_id,
-        "role": role,
-        "status": "RUNNING",
-        "task_prompt": task_prompt,
-        "output": "Execution in progress...",
-        "messages": messages,
-        "created_at": time.time(),
-        "lock": threading.Lock(),
-    }
+    with _SUBAGENTS_LOCK:
+        # Check + insert under one lock hold (no check-then-act race), and
+        # count only live agents: finished ones stay listed for /team.
+        if _running_count() >= 10:
+            return "Error: too many active subagents (max 10). Kill one first."
+        ACTIVE_SUBAGENTS[agent_id] = {
+            "id": agent_id,
+            "role": role,
+            "status": "RUNNING",
+            "task_prompt": task_prompt,
+            "output": "Execution in progress...",
+            "messages": messages,
+            "created_at": time.time(),
+            # Follow-up messages wait here until the worker drains them at a
+            # step boundary (keeps assistant/tool ordering valid).
+            "inbox": [],
+            # Nesting level of this agent; threads inherit it so depth
+            # accumulates across generations (fork-bomb guard).
+            "depth": depth + 1,
+        }
 
     resume_subagent_thread(agent_id, workspace_root, config)
 
     return f"Subagent '{role}' spawned with ID: {agent_id}. Status: RUNNING in background.\nUse send_message_to_agent(agent_id='{agent_id}', message='...') or check /team to inspect results."
 
 
+def _running_count() -> int:
+    with _SUBAGENTS_LOCK:
+        return sum(1 for s in ACTIVE_SUBAGENTS.values() if s.get("status") == "RUNNING")
+
+
+def _drain_inbox(sub: Dict[str, Any]) -> None:
+    # Caller holds _SUBAGENTS_LOCK.
+    inbox = sub.get("inbox")
+    if inbox:
+        sub["messages"].extend(inbox)
+        inbox.clear()
+
+
 def resume_subagent_thread(agent_id: str, workspace_root: Path, config: Any):
-    sub = ACTIVE_SUBAGENTS.get(agent_id)
-    if not sub:
-        return
-
-    def _thread_target():
-        # Prevent multiple threads from running simultaneously on this subagent
-        if not sub["lock"].acquire(blocking=False):
+    token = object()
+    with _SUBAGENTS_LOCK:
+        sub = ACTIVE_SUBAGENTS.get(agent_id)
+        if not sub or sub.get("status") == "KILLED":
             return
-        try:
-            sub["status"] = "RUNNING"
-            sub["output"] = "Execution in progress..."
+        # Single-runner guard decided under the global lock: if a worker is
+        # live it will drain the inbox itself, so no wakeup is ever lost
+        # (the old try-lock let a just-finishing worker drop new messages).
+        if sub.get("runner") is not None:
+            return
+        sub["runner"] = token
+        sub["status"] = "RUNNING"
+        sub["output"] = "Execution in progress..."
 
+    def _thread_target(config):
+        try:
             from openai import OpenAI
             from nimcode.context import generate_workspace_map
-            from nimcode.core.prompts import build_system_prompt, strip_reasoning_spans
+            from nimcode.core.prompts import (
+                build_system_prompt,
+                strip_reasoning_spans,
+            )
             from nimcode.core.agent import (
                 parse_xml_tool_calls,
                 MockMessage,
@@ -197,7 +239,10 @@ def resume_subagent_thread(agent_id: str, workspace_root: Path, config: Any):
             if not api_key and getattr(config, "api_base_url", None):
                 api_key = "local_dummy_key"
             elif not api_key:
-                api_key = "missing_nvidia_api_key"
+                with _SUBAGENTS_LOCK:
+                    sub["status"] = "ERROR"
+                    sub["output"] = "Error: NVIDIA_API_KEY is not set."
+                return
 
             base_url = (
                 getattr(config, "api_base_url", None)
@@ -217,26 +262,41 @@ def resume_subagent_thread(agent_id: str, workspace_root: Path, config: Any):
                 w_map,
                 disable_native_tools=disable_native,
             )
-            if sub["messages"] and sub["messages"][0]["role"] == "system":
-                sub["messages"][0]["content"] = (
-                    f"{sys_prompt}\n\nYou are a background subagent with the specialized role: {sub['role']}."
-                )
+            with _SUBAGENTS_LOCK:
+                if sub["messages"] and sub["messages"][0]["role"] == "system":
+                    sub["messages"][0]["content"] = (
+                        f"{sys_prompt}\n\nYou are a background subagent with the specialized role: {sub['role']}."
+                    )
 
             max_steps = (
                 50
                 if getattr(config, "mode", "") == "yolo"
                 else getattr(config, "max_loop_iterations", 10)
             )
+            try:
+                max_steps = int(max_steps)
+            except Exception:
+                max_steps = 10
+            max_steps = max(1, max_steps)
 
+            from nimcode.core.agent import prune_history
+
+            budget = getattr(config, "context_budget_tokens", None) or 16000
             for step in range(max_steps):
-                if sub["status"] == "KILLED":
+                with _SUBAGENTS_LOCK:
+                    status = sub["status"]
+                    _drain_inbox(sub)
+                    messages = list(sub["messages"])
+                if status == "KILLED":
                     break
+                # Long runs would otherwise overflow the context window.
+                messages = prune_history(messages, budget)
                 tools_arg = None if disable_native else AVAILABLE_TOOLS_SPEC
                 model_to_use = getattr(
                     config, "fast_model", "deepseek-ai/deepseek-v4-flash"
                 )
                 normalized_messages = normalize_messages(
-                    sub["messages"], disable_native_tools=disable_native
+                    messages, disable_native_tools=disable_native
                 )
 
                 kwargs = {
@@ -254,6 +314,9 @@ def resume_subagent_thread(agent_id: str, workspace_root: Path, config: Any):
 
                 response = client.chat.completions.create(**kwargs)
                 if not response or not response.choices:
+                    with _SUBAGENTS_LOCK:
+                        sub["status"] = "ERROR"
+                        sub["output"] = "Error: empty model response."
                     break
                 raw_msg = response.choices[0].message
                 cleaned = strip_reasoning_spans(raw_msg.content or "")
@@ -274,40 +337,83 @@ def resume_subagent_thread(agent_id: str, workspace_root: Path, config: Any):
                         }
                         for tc in raw_msg.tool_calls
                     ]
-                sub["messages"].append(msg_dict)
-                if not raw_msg.tool_calls:
-                    sub["output"] = cleaned
-                    sub["status"] = "COMPLETED"
-                    break
+                with _SUBAGENTS_LOCK:
+                    sub["messages"].append(msg_dict)
+                    if not raw_msg.tool_calls:
+                        if sub.get("inbox") and sub["status"] != "KILLED":
+                            continue  # answer follow-ups that arrived mid-turn
+                        sub["output"] = cleaned
+                        if sub["status"] != "KILLED":
+                            sub["status"] = "COMPLETED"
+                        sub["runner"] = None
+                        break
 
+                consecutive_invalid = 0
                 for tc in raw_msg.tool_calls:
                     is_valid, tname, targs = is_valid_tool_call(tc)
                     if not is_valid:
                         tool_res = f"Error: Invalid arguments for '{tname}'"
+                        consecutive_invalid += 1
+                        if consecutive_invalid >= 5:
+                            tool_res += (
+                                " [aborting: too many consecutive invalid calls]"
+                            )
                     else:
+                        consecutive_invalid = 0
+                        # Thread-local config already carries this agent's
+                        # depth, so nested spawns enforce the cap directly.
                         tool_res = execute_local_tool(
                             tname, targs, workspace_root, config
                         )
-                    sub["messages"].append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": str(tool_res),
-                        }
-                    )
+                    with _SUBAGENTS_LOCK:
+                        sub["messages"].append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": str(tool_res),
+                            }
+                        )
+                    if consecutive_invalid >= 5:
+                        break
+                if consecutive_invalid >= 5:
+                    with _SUBAGENTS_LOCK:
+                        sub["status"] = "ERROR"
+                        sub["output"] = "Aborted: too many invalid tool calls."
+                    break
             else:
-                sub["status"] = "COMPLETED (Reached max steps)"
-                if sub["messages"] and sub["messages"][-1].get("content"):
-                    sub["output"] = sub["messages"][-1]["content"]
-        except Exception as e:
-            sub["status"] = f"ERROR: {e}"
-            sub["output"] = f"Subagent failed: {e}"
+                with _SUBAGENTS_LOCK:
+                    if sub["status"] != "KILLED":
+                        sub["status"] = "COMPLETED (Reached max steps)"
+                    if sub["messages"] and sub["messages"][-1].get("content"):
+                        sub["output"] = sub["messages"][-1]["content"]
+        except BaseException as e:
+            with _SUBAGENTS_LOCK:
+                # Cooperative kill / cancel still lands here; mark KILLED, not ERROR.
+                if sub.get("status") == "KILLED":
+                    sub["output"] = "Killed by agent tool call."
+                else:
+                    sub["status"] = f"ERROR: {e}"
+                    sub["output"] = f"Subagent failed: {e}"
         finally:
-            sub["lock"].release()
+            with _SUBAGENTS_LOCK:
+                if sub.get("runner") is token:
+                    sub["runner"] = None
 
-    import threading
+    import copy
 
-    t = threading.Thread(target=_thread_target, daemon=True)
+    # Thread-local config copy carrying this agent's nesting level, so any
+    # spawn_agent call from this thread enforces depth correctly. (Mutating
+    # the shared config would race across sibling threads.)
+    try:
+        thread_config = copy.copy(config)
+    except Exception:
+        thread_config = config
+    try:
+        thread_config._subagent_depth = int(sub.get("depth", 0))
+    except Exception:
+        pass
+
+    t = threading.Thread(target=_thread_target, args=(thread_config,), daemon=True)
     t.start()
 
 
@@ -316,37 +422,48 @@ def send_message_to_agent_logic(
 ) -> str:
     if isinstance(workspace_root, str):
         workspace_root = Path(workspace_root)
-    sub = ACTIVE_SUBAGENTS.get(agent_id)
-    if not sub:
-        return f"Error: No subagent found with ID '{agent_id}'. Active IDs: {list(ACTIVE_SUBAGENTS.keys())}"
-    if sub["status"] == "KILLED":
-        return (
-            f"Error: Subagent '{agent_id}' has been KILLED. Cannot accept new messages."
-        )
+    with _SUBAGENTS_LOCK:
+        sub = ACTIVE_SUBAGENTS.get(agent_id)
+        if not sub:
+            return f"Error: No subagent found with ID '{agent_id}'. Active IDs: {list(ACTIVE_SUBAGENTS.keys())}"
+        if sub["status"] == "KILLED":
+            return f"Error: Subagent '{agent_id}' has been KILLED. Cannot accept new messages."
 
-    if sub["messages"] and sub["messages"][-1].get("role") == "tool":
-        sub["messages"].append({"role": "assistant", "content": "Acknowledged."})
+        if not isinstance(message, str) or not message:
+            return "Error: 'message' must be a non-empty string."
+        sub.setdefault("inbox", []).append({"role": "user", "content": message})
+        role = sub["role"]
+        status = sub["status"]
 
-    sub["messages"].append({"role": "user", "content": message})
     resume_subagent_thread(agent_id, workspace_root, config)
-    return f"Message sent to Subagent '{agent_id}' ({sub['role']}). Current status: {sub['status']}."
+    return f"Message sent to Subagent '{agent_id}' ({role}). Current status: {status}."
 
 
 def kill_agent_logic(agent_id: str, workspace_root: Path, config: Any) -> str:
-    sub = ACTIVE_SUBAGENTS.get(agent_id)
-    if not sub:
-        return f"Error: No subagent found with ID '{agent_id}'."
-    sub["status"] = "KILLED"
-    sub["output"] = "Killed by agent tool call."
+    with _SUBAGENTS_LOCK:
+        sub = ACTIVE_SUBAGENTS.get(agent_id)
+        if not sub:
+            return f"Error: No subagent found with ID '{agent_id}'."
+        sub["status"] = "KILLED"
+        sub["output"] = "Killed by agent tool call."
     return f"Subagent '{agent_id}' successfully KILLED."
 
 
 def list_agents_logic(workspace_root: Path, config: Any) -> str:
-    if not ACTIVE_SUBAGENTS:
-        return "No subagents spawned."
+    with _SUBAGENTS_LOCK:
+        if not ACTIVE_SUBAGENTS:
+            return "No subagents spawned."
+        agents_copy = {}
+        for aid, sub in ACTIVE_SUBAGENTS.items():
+            agents_copy[aid] = {
+                "role": sub["role"],
+                "status": sub["status"],
+                "output": sub["output"],
+            }
+
     result = []
-    for aid, sub in ACTIVE_SUBAGENTS.items():
-        snippet = sub["output"].replace("\n", " ")
+    for aid, sub in agents_copy.items():
+        snippet = str(sub.get("output") or "").replace("\n", " ")
         if len(snippet) > 80:
             snippet = snippet[:80] + "..."
         result.append(

@@ -4,8 +4,10 @@ import subprocess
 import time
 import uuid
 import atexit
+import re
+import threading
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from nimcode.tools.registry import register_tool, ToolSandboxError
 from nimcode.tools.base import (
     resolve_and_validate_path,
@@ -13,6 +15,7 @@ from nimcode.tools.base import (
     is_docker_available,
     scrub_text,
     truncate_output,
+    coerce_output_cap,
 )
 from nimcode.config import get_project_nimcode_dir
 
@@ -21,13 +24,32 @@ from nimcode.config import get_project_nimcode_dir
 # Format: process_id -> { "popen_or_container_id": proc_obj_or_container_id, "logfile_path": path_or_None, "start_time": ts, "command": cmd, "is_docker": bool, "container_name": str_or_None }
 BACKGROUND_PROCESSES: Dict[str, Dict[str, Any]] = {}
 _process_counter = 0
+_BG_LOCK = threading.RLock()
+MAX_BG_PROCESSES = 10
+
+
+def _coerce_timeout(raw: Any, default: int = 60) -> tuple[int, str]:
+    """Validate timeout args; returns (seconds, error)."""
+    if raw is None:
+        return default, ""
+    try:
+        t = int(raw)
+    except (TypeError, ValueError):
+        return 0, "Error: 'timeout' must be an integer number of seconds."
+    if t <= 0:
+        return 0, "Error: 'timeout' must be a positive integer."
+    return min(t, 600), ""
 
 
 def _kill_host_process(proc: subprocess.Popen):
     """
     Cleanly or forcefully terminate a host process.
     On Windows, uses taskkill to terminate the process tree immediately and prevent orphan processes.
+    On POSIX, signals the whole process group (host procs spawn detached via
+    start_new_session, so bare terminate() would orphan grandchildren).
     """
+    import signal
+
     try:
         if sys.platform == "win32":
             subprocess.run(
@@ -35,12 +57,22 @@ def _kill_host_process(proc: subprocess.Popen):
                 capture_output=True,
                 timeout=5,
             )
+            try:
+                proc.wait(timeout=2)  # reap the handle / exit status
+            except subprocess.TimeoutExpired:
+                proc.kill()
         else:
-            proc.terminate()
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception:
+                proc.terminate()
             try:
                 proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    proc.kill()
                 proc.wait(timeout=2)
     except Exception:
         pass
@@ -50,31 +82,36 @@ def cleanup_background_processes():
     """
     Clean up all running background processes in the registry.
     """
-    pids = list(BACKGROUND_PROCESSES.keys())
-    if not pids:
+    with _BG_LOCK:
+        entries = list(BACKGROUND_PROCESSES.values())
+        BACKGROUND_PROCESSES.clear()
+    if not entries:
         return
 
-    for pid in pids:
-        proc_info = BACKGROUND_PROCESSES.get(pid)
-        if not proc_info:
-            continue
-
+    log_dirs = set()
+    for proc_info in entries:
         if proc_info.get("is_docker"):
-            container_id = proc_info["popen_or_container_id"]
-            try:
-                subprocess.run(
-                    ["docker", "kill", container_id], capture_output=True, timeout=5
-                )
-                subprocess.run(
-                    ["docker", "rm", "-f", container_id], capture_output=True, timeout=5
-                )
-            except Exception:
-                pass
+            _docker_rm(proc_info["popen_or_container_id"])
         else:
-            proc = proc_info["popen_or_container_id"]
-            _kill_host_process(proc)
+            _kill_host_process(proc_info["popen_or_container_id"])
+            if proc_info.get("logfile_path"):
+                log_dirs.add(Path(proc_info["logfile_path"]).parent)
 
-    BACKGROUND_PROCESSES.clear()
+    # Clean up old log files (keep last 50). Use the dirs the logs were
+    # actually written to: Path.cwd() at exit may not be the workspace, and
+    # get_project_nimcode_dir() would create/migrate a dir for it.
+    for log_dir in log_dirs:
+        try:
+            log_files = sorted(
+                log_dir.glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True
+            )
+            for old_log in log_files[50:]:
+                try:
+                    old_log.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 # Register the cleanup handler to execute on interpreter shutdown
@@ -90,15 +127,84 @@ def _build_docker_command(
     """
     Build a docker run command list for executing the given command in a sandboxed container.
     """
-    workspace = workspace_root.resolve()
-    docker_image = getattr(config, "docker_image", "python:3.11-slim")
-    docker_extra_args = getattr(config, "docker_extra_args", [])
-    docker_expose_ports = getattr(config, "docker_expose_ports", [])
+    return _docker_run_argv(["--rm"], command, workspace_root, config)
+
+
+DEFAULT_DOCKER_IMAGE = "python:3.11-slim"
+# Flags that can break out of the sandbox regardless of value.
+_DOCKER_DENY_FLAGS = {
+    "--privileged",
+    "--cap-add",
+    "--device",
+    "--volume",
+    "--volumes-from",
+    "--mount",
+    "--security-opt",
+    "--userns",
+    "--cgroup-parent",
+    "--runtime",
+}
+# Namespace flags that are only dangerous with a host/container: value.
+_DOCKER_NS_FLAGS = {"--network", "--net", "--pid", "--ipc", "--uts", "--cgroupns"}
+
+
+def _is_host_ns(value: str) -> bool:
+    v = value.strip().strip("'\"").lower()
+    return v == "host" or v.startswith("container:")
+
+
+def _safe_docker_extra_args(config: Any) -> List[str]:
+    """Filter config.docker_extra_args, dropping host-escape flags.
+
+    The old substring deny-list missed split forms (["--network", "host"]),
+    attached short mounts ("-v/:/host", "-v=/:/h", "-itv/:/h"), --device,
+    --security-opt seccomp=unconfined, --userns=host, etc.
+    """
+    out: List[str] = []
+    pending_ns = False
+    for extra in getattr(config, "docker_extra_args", None) or []:
+        if not isinstance(extra, str) or not extra.strip():
+            continue
+        arg = extra.strip()
+        if pending_ns:
+            pending_ns = False
+            if _is_host_ns(arg):
+                out.pop()  # drop the namespace flag we already appended
+                continue
+        flag, sep, value = arg.lower().partition("=")
+        flag = flag.split()[0]
+        if flag in _DOCKER_DENY_FLAGS:
+            continue
+        # Any short-flag cluster containing 'v' may carry a bind mount.
+        if flag.startswith("-") and not flag.startswith("--") and "v" in flag:
+            continue
+        if flag in _DOCKER_NS_FLAGS:
+            rest = value if sep else arg[len(flag) :]
+            if rest.strip():
+                if _is_host_ns(rest):
+                    continue
+            else:
+                pending_ns = True
+        out.append(arg)
+    if pending_ns and out:
+        out.pop()  # dangling namespace flag would swallow the image name
+    return out
+
+
+def _docker_run_argv(
+    run_flags: List[str], command: str, workspace_root: Path, config: Any
+) -> List[str]:
+    """Shared `docker run` argv for foreground and background execution."""
+    workspace = Path(workspace_root).resolve()
+    docker_image = getattr(config, "docker_image", None) or DEFAULT_DOCKER_IMAGE
+    # An "image" starting with '-' would be parsed by docker as a flag.
+    if not isinstance(docker_image, str) or docker_image.strip().startswith("-"):
+        docker_image = DEFAULT_DOCKER_IMAGE
 
     docker_cmd = [
         "docker",
         "run",
-        "--rm",
+        *run_flags,
         "--init",
         "--cap-drop",
         "ALL",
@@ -110,20 +216,49 @@ def _build_docker_command(
         "/workspace",
     ]
 
-    # Add port exposures if configured
-    for port in docker_expose_ports:
-        docker_cmd.extend(["-p", f"{port}:{port}"])
+    # Add port exposures if configured (validated ints only)
+    for port in getattr(config, "docker_expose_ports", None) or []:
+        try:
+            _port = int(port)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= _port <= 65535:
+            docker_cmd.extend(["-p", f"{_port}:{_port}"])
 
-    # Add extra docker args from config
-    docker_cmd.extend(docker_extra_args)
-
-    # Add the image
-    docker_cmd.append(docker_image)
-
-    # Add the command to run
+    docker_cmd.extend(_safe_docker_extra_args(config))
+    docker_cmd.append(docker_image.strip())
     docker_cmd.extend(["sh", "-c", command])
-
     return docker_cmd
+
+
+def _docker_rm(container: str) -> None:
+    """Force-remove (and thereby kill) a container. Never raises or hangs."""
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", container], capture_output=True, timeout=15
+        )
+    except Exception:
+        pass
+
+
+def _subagent_depth(config: Any) -> int:
+    try:
+        return int(getattr(config, "_subagent_depth", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _resolve_use_docker(raw: Any, config: Any) -> bool:
+    """Decide Docker vs host. Shared by the executor and render_preview."""
+    docker_ok = not getattr(config, "disable_docker", False) and is_docker_available()
+    if not isinstance(raw, bool):
+        # None / garbage like "false" (truthy string) -> auto-detect.
+        return docker_ok
+    if raw is False and docker_ok and _subagent_depth(config) > 0:
+        # Swarm threads run without the human gate; they may not opt out
+        # of an available sandbox.
+        return True
+    return raw
 
 
 def _execute_in_docker(
@@ -137,13 +272,10 @@ def _execute_in_docker(
     Execute a command inside a Docker container.
     Returns dict with stdout, stderr, returncode, and timed_out.
     """
-    import uuid
-
     container_name = f"nimcode_{uuid.uuid4().hex[:12]}"
-    docker_cmd = _build_docker_command(command, workspace_root, config)
-    if len(docker_cmd) > 2 and docker_cmd[1] == "run":
-        docker_cmd.insert(2, "--name")
-        docker_cmd.insert(3, container_name)
+    docker_cmd = _docker_run_argv(
+        ["--rm", "--name", container_name], command, workspace_root, config
+    )
 
     # Prepare environment
     env = os.environ.copy()
@@ -154,6 +286,7 @@ def _execute_in_docker(
     try:
         result = subprocess.run(
             docker_cmd,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -169,8 +302,7 @@ def _execute_in_docker(
             "timed_out": False,
         }
     except subprocess.TimeoutExpired as e:
-        subprocess.run(["docker", "kill", container_name], capture_output=True)
-        subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
+        _docker_rm(container_name)
         stdout_str = (
             e.stdout.decode("utf-8", errors="replace")
             if isinstance(e.stdout, bytes)
@@ -188,8 +320,8 @@ def _execute_in_docker(
             "timed_out": True,
         }
     except Exception as e:
-        subprocess.run(["docker", "kill", container_name], capture_output=True)
-        subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
+        # e.g. FileNotFoundError when docker is missing; _docker_rm never raises.
+        _docker_rm(container_name)
         return {
             "stdout": "",
             "stderr": f"Docker execution error: {e}",
@@ -213,9 +345,18 @@ def _execute_on_host(
         env.update(extra_env)
     env = scrub_env(env)
 
+    popen_kwargs: Dict[str, Any] = {}
+    if sys.platform != "win32":
+        # Own process group so a timeout kills the whole tree; a bare
+        # proc.kill() only killed `sh`, and grandchildren holding the pipes
+        # made the follow-up communicate() hang forever.
+        popen_kwargs["start_new_session"] = True
     proc = subprocess.Popen(
         command,
         shell=True,
+        # Never inherit the TUI's stdin: prompting commands (git commit w/o -m,
+        # npx create-*, a bare `python`) would steal keystrokes or block.
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -223,6 +364,7 @@ def _execute_on_host(
         errors="replace",
         env=env,
         cwd=str(workspace_root),
+        **popen_kwargs,
     )
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
@@ -233,42 +375,70 @@ def _execute_on_host(
             "timed_out": False,
         }
     except subprocess.TimeoutExpired:
-        if sys.platform == "win32":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True
-            )
-        else:
-            proc.kill()
-        stdout, stderr = proc.communicate()
-        stdout_str = (
-            stdout.decode("utf-8", errors="replace")
-            if isinstance(stdout, bytes)
-            else (stdout or "")
-        )
-        stderr_str = (
-            stderr.decode("utf-8", errors="replace")
-            if isinstance(stderr, bytes)
-            else (stderr or "")
-        )
+        _kill_host_process(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except Exception:
+            # A detached grandchild still holds the pipes; give up on output.
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+            stdout, stderr = "", ""
         return {
-            "stdout": stdout_str,
-            "stderr": stderr_str,
+            "stdout": stdout or "",
+            "stderr": stderr or "",
             "returncode": -1,
             "timed_out": True,
         }
-    except Exception as e:
-        if sys.platform == "win32":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True
-            )
-        else:
-            proc.kill()
+    except BaseException as e:
+        # Includes KeyboardInterrupt (ESC cancel): don't leave the tree running.
+        _kill_host_process(proc)
+        if not isinstance(e, Exception):
+            raise
         return {
             "stdout": "",
             "stderr": f"Host execution error: {e}",
             "returncode": -1,
             "timed_out": False,
         }
+
+
+def _validate_command_safety(command: str) -> Tuple[bool, str]:
+    """
+    Validate command for potential security issues when running in Docker.
+    Returns (is_safe, warning_message).
+    """
+    # Patterns that could be dangerous in a Docker context
+    dangerous_patterns = [
+        # Docker socket mounting
+        (r"-v\s+/var/run/docker\.sock", "Docker socket mount detected"),
+        (r"--mount.*docker\.sock", "Docker socket mount detected"),
+        # Privileged mode
+        (r"--privileged", "Privileged mode requested"),
+        # Host network/namespace
+        (r"--network\s+host", "Host network mode requested"),
+        (r"--pid\s+host", "Host PID namespace requested"),
+        (r"--ipc\s+host", "Host IPC namespace requested"),
+        # Capabilities
+        (r"--cap-add", "Capability addition requested"),
+        # Volume mounts that could escape
+        (r"-v\s+/[^:]+:/", "Absolute host path mount detected"),
+        # Shell injection patterns
+        (r"\$\(", "Command substitution detected"),
+        (r"`.*`", "Backtick command substitution detected"),
+        (r"&&\s*rm\s+-rf", "Destructive command chain detected"),
+        (r";\s*rm\s+-rf", "Destructive command chain detected"),
+        (r"\|\s*sh", "Piped to shell detected"),
+        (r"\|\s*bash", "Piped to bash detected"),
+    ]
+
+    for pattern, warning in dangerous_patterns:
+        if re.search(pattern, command, re.IGNORECASE):
+            return False, warning
+
+    return True, ""
 
 
 def _execute_command(
@@ -282,24 +452,53 @@ def _execute_command(
     """
     Execute a command, using Docker if available and not disabled, otherwise falling back to host.
     """
-    # Determine whether to use Docker
-    if use_docker is None:
-        use_docker = (
-            not getattr(config, "disable_docker", False) and is_docker_available()
-        )
+    use_docker = _resolve_use_docker(use_docker, config)
+
+    # Validate command safety for Docker execution (advisory only).
+    is_safe, warning = _validate_command_safety(command)
+    if not is_safe and use_docker:
+        try:
+            from nimcode.ui.output import secho
+
+            # Scrubbed (never log raw commands) and routed through secho so
+            # it reaches the TUI and isn't parsed as rich markup.
+            secho(f"Warning: {warning} in command '{scrub_text(command)}'", fg="yellow")
+        except Exception:
+            pass
 
     if use_docker:
         result = _execute_in_docker(command, workspace_root, config, timeout, extra_env)
-        # If Docker fails (e.g., image not found, permission denied), fall back to host
-        if result["returncode"] == -1 and "Docker execution error" in result["stderr"]:
-            result = _execute_on_host(
-                command, workspace_root, config, timeout, extra_env
-            )
-            result["fallback"] = True
         return result
     else:
         result = _execute_on_host(command, workspace_root, config, timeout, extra_env)
+        result["fallback"] = True
         return result
+
+
+def _run_and_format(
+    command: str,
+    workspace_root: Path,
+    config: Any,
+    timeout: int,
+    use_docker: Any,
+    label: str,
+) -> str:
+    """Run via _execute_command and render the tool result string."""
+    result = _execute_command(command, workspace_root, config, timeout, use_docker)
+    if result["timed_out"]:
+        parts = [f"Error: {label} timed out after {timeout}s and was killed"]
+    elif result.get("fallback"):
+        parts = ["[Note: Docker unavailable, fell back to host execution]"]
+    else:
+        parts = []
+    if result["stdout"]:
+        parts.append(f"[stdout]\n{result['stdout']}")
+    if result["stderr"]:
+        parts.append(f"[stderr]\n{result['stderr']}")
+    parts.append(f"[exit code: {result['returncode']}]")
+    # Scrub BEFORE truncating: a cut through a secret defeats the patterns.
+    output = scrub_text("\n".join(parts))
+    return truncate_output(output, coerce_output_cap(config))
 
 
 @register_tool(
@@ -308,7 +507,7 @@ def _execute_command(
         "type": "function",
         "function": {
             "name": "execute_command",
-            "description": "Execute a shell command in the workspace. Runs in a Docker sandbox if available, otherwise on host.",
+            "description": "Run a short-lived shell command that exits (build, lint, script, pytest -k). NEVER for dev servers — use start_background_process for those. Verify edits with this or run_tests.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -337,24 +536,52 @@ def execute_command_tool(
     Execute a shell command with Docker sandbox fallback to host execution.
     """
     command = args.get("command", "")
-    if not command:
+    if not command or not isinstance(command, str):
         return "Error: No command provided."
 
-    # Check for blocking patterns
-    blocking_patterns = [
+    # Redirect dev servers to start_background_process. Multi-word phrases are
+    # matched as substrings; bare binary names match the invoked program only,
+    # so `grep -r vite logs/` or `pytest -k test_vite` are not misclassified.
+    blocking_phrases = [
         "run dev",
         "http.server",
         "flask run",
-        "vite",
-        "uvicorn",
         "ng serve",
         "rails server",
         "next dev",
     ]
-    if any(pattern in command for pattern in blocking_patterns):
+    blocking_bins = {
+        "vite",
+        "uvicorn",
+        "gunicorn",
+        "flask",
+        "ng",
+        "rails",
+        "next",
+        "nodemon",
+    }
+    command_lower = command.lower()
+    try:
+        import shlex
+
+        argv = shlex.split(command, posix=(sys.platform != "win32"))
+        invoked = argv[0].lower() if argv else ""
+    except (ValueError, IndexError):
+        invoked = command.strip().split(" ")[0].lower() if command.strip() else ""
+    invoked = invoked.replace("\\", "/").split("/")[-1]
+    for ext in (".exe", ".cmd", ".bat"):
+        if invoked.endswith(ext):
+            invoked = invoked[: -len(ext)]
+            break
+    if invoked in blocking_bins or any(
+        phrase in command_lower for phrase in blocking_phrases
+    ):
         return f"Error: Command '{command}' matches a known long-running/blocking process pattern. Please use the 'start_background_process' tool instead of 'execute_command' to run this process, so it doesn't freeze the agent."
 
-    timeout = args.get("timeout", getattr(config, "timeout", 60))
+    timeout_raw = args.get("timeout", getattr(config, "timeout", 60))
+    timeout, timeout_err = _coerce_timeout(timeout_raw)
+    if timeout_err:
+        return timeout_err
     use_docker = args.get("use_docker", None)
 
     # Validate workspace path
@@ -363,53 +590,9 @@ def execute_command_tool(
     except ToolSandboxError as e:
         return f"Error: {e}"
 
-    try:
-        result = _execute_command(command, workspace_root, config, timeout, use_docker)
-    except subprocess.TimeoutExpired as e:
-        stdout_str = (
-            e.stdout.decode("utf-8", errors="replace")
-            if isinstance(e.stdout, bytes)
-            else (e.stdout or "")
-        )
-        stderr_str = (
-            e.stderr.decode("utf-8", errors="replace")
-            if isinstance(e.stderr, bytes)
-            else (e.stderr or "")
-        )
-        result = {
-            "stdout": stdout_str,
-            "stderr": stderr_str,
-            "returncode": -1,
-            "timed_out": True,
-        }
-
-    if result["timed_out"]:
-        output_parts = [f"Error: Command timed out after {timeout}s and was killed"]
-        if result["stdout"]:
-            output_parts.append(f"[stdout]\n{result['stdout']}")
-        if result["stderr"]:
-            output_parts.append(f"[stderr]\n{result['stderr']}")
-        output = "\n".join(output_parts)
-    else:
-        output_parts = []
-        if result.get("fallback"):
-            output_parts.append(
-                "[Note: Docker unavailable, fell back to host execution]"
-            )
-
-        if result["stdout"]:
-            output_parts.append(f"[stdout]\n{result['stdout']}")
-        if result["stderr"]:
-            output_parts.append(f"[stderr]\n{result['stderr']}")
-
-        output_parts.append(f"[exit code: {result['returncode']}]")
-        output = "\n".join(output_parts)
-
-    # Apply output cap
-    output_cap = getattr(config, "output_cap", 100000)
-    output = truncate_output(output, output_cap)
-
-    return scrub_text(output)
+    return _run_and_format(
+        command, workspace_root, config, timeout, use_docker, "Command"
+    )
 
 
 @register_tool(
@@ -418,7 +601,7 @@ def execute_command_tool(
         "type": "function",
         "function": {
             "name": "run_tests",
-            "description": "Run the project's test suite (pytest by default) in a Docker sandbox if available.",
+            "description": "PREFERRED verification after any code change: run the test suite (pytest by default). Run this before claiming work is done; fix failures and re-run.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -445,8 +628,18 @@ def run_tests_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> s
     """
     Run the project's test suite with Docker sandbox fallback to host execution.
     """
-    command = args.get("command", "pytest")
-    timeout = args.get("timeout", getattr(config, "timeout", 60) * 2)
+    # "" / None would run an empty shell command and report success.
+    command = args.get("command") or "pytest"
+    if not isinstance(command, str):
+        return "Error: 'command' must be a string."
+    default_timeout = getattr(config, "timeout", 60)
+    try:
+        default_timeout = int(default_timeout) * 2
+    except (TypeError, ValueError):
+        default_timeout = 120
+    timeout, timeout_err = _coerce_timeout(args.get("timeout", default_timeout))
+    if timeout_err:
+        return timeout_err
     use_docker = args.get("use_docker", None)
 
     # Validate workspace path
@@ -455,55 +648,15 @@ def run_tests_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> s
     except ToolSandboxError as e:
         return f"Error: {e}"
 
-    try:
-        result = _execute_command(command, workspace_root, config, timeout, use_docker)
-    except subprocess.TimeoutExpired as e:
-        stdout_str = (
-            e.stdout.decode("utf-8", errors="replace")
-            if isinstance(e.stdout, bytes)
-            else (e.stdout or "")
-        )
-        stderr_str = (
-            e.stderr.decode("utf-8", errors="replace")
-            if isinstance(e.stderr, bytes)
-            else (e.stderr or "")
-        )
-        result = {
-            "stdout": stdout_str,
-            "stderr": stderr_str,
-            "returncode": -1,
-            "timed_out": True,
-        }
+    return _run_and_format(
+        command, workspace_root, config, timeout, use_docker, "Test command"
+    )
 
-    if result["timed_out"]:
-        output_parts = [
-            f"Error: Test command timed out after {timeout}s and was killed"
-        ]
-        if result["stdout"]:
-            output_parts.append(f"[stdout]\n{result['stdout']}")
-        if result["stderr"]:
-            output_parts.append(f"[stderr]\n{result['stderr']}")
-        output = "\n".join(output_parts)
-    else:
-        output_parts = []
-        if result.get("fallback"):
-            output_parts.append(
-                "[Note: Docker unavailable, fell back to host execution]"
-            )
 
-        if result["stdout"]:
-            output_parts.append(f"[stdout]\n{result['stdout']}")
-        if result["stderr"]:
-            output_parts.append(f"[stderr]\n{result['stderr']}")
-
-        output_parts.append(f"[exit code: {result['returncode']}]")
-        output = "\n".join(output_parts)
-
-    # Apply output cap
-    output_cap = getattr(config, "output_cap", 100000)
-    output = truncate_output(output, output_cap)
-
-    return scrub_text(output)
+def tests_passed(output: str) -> bool:
+    """True iff the final ``[exit code: N]`` marker appended by the runner is 0."""
+    codes = re.findall(r"\[exit code: (-?\d+)\]", output or "")
+    return bool(codes) and codes[-1] == "0"
 
 
 def execute_test_runner(
@@ -537,59 +690,22 @@ def execute_test_runner(
                 else "python -m unittest discover -v"
             )
 
-    timeout = getattr(config, "timeout", 60) * 2
+    try:
+        default_timeout = int(getattr(config, "timeout", 60)) * 2
+    except (TypeError, ValueError):
+        default_timeout = 120
+    timeout, timeout_err = _coerce_timeout(default_timeout)
+    if timeout_err:
+        return timeout_err
     # Validate workspace path
     try:
         workspace_root = resolve_and_validate_path(".", workspace_root)
     except ToolSandboxError as e:
         return f"Error: {e}"
 
-    try:
-        result = _execute_command(test_cmd, workspace_root, config, timeout, None)
-    except subprocess.TimeoutExpired as e:
-        stdout_str = (
-            e.stdout.decode("utf-8", errors="replace")
-            if isinstance(e.stdout, bytes)
-            else (e.stdout or "")
-        )
-        stderr_str = (
-            e.stderr.decode("utf-8", errors="replace")
-            if isinstance(e.stderr, bytes)
-            else (e.stderr or "")
-        )
-        result = {
-            "stdout": stdout_str,
-            "stderr": stderr_str,
-            "returncode": -1,
-            "timed_out": True,
-        }
-
-    if result["timed_out"]:
-        output_parts = [f"Error: Test runner timed out after {timeout}s and was killed"]
-        if result["stdout"]:
-            output_parts.append(f"[stdout]\n{result['stdout']}")
-        if result["stderr"]:
-            output_parts.append(f"[stderr]\n{result['stderr']}")
-        output = "\n".join(output_parts)
-    else:
-        output_parts = []
-        if result.get("fallback"):
-            output_parts.append(
-                "[Note: Docker unavailable, fell back to host execution]"
-            )
-
-        if result["stdout"]:
-            output_parts.append(f"[stdout]\n{result['stdout']}")
-        if result["stderr"]:
-            output_parts.append(f"[stderr]\n{result['stderr']}")
-
-        output_parts.append(f"[exit code: {result['returncode']}]")
-        output = "\n".join(output_parts)
-
-    output_cap = getattr(config, "output_cap", 100000)
-    output = truncate_output(output, output_cap)
-
-    return scrub_text(output)
+    return _run_and_format(
+        test_cmd, workspace_root, config, timeout, None, "Test runner"
+    )
 
 
 def _build_background_docker_command(
@@ -600,44 +716,12 @@ def _build_background_docker_command(
 ) -> List[str]:
     """
     Build a docker run -d command list for executing the given command in a sandboxed container.
+    No --rm: a dev server that crashes on startup would otherwise take its
+    logs with it; stop_process / cleanup remove the container with rm -f.
     """
-    workspace = workspace_root.resolve()
-    docker_image = getattr(config, "docker_image", "python:3.11-slim")
-    docker_extra_args = getattr(config, "docker_extra_args", [])
-    docker_expose_ports = getattr(config, "docker_expose_ports", [])
-
-    docker_cmd = [
-        "docker",
-        "run",
-        "-d",
-        "--rm",
-        "--name",
-        container_name,
-        "--init",
-        "--cap-drop",
-        "ALL",
-        "--security-opt",
-        "no-new-privileges:true",
-        "-v",
-        f"{str(workspace)}:/workspace",
-        "-w",
-        "/workspace",
-    ]
-
-    # Add port exposures if configured
-    for port in docker_expose_ports:
-        docker_cmd.extend(["-p", f"{port}:{port}"])
-
-    # Add extra docker args from config
-    docker_cmd.extend(docker_extra_args)
-
-    # Add the image
-    docker_cmd.append(docker_image)
-
-    # Add the command to run
-    docker_cmd.extend(["sh", "-c", command])
-
-    return docker_cmd
+    return _docker_run_argv(
+        ["-d", "--name", container_name], command, workspace_root, config
+    )
 
 
 @register_tool(
@@ -646,7 +730,7 @@ def _build_background_docker_command(
         "type": "function",
         "function": {
             "name": "start_background_process",
-            "description": "Start a long-running command in the background (detached). Use for dev servers, web servers, etc.",
+            "description": "Run dev servers / watch processes that never exit (npm run dev, uvicorn, flask run, etc). REQUIRED instead of execute_command for these. Follow with get_process_output, then stop_process.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -667,7 +751,7 @@ def start_background_process_tool(
     Launches a command in the background (detached) and returns a process ID.
     """
     command = args.get("command", "")
-    if not command:
+    if not command or not isinstance(command, str):
         return "Error: No command provided."
 
     # Validate workspace path
@@ -677,10 +761,16 @@ def start_background_process_tool(
         return f"Error: {e}"
 
     global _process_counter
-    _process_counter += 1
-    process_id = f"bg_{_process_counter}"
+    with _BG_LOCK:
+        if len(BACKGROUND_PROCESSES) >= MAX_BG_PROCESSES:
+            return (
+                f"Error: too many background processes (max {MAX_BG_PROCESSES}). "
+                "Stop one with stop_process first."
+            )
+        _process_counter += 1
+        process_id = f"bg_{_process_counter}"
 
-    use_docker = not getattr(config, "disable_docker", False) and is_docker_available()
+    use_docker = _resolve_use_docker(None, config)
 
     if use_docker:
         container_name = f"nimcode_bg_{uuid.uuid4().hex[:12]}"
@@ -694,6 +784,7 @@ def start_background_process_tool(
         try:
             result = subprocess.run(
                 docker_cmd,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -703,40 +794,41 @@ def start_background_process_tool(
                 timeout=15,
             )
             if result.returncode != 0:
-                return f"Error starting background process in Docker: {result.stderr.strip()}"
+                _docker_rm(container_name)  # created-but-failed containers linger
+                return f"Error starting background process in Docker: {scrub_text(result.stderr.strip())}"
 
             container_id = result.stdout.strip()
             if not container_id:
                 container_id = container_name
 
-            BACKGROUND_PROCESSES[process_id] = {
-                "popen_or_container_id": container_id,
-                "logfile_path": None,
-                "start_time": time.time(),
-                "command": command,
-                "is_docker": True,
-                "container_name": container_name,
-            }
+            with _BG_LOCK:
+                BACKGROUND_PROCESSES[process_id] = {
+                    "popen_or_container_id": container_id,
+                    "logfile_path": None,
+                    "start_time": time.time(),
+                    "command": command,
+                    "is_docker": True,
+                    "container_name": container_name,
+                }
             return f"Background process started in Docker sandbox. Process ID: {process_id}\nUse get_process_output to view logs."
         except Exception as e:
+            # e.g. TimeoutExpired: the container may still have started.
+            _docker_rm(container_name)
             return f"Error starting background process in Docker: {e}"
     else:
         # Host execution fallback
-        nimcode_dir = get_project_nimcode_dir(workspace_root)
-        log_dir = nimcode_dir / "process_logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        logfile_path = log_dir / f"{process_id}.log"
-
-        env = os.environ.copy()
-        env = scrub_env(env)
+        env = scrub_env(os.environ.copy())
 
         try:
-            log_file = open(logfile_path, "w", encoding="utf-8")
-
+            log_dir = get_project_nimcode_dir(workspace_root) / "process_logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            logfile_path = log_dir / f"{process_id}.log"
             popen_kwargs = {
                 "shell": True,
-                "stdout": log_file,
-                "stderr": log_file,
+                # Detached servers must not read the TUI's stdin.
+                "stdin": subprocess.DEVNULL,
+                "stdout": None,  # set below after opening log file
+                "stderr": None,
                 "text": True,
                 "env": env,
                 "cwd": str(workspace_root),
@@ -744,18 +836,28 @@ def start_background_process_tool(
             if sys.platform != "win32":
                 popen_kwargs["start_new_session"] = True
             else:
-                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-
-            proc = subprocess.Popen(command, **popen_kwargs)
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore
+            log_file = open(logfile_path, "w", encoding="utf-8")
+            popen_kwargs["stdout"] = log_file
+            popen_kwargs["stderr"] = log_file
+            try:
+                proc = subprocess.Popen(command, **popen_kwargs)  # type: ignore
+            except Exception:
+                try:
+                    log_file.close()
+                except Exception:
+                    pass
+                raise
             log_file.close()
 
-            BACKGROUND_PROCESSES[process_id] = {
-                "popen_or_container_id": proc,
-                "logfile_path": str(logfile_path),
-                "start_time": time.time(),
-                "command": command,
-                "is_docker": False,
-            }
+            with _BG_LOCK:
+                BACKGROUND_PROCESSES[process_id] = {
+                    "popen_or_container_id": proc,
+                    "logfile_path": str(logfile_path),
+                    "start_time": time.time(),
+                    "command": command,
+                    "is_docker": False,
+                }
             return f"Background process started on host. Process ID: {process_id}\nLogfile: {logfile_path.name}\nUse get_process_output to view logs."
         except Exception as e:
             return f"Error starting background process on host: {e}"
@@ -803,41 +905,53 @@ def get_process_output_tool(
     if proc_info["is_docker"]:
         container_id = proc_info["popen_or_container_id"]
         # Check running state
-        inspect_res = subprocess.run(
-            [
-                "docker",
-                "inspect",
-                "-f",
-                "{{.State.Running}} {{.State.ExitCode}}",
-                container_id,
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-        )
+        try:
+            inspect_res = subprocess.run(
+                [
+                    "docker",
+                    "inspect",
+                    "-f",
+                    "{{.State.Running}} {{.State.ExitCode}}",
+                    container_id,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+            )
+        except Exception as e:
+            return f"Process {process_id} Status: unknown (inspect failed: {e})"
         if inspect_res.returncode == 0:
             parts = inspect_res.stdout.strip().split()
             if len(parts) >= 2:
                 is_running = parts[0] == "true"
-                exit_code = int(parts[1])
+                try:
+                    exit_code = int(parts[1])
+                except ValueError:
+                    exit_code = -1
                 status_msg = (
                     "running" if is_running else f"exited with code {exit_code}"
                 )
+            else:
+                is_running = False
+                status_msg = f"unknown (inspect: {inspect_res.stdout.strip()[:100]})"
         else:
             is_running = False
             status_msg = "exited/not found"
 
         # Get logs
-        logs_res = subprocess.run(
-            ["docker", "logs", container_id],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=10,
-        )
+        try:
+            logs_res = subprocess.run(
+                ["docker", "logs", "--tail", "500", container_id],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+        except Exception as e:
+            return f"Process {process_id} Status: {status_msg}\nCommand: {proc_info['command']}\n\n[Output]\nError reading logs: {e}"
         output = logs_res.stdout + logs_res.stderr
     else:
         proc = proc_info["popen_or_container_id"]
@@ -853,8 +967,17 @@ def get_process_output_tool(
         logfile_path = Path(proc_info["logfile_path"])
         if logfile_path.exists():
             try:
-                with open(logfile_path, "r", encoding="utf-8", errors="replace") as lf:
-                    output = lf.read()
+                # Tail last 200KB instead of reading GB logs into memory.
+                with open(logfile_path, "rb") as lf:
+                    lf.seek(0, 2)
+                    size = lf.tell()
+                    lf.seek(max(0, size - 200_000))
+                    output = lf.read().decode("utf-8", errors="replace")
+                    if size > 200_000:
+                        output = (
+                            f"[... truncated {size - 200_000} earlier bytes ...]\n"
+                            + output
+                        )
             except Exception as e:
                 output = f"Error reading logfile: {e}"
         else:
@@ -862,9 +985,8 @@ def get_process_output_tool(
 
     res = f"Process {process_id} Status: {status_msg}\nCommand: {proc_info['command']}\n\n[Output]\n{output}"
 
-    output_cap = getattr(config, "output_cap", 100000)
-    res = truncate_output(res, output_cap)
-    return scrub_text(res)
+    # Scrub before truncating so a cut can't split a secret past the patterns.
+    return truncate_output(scrub_text(res), coerce_output_cap(config))
 
 
 @register_tool(
@@ -899,17 +1021,11 @@ def stop_process_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -
     if not proc_info:
         return f"Error: Process '{process_id}' not found in registry."
 
+    with _BG_LOCK:
+        BACKGROUND_PROCESSES.pop(process_id, None)
     if proc_info["is_docker"]:
-        container_id = proc_info["popen_or_container_id"]
-        subprocess.run(
-            ["docker", "kill", container_id], capture_output=True, timeout=10
-        )
-        subprocess.run(
-            ["docker", "rm", "-f", container_id], capture_output=True, timeout=10
-        )
+        _docker_rm(proc_info["popen_or_container_id"])
     else:
-        proc = proc_info["popen_or_container_id"]
-        _kill_host_process(proc)
+        _kill_host_process(proc_info["popen_or_container_id"])
 
-    BACKGROUND_PROCESSES.pop(process_id, None)
     return f"Process {process_id} has been stopped and removed from the registry."

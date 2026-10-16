@@ -1,16 +1,60 @@
 import os
-import time
-import shutil
 from pathlib import Path
 from typing import Dict, Any
 from nimcode.tools.registry import register_tool
-from nimcode.tools.base import resolve_and_validate_path, truncate_output
+from nimcode.tools.base import (
+    resolve_and_validate_path,
+    truncate_output,
+    backup_file,
+    coerce_output_cap,
+)
+
+
+def _has_crlf(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f_bin:
+            return b"\r\n" in f_bin.read(4096)
+    except OSError:
+        return False
+
+
+def atomic_write_text(target_path: Path, text: str, crlf: bool) -> None:
+    """Crash-safe write (temp file + os.replace) shared by write/patch tools.
+
+    `text` is normalized to LF first so CRLF input never becomes "\\r\\r\\n" when
+    translated back, and the original file mode is preserved (mkstemp is 0600).
+    """
+    import stat
+    import tempfile
+
+    text = text.replace("\r\n", "\n")
+    try:
+        mode = stat.S_IMODE(target_path.stat().st_mode)
+    except OSError:
+        # ponytail: fixed 0644 for new files; os.umask() probing races across swarm threads.
+        mode = 0o644
+    fd, tmp_name = tempfile.mkstemp(dir=str(target_path.parent), prefix=".nimcode_tmp_")
+    try:
+        with open(fd, "w", encoding="utf-8", newline="\r\n" if crlf else "\n") as f:
+            f.write(text)
+        try:
+            os.chmod(tmp_name, mode)
+        except OSError:
+            pass
+        os.replace(tmp_name, target_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
 
 READ_FILE_SCHEMA = {
     "type": "function",
     "function": {
         "name": "read_file",
-        "description": "Read the contents of a file located within the workspace root, optionally specifying a line range.",
+        "description": "Read a file. ALWAYS call this before editing any existing file so your SEARCH blocks match exactly. Use start_line/end_line for large files.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -36,7 +80,7 @@ WRITE_FILE_SCHEMA = {
     "type": "function",
     "function": {
         "name": "write_file",
-        "description": "Write or overwrite a file within the workspace root with new content. Creates parent directories if needed.",
+        "description": "Create a NEW file or fully rewrite one. For edits to existing files prefer patch_file_blocks to avoid clobbering unrelated code. Creates parent directories if needed.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -65,19 +109,26 @@ def read_file_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> s
 
     if not target_path.exists():
         return f"Error: File '{path_str}' does not exist."
-    if not target_path.is_file():
+    if not target_path.is_file() or target_path.is_symlink():
+        if target_path.is_symlink():
+            return f"Error: Path '{path_str}' is a symlink; refusing to follow."
         return f"Error: Path '{path_str}' is a directory, not a file."
 
     # Check file size before reading full content if binary/large
-    file_size = target_path.stat().st_size
+    try:
+        file_size = target_path.stat().st_size
+    except OSError as e:
+        return f"Error reading '{path_str}': {e}"
     if file_size > 5_000_000:  # 5MB absolute upper limit check for binary
         return f"Error: File '{path_str}' is too large to read ({file_size} bytes)."
 
     try:
         with open(target_path, "r", encoding="utf-8") as f:
-            content = f.read()
+            content = f.read(5_000_000 + 1)
     except UnicodeDecodeError:
         return f"Error: File '{path_str}' appears to be binary or not UTF-8 encoded."
+    except OSError as e:
+        return f"Error reading '{path_str}': {e}"
 
     start_line = args.get("start_line")
     end_line = args.get("end_line")
@@ -86,8 +137,15 @@ def read_file_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> s
         lines = content.splitlines()
         total_lines = len(lines)
 
-        s_idx = max(0, int(start_line) - 1) if start_line is not None else 0
-        e_idx = min(total_lines, int(end_line)) if end_line is not None else total_lines
+        try:
+            s = int(start_line) if start_line is not None else 1
+            e = int(end_line) if end_line is not None else total_lines
+        except (TypeError, ValueError):
+            return "Error: Invalid line number(s). start_line and end_line must be positive integers."
+        if s < 1 or e < 1 or s > e:
+            return "Error: Invalid line range. Require 1 <= start_line <= end_line."
+        s_idx = s - 1
+        e_idx = min(total_lines, e)
 
         if s_idx >= total_lines:
             return f"[Empty read: start_line {start_line} exceeds total lines {total_lines}]"
@@ -96,14 +154,11 @@ def read_file_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> s
         content = "\n".join(selected_lines)
         header = f"[File: {path_str} | Lines {s_idx + 1} to {min(total_lines, e_idx)} of {total_lines}]\n"
         content = header + content
-        return content
+        return truncate_output(content, coerce_output_cap(config))
 
-    output_cap = getattr(config, "output_cap", 100000) if config is not None else 100000
+    output_cap = coerce_output_cap(config)
     if len(content) > output_cap:
-        return (
-            content[:output_cap]
-            + f"\n... [Output truncated at {output_cap} characters. Use start_line and end_line parameters to read specific sections of the file.]"
-        )
+        return truncate_output(content, output_cap)
     return content
 
 
@@ -115,46 +170,31 @@ def write_file_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> 
     content = args.get("content", "")
     if not isinstance(content, str):
         content = str(content)
+    if len(content) > 5_000_000:
+        return "Error: content too large to write (5MB limit)."
     target_path = resolve_and_validate_path(path_str, workspace_root)
 
     # Auto-backup before overwrite for easy one-command revert
-    if (
-        getattr(config, "auto_backup", True)
-        and target_path.exists()
-        and target_path.is_file()
-    ):
-        from nimcode.config import get_project_nimcode_dir
-
-        backup_dir = get_project_nimcode_dir(workspace_root) / "backups"
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = int(time.time())
-        try:
-            rel_path = target_path.relative_to(workspace_root)
-            safe_rel_name = str(rel_path).replace(os.sep, "_").replace("/", "_")
-        except Exception:
-            safe_rel_name = target_path.name
-        backup_filename = f"{timestamp}_{safe_rel_name}"
-        backup_path = backup_dir / backup_filename
-        try:
-            shutil.copy2(target_path, backup_path)
-        except Exception:
-            pass
+    if getattr(config, "auto_backup", True):
+        backup_file(target_path, workspace_root)
 
     # Create parent directories
-    target_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return f"Error: cannot create parent directories for '{path_str}': {e}"
 
-    # Detect original line ending if file exists
-    has_crlf = False
-    if target_path.exists() and target_path.is_file():
-        try:
-            with open(target_path, "rb") as f_bin:
-                has_crlf = b"\r\n" in f_bin.read(4096)
-        except Exception:
-            pass
-
-    newline = "\r\n" if has_crlf else "\n"
-    with open(target_path, "w", encoding="utf-8", newline=newline) as f:
-        f.write(content)
+    if target_path.is_dir():
+        return f"Error: Path '{path_str}' is a directory."
+    # Keep existing CRLF files CRLF; new files follow the content's own style.
+    if target_path.is_file():
+        crlf = _has_crlf(target_path)
+    else:
+        crlf = "\r\n" in content
+    try:
+        atomic_write_text(target_path, content, crlf)
+    except OSError as e:
+        return f"Error writing '{path_str}': {e}"
     return f"Successfully wrote {len(content)} characters to '{path_str}'."
 
 
@@ -162,7 +202,7 @@ LIST_FILES_SCHEMA = {
     "type": "function",
     "function": {
         "name": "list_files",
-        "description": "List files and directories in the workspace under the specified path.",
+        "description": "List files/directories under a path. Use for exploring unknown directories before reading files.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -179,7 +219,7 @@ GLOB_FILES_SCHEMA = {
     "type": "function",
     "function": {
         "name": "glob_files",
-        "description": "Find files in the workspace matching a glob pattern.",
+        "description": "Find files by glob pattern. Use first to discover relevant files (e.g. '**/*.py', 'src/**/*.ts') before reading them.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -196,9 +236,12 @@ GLOB_FILES_SCHEMA = {
 
 @register_tool("list_files", LIST_FILES_SCHEMA)
 def list_files_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> str:
+    from nimcode.context import is_ignored, load_gitignore_rules
     from nimcode.tools.registry import ToolSandboxError
 
     path_str = args.get("path", ".")
+    if not isinstance(path_str, str):
+        return "Error: Invalid 'path' parameter for list_files."
     try:
         target_path = resolve_and_validate_path(path_str, workspace_root)
     except ToolSandboxError as e:
@@ -210,64 +253,124 @@ def list_files_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> 
         return f"Error: Path '{path_str}' is a file, not a directory."
 
     try:
+        gitignore_rules = load_gitignore_rules(workspace_root)
         entries = sorted(target_path.iterdir(), key=lambda x: (x.is_file(), x.name))
         result = []
-        for entry in entries:
-            rel = entry.relative_to(workspace_root)
+        for entry in entries[:2000]:
+            try:
+                if is_ignored(entry, gitignore_rules, root=workspace_root):
+                    continue
+                rel = entry.relative_to(workspace_root.resolve())
+            except Exception:
+                continue
             t = "File" if entry.is_file() else "Directory"
             result.append(f"{rel.as_posix()} ({t})")
         if not result:
             return f"Directory '{path_str}' is empty."
+        if len(entries) > 2000:
+            result.append(f"... [truncated: {len(entries) - 2000} more entries]")
         output = "\n".join(result)
-        output_cap = getattr(config, "output_cap", 100000)
-        output = truncate_output(output, output_cap)
+        output = truncate_output(output, coerce_output_cap(config))
         return output
     except Exception as e:
         return f"Error listing directory '{path_str}': {e}"
 
 
+def _glob_to_regex(parts: list):
+    """Path.glob-style segments ('**' = any depth) -> compiled regex on posix rel paths."""
+    import re
+
+    out = ""
+    for i, seg in enumerate(parts):
+        last = i == len(parts) - 1
+        if seg == "**":
+            out += ".*" if last else "(?:[^/]+/)*"
+            continue
+        j = 0
+        while j < len(seg):
+            c = seg[j]
+            if c == "*":
+                out += "[^/]*"
+            elif c == "?":
+                out += "[^/]"
+            elif c == "[" and "]" in seg[j + 2 :]:
+                k = seg.index("]", j + 2)
+                body = seg[j + 1 : k]
+                if body.startswith("!"):
+                    body = "^" + body[1:]
+                out += "[" + body.replace("\\", "\\\\") + "]"
+                j = k
+            else:
+                out += re.escape(c)
+            j += 1
+        if not last:
+            out += "/"
+    flags = re.IGNORECASE if os.name == "nt" else 0
+    return re.compile(out + r"\Z", flags)
+
+
 @register_tool("glob_files", GLOB_FILES_SCHEMA)
 def glob_files_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> str:
     from nimcode.tools.registry import ToolSandboxError
-    from nimcode.context import is_ignored
+    from nimcode.context import is_ignored, load_gitignore_rules
 
     pattern = args.get("pattern")
-    if not pattern:
+    if not pattern or not isinstance(pattern, str):
+        return "Error: Missing 'pattern' parameter."
+    pattern = pattern.replace("\\", "/").strip()
+    parts = [s for s in pattern.split("/") if s not in ("", ".")]
+    if pattern.startswith("/") or Path(pattern).is_absolute() or ".." in parts:
+        return "Error: glob pattern must be relative to the workspace (no '..')."
+    if not parts:
         return "Error: Missing 'pattern' parameter."
 
-    gitignore_rules = []
-    gitignore_path = workspace_root / ".gitignore"
-    if gitignore_path.exists():
-        try:
-            with open(gitignore_path, "r", encoding="utf-8") as f:
-                gitignore_rules = [
-                    line.strip()
-                    for line in f
-                    if line.strip() and not line.strip().startswith("#")
-                ]
-        except Exception:
-            pass
+    gitignore_rules = load_gitignore_rules(workspace_root)
+    root = workspace_root.resolve()
+    # Walk from the literal (wildcard-free) prefix only, pruning ignored dirs
+    # (node_modules, .venv, ...) instead of letting Path.glob('**') visit them.
+    prefix = []
+    for seg in parts[:-1]:
+        if any(c in seg for c in "*?["):
+            break
+        prefix.append(seg)
+    regex = _glob_to_regex(parts)
 
     try:
+        try:
+            start = resolve_and_validate_path("/".join(prefix) or ".", workspace_root)
+        except ToolSandboxError as e:
+            return f"Error: {e}"
         results = []
-        for p in workspace_root.glob(pattern):
-            try:
-                resolved = resolve_and_validate_path(
-                    str(p.relative_to(workspace_root)), workspace_root
-                )
-                if resolved.is_file():
-                    if is_ignored(resolved, gitignore_rules, root=workspace_root):
-                        continue
-                    results.append(p.relative_to(workspace_root).as_posix())
-            except (ToolSandboxError, ValueError):
-                continue
+        truncated = False
+        for dirpath, dirnames, filenames in os.walk(start):
+            d = Path(dirpath)
+            dirnames[:] = sorted(
+                n
+                for n in dirnames
+                if not (d / n).is_symlink()
+                and not is_ignored(d / n, gitignore_rules, root=root)
+            )
+            for name in sorted(filenames):
+                p = d / name
+                rel = p.relative_to(root).as_posix()
+                if not regex.match(rel) or p.is_symlink():
+                    continue
+                if is_ignored(p, gitignore_rules, root=root):
+                    continue
+                results.append(rel)
+                if len(results) >= 2000:
+                    truncated = True
+                    break
+            if truncated:
+                break
 
         if not results:
             return f"No files matched pattern '{pattern}'."
 
         output = "\n".join(sorted(results))
-        output_cap = getattr(config, "output_cap", 100000)
-        output = truncate_output(output, output_cap)
+        if truncated:
+            output += "\n... [truncated: showing first 2000 matches]"
+        output = truncate_output(output, coerce_output_cap(config))
         return output
     except Exception as e:
         return f"Error globbing pattern '{pattern}': {e}"
@@ -277,7 +380,7 @@ PATCH_FILE_BLOCKS_SCHEMA = {
     "type": "function",
     "function": {
         "name": "patch_file_blocks",
-        "description": "Apply precision multi-line search-and-replace edits to a file using Aider-style SEARCH/REPLACE blocks.",
+        "description": "PREFERRED way to edit existing files: precise SEARCH/REPLACE blocks. Read the file first so SEARCH matches exactly including whitespace. Keep blocks small and unique.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -299,7 +402,7 @@ SEARCH_GREP_SCHEMA = {
     "type": "function",
     "function": {
         "name": "search_grep",
-        "description": "Search codebase file contents for a specific query substring or regex pattern recursively.",
+        "description": "Search file contents recursively. Use to find usages, call-sites, and error strings before reading specific files.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -321,7 +424,7 @@ SEARCH_SYMBOLS_SCHEMA = {
     "type": "function",
     "function": {
         "name": "search_symbols",
-        "description": "Find Python class and function definitions matching a query.",
+        "description": "Find Python class/function definitions by name. Use to locate where a symbol is defined before reading it.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -366,23 +469,39 @@ def patch_file_blocks_logic(
         return f"Error: File '{path_str}' does not exist or is not a file."
 
     try:
-        with open(target_path, "r", encoding="utf-8", errors="replace") as f:
+        # Strict decode: errors="replace" would silently write U+FFFD over
+        # every non-UTF-8 byte of the file on save.
+        with open(target_path, "r", encoding="utf-8") as f:
             content = f.read()
+    except UnicodeDecodeError:
+        return f"Error: File '{path_str}' is not valid UTF-8; refusing to patch (would corrupt it)."
     except Exception as e:
         return f"Error reading '{path_str}': {e}"
 
     import re
 
-    pattern = r"<<<<<<< SEARCH\s*\n(.*?)\n=======\s*\n(.*?)\n>>>>>>> REPLACE"
-    matches = list(re.finditer(pattern, edit_blocks, re.DOTALL))
+    if not isinstance(edit_blocks, str):
+        return "Error: Invalid 'edit_blocks' parameter: must be a string."
+    # File content is newline-normalized by text-mode read; do the same to the blocks.
+    edit_blocks = edit_blocks.replace("\r\n", "\n")
+    # Line-anchored delimiters. Each group keeps its trailing "\n" (stripped
+    # below), so an empty REPLACE (= deletion) matches instead of spilling
+    # into the next block.
+    pattern = (
+        r"^<<<<<<<[ \t]*SEARCH[^\n]*\n(.*?)^=======[^\n]*\n(.*?)"
+        r"^>>>>>>>[^\n]*REPLACE[^\n]*$"
+    )
+    matches = list(re.finditer(pattern, edit_blocks, re.DOTALL | re.MULTILINE))
     if not matches:
         return "Error: No valid edit blocks found. Ensure you use <<<<<<< SEARCH, =======, and >>>>>>> REPLACE delimiters exactly."
 
     new_content = content
     for idx, match in enumerate(matches):
-        search_str = match.group(1)
-        replace_str = match.group(2)
+        search_str = match.group(1).removesuffix("\n")
+        replace_str = match.group(2).removesuffix("\n")
 
+        if not search_str:
+            return f"Error in block #{idx + 1}: empty SEARCH block."
         count = new_content.count(search_str)
         if count == 0:
             return f"Error in block #{idx + 1}: SEARCH block not found in the file. Make sure lines match exactly including leading spaces."
@@ -407,33 +526,12 @@ def patch_file_blocks_logic(
         return "".join(diff) if diff else "No changes detected."
 
     if config and getattr(config, "auto_backup", True):
-        from nimcode.config import get_project_nimcode_dir
+        backup_file(target_path, workspace_root, tag="blocks")
 
-        backup_dir = get_project_nimcode_dir(workspace_root) / "backups"
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = int(time.time())
-        try:
-            rel_path = target_path.relative_to(workspace_root)
-            safe_rel_name = str(rel_path).replace(os.sep, "_").replace("/", "_")
-        except Exception:
-            safe_rel_name = target_path.name
-        backup_path = backup_dir / f"{timestamp}_blocks_{safe_rel_name}"
-        try:
-            shutil.copy2(target_path, backup_path)
-        except Exception:
-            pass
-
-    # Detect original line ending
-    has_crlf = False
     try:
-        with open(target_path, "rb") as f_bin:
-            has_crlf = b"\r\n" in f_bin.read(4096)
-    except Exception:
-        pass
-
-    newline = "\r\n" if has_crlf else "\n"
-    with open(target_path, "w", encoding="utf-8", newline=newline) as f:
-        f.write(new_content)
+        atomic_write_text(target_path, new_content, _has_crlf(target_path))
+    except OSError as e:
+        return f"Error writing '{path_str}': {e}"
 
     return f"Successfully applied {len(matches)} edit block(s) to '{path_str}'."
 
@@ -452,88 +550,94 @@ def search_grep_tool(args: Dict[str, Any], workspace_root: Path, config: Any) ->
         return f"Error: Path '{path_str}' does not exist."
 
     import re
-    from nimcode.context import is_ignored
+    from nimcode.context import is_ignored, load_gitignore_rules
 
-    gitignore_rules = []
-    gitignore_path = workspace_root / ".gitignore"
-    if gitignore_path.exists():
-        try:
-            with open(gitignore_path, "r", encoding="utf-8") as f:
-                gitignore_rules = [
-                    line.strip()
-                    for line in f
-                    if line.strip() and not line.strip().startswith("#")
-                ]
-        except Exception:
-            pass
+    if not isinstance(query, str) or not query:
+        return "Error: Missing 'query' parameter."
 
+    gitignore_rules = load_gitignore_rules(workspace_root)
+
+    regex_note = ""
     try:
         compiled_regex = re.compile(query, re.IGNORECASE)
-    except Exception:
+    except re.error:
         compiled_regex = None
+        regex_note = (
+            "[Note: invalid regex, falling back to case-insensitive substring match]\n"
+        )
 
     matches = []
+    skipped_large = 0
+    visited: set[tuple[int, int]] = set()
+    # search_path is resolved; relative_to() against an unresolved root
+    # (relative path, symlinked/8.3 dir) raised and silently dropped every match.
+    root = workspace_root.resolve()
+    query_lower = query.lower()
 
-    def walk_and_search(dir_path: Path):
-        for entry in sorted(dir_path.iterdir(), key=lambda x: (x.is_file(), x.name)):
-            if is_ignored(entry, gitignore_rules, root=workspace_root):
+    def grep_file(file_path: Path) -> None:
+        with open(file_path, "rb") as fb:
+            data = fb.read()
+        if b"\0" in data[:8192]:
+            return  # binary
+        rel = file_path.relative_to(root).as_posix()
+        for line_num, line in enumerate(
+            data.decode("utf-8", errors="replace").splitlines(), 1
+        ):
+            if compiled_regex:
+                hit = compiled_regex.search(line)
+            else:
+                hit = query_lower in line.lower()
+            if hit:
+                matches.append((rel, line_num, line.strip()[:500]))
+                if len(matches) > 5000:
+                    return
+
+    def walk_and_search(dir_path: Path, depth: int = 0):
+        nonlocal skipped_large
+        if depth > 25 or len(matches) > 5000:
+            return
+        try:
+            st = dir_path.stat()
+            key = (st.st_dev, st.st_ino)
+            if key in visited:
+                return
+            visited.add(key)
+        except OSError:
+            return
+        try:
+            entries = sorted(dir_path.iterdir(), key=lambda x: (x.is_file(), x.name))
+        except OSError:
+            return
+        for entry in entries:
+            if len(matches) > 5000:
+                break
+            try:
+                if entry.is_symlink():
+                    continue
+                if is_ignored(entry, gitignore_rules, root=root):
+                    continue
+            except OSError:
                 continue
             if entry.is_dir():
-                walk_and_search(entry)
+                walk_and_search(entry, depth + 1)
             elif entry.is_file():
-                file_size = entry.stat().st_size
+                try:
+                    file_size = entry.stat().st_size
+                except OSError:
+                    continue
                 if file_size > 1_000_000:
+                    skipped_large += 1
                     continue
                 try:
-                    with open(entry, "r", encoding="utf-8", errors="replace") as f:
-                        for line_num, line in enumerate(f, 1):
-                            if compiled_regex:
-                                if compiled_regex.search(line):
-                                    matches.append(
-                                        (
-                                            entry.relative_to(
-                                                workspace_root
-                                            ).as_posix(),
-                                            line_num,
-                                            line.strip(),
-                                        )
-                                    )
-                            else:
-                                if query in line:
-                                    matches.append(
-                                        (
-                                            entry.relative_to(
-                                                workspace_root
-                                            ).as_posix(),
-                                            line_num,
-                                            line.strip(),
-                                        )
-                                    )
+                    grep_file(entry)
                 except Exception:
                     pass
 
     if search_path.is_file():
         try:
-            with open(search_path, "r", encoding="utf-8", errors="replace") as f:
-                for line_num, line in enumerate(f, 1):
-                    if compiled_regex:
-                        if compiled_regex.search(line):
-                            matches.append(
-                                (
-                                    search_path.relative_to(workspace_root).as_posix(),
-                                    line_num,
-                                    line.strip(),
-                                )
-                            )
-                    else:
-                        if query in line:
-                            matches.append(
-                                (
-                                    search_path.relative_to(workspace_root).as_posix(),
-                                    line_num,
-                                    line.strip(),
-                                )
-                            )
+            if search_path.stat().st_size > 5_000_000:
+                return f"Error: File '{path_str}' is too large to search."
+            grep_file(search_path)
         except Exception as e:
             return f"Error reading file '{path_str}': {e}"
     else:
@@ -542,42 +646,38 @@ def search_grep_tool(args: Dict[str, Any], workspace_root: Path, config: Any) ->
     if not matches:
         return f"No matches found for query '{query}'."
 
-    output_lines = [f"{m[0]}:{m[1]}: {m[2]}" for m in matches]
-    output = "\n".join(output_lines)
-    output_cap = getattr(config, "output_cap", 100000)
-    output = truncate_output(output, output_cap)
-    return output
+    output_lines = [f"{m[0]}:{m[1]}: {m[2]}" for m in matches[:5000]]
+    output = regex_note + "\n".join(output_lines)
+    if skipped_large:
+        output += f"\n[skipped {skipped_large} large file(s) >1MB]"
+    return truncate_output(output, coerce_output_cap(config))
 
 
 @register_tool("search_symbols", SEARCH_SYMBOLS_SCHEMA)
 def search_symbols_tool(args: Dict[str, Any], workspace_root: Path, config: Any) -> str:
     query = args.get("query", "")
-    if not query:
+    if not query or not isinstance(query, str):
         return "Error: Missing 'query' parameter."
 
     import ast
-    from nimcode.context import is_ignored
+    import warnings
+    from nimcode.context import is_ignored, load_gitignore_rules
 
-    gitignore_rules = []
-    gitignore_path = workspace_root / ".gitignore"
-    if gitignore_path.exists():
-        try:
-            with open(gitignore_path, "r", encoding="utf-8") as f:
-                gitignore_rules = [
-                    line.strip()
-                    for line in f
-                    if line.strip() and not line.strip().startswith("#")
-                ]
-        except Exception:
-            pass
+    gitignore_rules = load_gitignore_rules(workspace_root)
 
     symbols = []
+    visited: set = set()
 
     def scan_file(file_path: Path):
         try:
+            if file_path.stat().st_size > 1_000_000:
+                return
             with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
-            tree = ast.parse(content)
+            # SyntaxWarnings (e.g. invalid escapes) would spew to stderr and garble the TUI.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                tree = ast.parse(content)
             for node in ast.walk(tree):
                 if isinstance(
                     node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
@@ -590,12 +690,33 @@ def search_symbols_tool(args: Dict[str, Any], workspace_root: Path, config: Any)
         except Exception:
             pass
 
-    def walk_and_scan(dir_path: Path):
-        for entry in sorted(dir_path.iterdir(), key=lambda x: (x.is_file(), x.name)):
-            if is_ignored(entry, gitignore_rules, root=workspace_root):
+    def walk_and_scan(dir_path: Path, depth: int = 0):
+        if depth > 25 or len(symbols) > 5000:
+            return
+        try:
+            st = dir_path.stat()
+            key = (st.st_dev, st.st_ino)
+            if key in visited:
+                return
+            visited.add(key)
+        except OSError:
+            return
+        try:
+            entries = sorted(dir_path.iterdir(), key=lambda x: (x.is_file(), x.name))
+        except OSError:
+            return
+        for entry in entries:
+            if len(symbols) > 5000:
+                break
+            try:
+                if entry.is_symlink():
+                    continue
+                if is_ignored(entry, gitignore_rules, root=workspace_root):
+                    continue
+            except OSError:
                 continue
             if entry.is_dir():
-                walk_and_scan(entry)
+                walk_and_scan(entry, depth + 1)
             elif entry.is_file() and entry.suffix == ".py":
                 scan_file(entry)
 
@@ -604,7 +725,6 @@ def search_symbols_tool(args: Dict[str, Any], workspace_root: Path, config: Any)
     if not symbols:
         return f"No symbols matching query '{query}' found."
 
-    output = "\n".join(symbols)
-    output_cap = getattr(config, "output_cap", 100000)
-    output = truncate_output(output, output_cap)
+    output = "\n".join(symbols[:5000])
+    output = truncate_output(output, coerce_output_cap(config))
     return output

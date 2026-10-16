@@ -1,3 +1,4 @@
+from typing import Optional, Any
 from rich.align import Align
 from rich.columns import Columns
 from rich.panel import Panel
@@ -7,7 +8,33 @@ from rich.text import Text
 from nimcode.ui.output import console, symbol
 
 
-def show_help():
+def show_help(tui: Optional[Any] = None):
+    if tui is not None:
+        help_md = (
+            "**Keyboard Shortcuts & Commands**\n\n"
+            "| Shortcut / Command | Action |\n"
+            "| --- | --- |\n"
+            "| **Shift + Tab** | Cycle between [ Plan Mode ], [ Build Mode ], and [ YOLO Mode ] |\n"
+            "| **?** or **/help** | Show this help menu |\n"
+            "| **/plan** / **/build** / **/yolo** | Switch active mode directly (or cycle with Shift+Tab) |\n"
+            "| **/test [cmd]** | Run test suite inside validation sandbox |\n"
+            "| **/team** | Monitor or inspect active background subagents |\n"
+            "| **/resume** | Show and access old chat sessions |\n"
+            "| **/model** | Choose active AI model (Mistral, DeepSeek, etc.) |\n"
+            "| **/config** | View or modify nimcode runtime configuration settings |\n"
+            "| **/changes** / **/diff** | Check git working tree changes and recent file backups |\n"
+            "| **/compact** | Compact conversation history into summary.md |\n"
+            "| **/recap** | Show a quick 4-5 line summary of the session |\n"
+            "| **/skills** | Show installed agent skills |\n"
+            "| **/install-skill <link>** | Install new skill from raw .md, .zip, or git repo |\n"
+            "| **/exit** / **/quit** | Exit the nimcode application |\n"
+            "| **Ctrl + C / ESC** | Cancel the current prompt / exit |\n\n"
+            "*Note: Shell commands and tests run inside a sandboxed Docker container by default. "
+            "To execute commands directly on the host, set 'disable_docker = true' in nimcode.toml.*"
+        )
+        tui.add_message("system", help_md, markdown=True)
+        return
+
     table = Table(
         title="Keyboard Shortcuts & Commands",
         border_style="cyan",

@@ -16,8 +16,19 @@ def resolve_and_validate_path(path_str: str, workspace_root: Path) -> Path:
     if not path_str or not isinstance(path_str, str):
         raise ToolSandboxError("Security Error: Invalid or missing file path.")
 
-    resolved_root = workspace_root.resolve()
-    target_path = (resolved_root / path_str).resolve()
+    if Path(path_str).is_absolute():
+        raise ToolSandboxError(
+            f"Security Error: Path '{path_str}' must be relative to workspace root."
+        )
+
+    if "\x00" in path_str:
+        raise ToolSandboxError("Security Error: Path contains a NUL byte.")
+
+    resolved_root = Path(workspace_root).resolve()
+    try:
+        target_path = (resolved_root / path_str).resolve()
+    except (OSError, ValueError, RuntimeError) as e:
+        raise ToolSandboxError(f"Security Error: Cannot resolve path '{path_str}': {e}")
 
     try:
         if hasattr(target_path, "is_relative_to"):
@@ -39,16 +50,27 @@ def is_docker_available() -> bool:
     """
     Check if Docker daemon is available and responsive.
     Returns True if 'docker info' succeeds, False otherwise.
+    Result is cached for 30s to avoid blocking the TUI on every preview.
     """
+    import time
+
+    now = time.monotonic()
+    cached = getattr(is_docker_available, "_cache", None)
+    if cached is not None:
+        result, ts = cached
+        if now - ts < 30:
+            return result
     try:
-        result = subprocess.run(
+        result_proc = subprocess.run(
             ["docker", "info"],
             capture_output=True,
             timeout=5,
         )
-        return result.returncode == 0
+        available = result_proc.returncode == 0
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
-        return False
+        available = False
+    is_docker_available._cache = (available, now)  # type: ignore[attr-defined]
+    return available
 
 
 def is_valid_tool_call(tool_call: Any) -> Tuple[bool, str, Dict[str, Any]]:
@@ -67,8 +89,13 @@ def is_valid_tool_call(tool_call: Any) -> Tuple[bool, str, Dict[str, Any]]:
     else:
         try:
             args = json.loads(raw_args) if raw_args else {}
+        except json.JSONDecodeError as e:
+            return False, tool_name, {"_parse_error": f"Invalid JSON arguments: {e}"}
         except Exception:
             return False, tool_name, {}
+    if not isinstance(args, dict):
+        # e.g. arguments='[1,2]' or '"x"' -- .get() below would crash.
+        return False, tool_name, {"_parse_error": "Arguments must be a JSON object."}
 
     if tool_name == "read_file":
         if not args.get("path"):
@@ -147,13 +174,28 @@ def scrub_text(text: str) -> str:
     """
     if not text:
         return text
-    # Mask Bearer tokens
-    text = re.sub(r"(?i)(bearer\s+)[\w\.\-]+", r"\1***REDACTED***", text)
-    # Mask Basic auth strings
-    text = re.sub(r"(?i)(basic\s+)[a-zA-Z0-9\+/=]+", r"\1***REDACTED***", text)
-    # Mask common CLI flags e.g., -p<pass>, --password=<pass>, --token=<token>
+    # Mask Bearer tokens (base64/url-safe chars incl. + / ~ and = padding)
+    text = re.sub(r"(?i)(\bbearer\s+)[\w.~+/\-]+=*", r"\1***REDACTED***", text)
+    # Mask Basic auth only in an Authorization header context; a bare
+    # "basic <word>" rule mangled ordinary prose ("basic usage").
     text = re.sub(
-        r"(?i)(-(?:p|-password|-token|-secret)\s*=?\s*['\"]?)[\w\.\-\+/\=]+",
+        r"(?i)(authorization\s*[:=]\s*['\"]?basic\s+)[A-Za-z0-9+/]+=*",
+        r"\1***REDACTED***",
+        text,
+    )
+    # Secret CLI flags: --password=x / --token x / --secret x / --api-key x.
+    # Lookbehind stops matches inside hyphenated words.
+    text = re.sub(
+        r"(?i)((?<![\w-])--(?:password|passwd|token|secret|api-key|apikey)"
+        r"(?:\s*=\s*|\s+)['\"]?)[^\s'\"]+",
+        r"\1***REDACTED***",
+        text,
+    )
+    # mysql-style attached password (mysql -uroot -psecret). Scoped to the
+    # mysql family: a generic "-p" rule redacted `mkdir -p x`, `find -print`,
+    # `docker -p 3000:3000` and every hyphenated word ("pre-processing").
+    text = re.sub(
+        r"(?i)(\b(?:mysql\w*|mariadb\w*)\b[^\n]*?(?<![\w-])-p)(?=[^\s-])\S+",
         r"\1***REDACTED***",
         text,
     )
@@ -161,7 +203,83 @@ def scrub_text(text: str) -> str:
     text = re.sub(
         r"(?i)((?:api-key|x-api-key)\s*:\s*['\"]?)[\w\.\-]+", r"\1***REDACTED***", text
     )
+    # Well-known vendor key prefixes (NVIDIA, OpenAI/Anthropic, GitHub, GitLab,
+    # Slack, Google) -- these contain '-'/'_' so the 32+ alnum rule misses them.
+    text = re.sub(
+        r"\b(?:nvapi-|sk-|ghp_|gho_|ghs_|ghu_|github_pat_|glpat-|xox[abprs]-|AIza)"
+        r"[\w\-]{16,}",
+        "***REDACTED***",
+        text,
+    )
+    # .env-style assignments: FOO_API_KEY=..., DB_PASSWORD=...
+    text = re.sub(
+        r"(\b[A-Z0-9_]*(?:API_KEY|APIKEY|SECRET|TOKEN|PASSWORD|PASSWD)[A-Z0-9_]*"
+        r"\s*=\s*['\"]?)[^\s'\"]+",
+        r"\1***REDACTED***",
+        text,
+    )
+    # Mask AWS keys (AKIA...)
+    text = re.sub(r"(?i)(AKIA[0-9A-Z]{16})", r"***REDACTED***", text)
+    # Mask AWS secret keys (40 chars, preceded by context like aws_secret_access_key=)
+    text = re.sub(
+        r"(?i)(aws_secret_access_key\s*=\s*['\"]?)([A-Za-z0-9/+=]{40})",
+        r"\1***REDACTED***",
+        text,
+    )
+    # Mask database URLs (postgres://, mysql://, mongodb://, redis://)
+    # NOTE: replace the whole URL, not just append — group ref would leak creds.
+    # Also covers driver suffixes (postgresql+psycopg2://, mongodb+srv://).
+    text = re.sub(
+        r"(?i)(?:postgres|postgresql|mysql|mongodb|redis|rediss|amqp)(?:\+[\w.]+)?"
+        r"://[^:\s/@]+:[^@\s]+@[^/\s]+",
+        "***REDACTED_DB_URL***",
+        text,
+    )
+    # Any other scheme://user:password@host -- mask the password part.
+    text = re.sub(
+        r"(?i)(\b[a-z][a-z0-9+.\-]*://[^:/\s@]+:)[^@\s/]+@", r"\1***REDACTED***@", text
+    )
+    # Mask JWT tokens (3 base64 parts separated by dots)
+    text = re.sub(
+        r"eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*", "***REDACTED***", text
+    )
+    # Mask generic long alphanumeric strings that look like keys (32+ chars)
+    text = re.sub(r"(?i)([a-z0-9]{32,})", r"***REDACTED***", text)
     return text
+
+
+def backup_file(target_path: Path, workspace_root: Path, tag: str = "") -> None:
+    """Copy target_path into the project's backups dir. Never raises."""
+    import os
+    import shutil
+    import time
+
+    try:
+        if not target_path.exists() or not target_path.is_file():
+            return
+        from nimcode.config import get_project_nimcode_dir
+
+        backup_dir = get_project_nimcode_dir(workspace_root) / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = int(time.time() * 1_000_000)
+        try:
+            rel_path = target_path.relative_to(workspace_root.resolve())
+            safe_rel_name = str(rel_path).replace(os.sep, "_").replace("/", "_")
+        except Exception:
+            safe_rel_name = target_path.name
+        prefix = f"{tag}_" if tag else ""
+        backup_path = backup_dir / f"{timestamp}_{os.getpid()}_{prefix}{safe_rel_name}"
+        shutil.copy2(target_path, backup_path)
+    except Exception:
+        pass
+
+
+def coerce_output_cap(config: Any, default: int = 100000) -> int:
+    """Read output_cap off config; fall back to default on garbage."""
+    try:
+        return int(getattr(config, "output_cap", default))
+    except Exception:
+        return default
 
 
 def truncate_output(text: str, max_length: int = 100000) -> str:
@@ -169,10 +287,18 @@ def truncate_output(text: str, max_length: int = 100000) -> str:
     Smart truncation: keeps the first N and last N chars of the string, dropping the middle.
     This ensures that both the beginning (context) and the end (stack traces/errors) are preserved.
     """
+    if not isinstance(text, str):
+        text = str(text)
+    try:
+        max_length = max(0, int(max_length))
+    except (TypeError, ValueError):
+        max_length = 100000
     if len(text) <= max_length:
         return text
 
+    # Report chars actually dropped (len - kept), not len - cap.
     msg = f"\n... [Output truncated: dropped {len(text) - max_length} chars from the middle] ...\n"
+    msg = f"\n... [Output truncated: dropped {len(text) - (max_length - len(msg))} chars from the middle] ...\n"
     budget = max_length - len(msg)
 
     if budget <= 0:
@@ -197,15 +323,21 @@ def render_preview(
     elif tool_name == "write_file":
         path_str = args.get("path", "")
         new_content = args.get("content", "")
+        if not isinstance(new_content, str):
+            new_content = str(new_content)
         try:
             target_path = resolve_and_validate_path(path_str, workspace_root)
             old_content = ""
             if target_path.exists() and target_path.is_file():
                 try:
-                    with open(
-                        target_path, "r", encoding="utf-8", errors="replace"
-                    ) as f:
-                        old_content = f.read()
+                    # Cap preview reads to avoid OOM on huge files.
+                    if target_path.stat().st_size > 200_000:
+                        old_content = "<file too large for preview>"
+                    else:
+                        with open(
+                            target_path, "r", encoding="utf-8", errors="replace"
+                        ) as f:
+                            old_content = f.read(200_000)
                 except Exception:
                     old_content = "<binary or unreadable file>"
             diff = difflib.unified_diff(
@@ -220,58 +352,21 @@ def render_preview(
             return f"\n[Tool Preview: write_file] Path: {path_str}\n{diff_text}\n"
         except ToolSandboxError as e:
             return f"\n[Tool Preview: write_file] Path: {path_str}\nError: {e}\n"
+        except Exception as e:
+            return f"\n[Tool Preview: write_file] Path: {path_str}\nError: {e}\n"
 
-    elif tool_name == "execute_command":
-        command = scrub_text(args.get("command", ""))
-        use_docker = args.get("use_docker", None)
-        if use_docker is None:
-            # Will be determined at execution time based on config
-            use_docker = (
-                not getattr(config, "disable_docker", False) and is_docker_available()
-                if config is not None
-                else is_docker_available()
-            )
-        if use_docker:
-            docker_image = args.get("docker_image", "python:3.11-slim")
-            workspace = workspace_root.resolve()
-            # Show a preview of the docker command
-            cmd_preview = (
-                f"docker run --rm --init "
-                f"--cap-drop ALL "
-                f"--security-opt no-new-privileges:true "
-                f"-v {str(workspace)}:/workspace "
-                f"-w /workspace "
-                f"{docker_image} "
-                f"sh -c {shlex.quote(command)}"
-            )
-            return f"\n[Tool Preview: execute_command (Docker)]\n{cmd_preview}\n"
-        else:
-            return f"\n[Tool Preview: execute_command (Host)]\n{command}\n"
+    elif tool_name in ("execute_command", "run_tests"):
+        default_cmd = "pytest" if tool_name == "run_tests" else ""
+        command = scrub_text(str(args.get("command") or default_cmd))
+        from nimcode.tools.cmd import _build_docker_command, _resolve_use_docker
 
-    elif tool_name == "run_tests":
-        command = scrub_text(args.get("command", "pytest"))
-        use_docker = args.get("use_docker", None)
-        if use_docker is None:
-            use_docker = (
-                not getattr(config, "disable_docker", False) and is_docker_available()
-                if config is not None
-                else is_docker_available()
-            )
-        if use_docker:
-            docker_image = args.get("docker_image", "python:3.11-slim")
-            workspace = workspace_root.resolve()
-            cmd_preview = (
-                f"docker run --rm --init "
-                f"--cap-drop ALL "
-                f"--security-opt no-new-privileges:true "
-                f"-v {str(workspace)}:/workspace "
-                f"-w /workspace "
-                f"{docker_image} "
-                f"sh -c {shlex.quote(command)}"
-            )
-            return f"\n[Tool Preview: run_tests (Docker)]\n{cmd_preview}\n"
-        else:
-            return f"\n[Tool Preview: run_tests (Host)]\n{command}\n"
+        # Same decision + argv the executor uses, so the approved preview
+        # matches what runs (image/ports/extra args come from config).
+        if _resolve_use_docker(args.get("use_docker"), config):
+            argv = _build_docker_command(command, workspace_root, config)
+            cmd_preview = " ".join(shlex.quote(a) for a in argv)
+            return f"\n[Tool Preview: {tool_name} (Docker)]\n{cmd_preview}\n"
+        return f"\n[Tool Preview: {tool_name} (Host)]\n{command}\n"
 
     elif tool_name == "list_files":
         path = args.get("path", ".")
@@ -321,12 +416,16 @@ def render_preview(
 
     elif tool_name == "spawn_agent":
         task = args.get("task_prompt", "")
-        return f"\n[Tool Preview: spawn_agent] Task: {task[:100]}...\n"
+        task = str(task) if not isinstance(task, str) else task
+        suffix = "..." if len(task) > 100 else ""
+        return f"\n[Tool Preview: spawn_agent] Task: {task[:100]}{suffix}\n"
 
     elif tool_name == "send_message_to_agent":
         agent_id = args.get("agent_id", "")
         message = args.get("message", "")
-        return f"\n[Tool Preview: send_message_to_agent] Agent: {agent_id}, Message: {message[:100]}...\n"
+        message = str(message) if not isinstance(message, str) else message
+        suffix = "..." if len(message) > 100 else ""
+        return f"\n[Tool Preview: send_message_to_agent] Agent: {agent_id}, Message: {message[:100]}{suffix}\n"
 
     elif tool_name == "kill_agent":
         agent_id = args.get("agent_id", "")
@@ -359,13 +458,26 @@ def render_preview(
         query = args.get("query", "")
         return f"\n[Tool Preview: web_search] Query: '{query}'\n"
 
-    return f"\n[Tool Preview: {tool_name}] Args: {json.dumps(args, indent=2)}\n"
+    try:
+        return f"\n[Tool Preview: {tool_name}] Args: {json.dumps(args, indent=2, default=str)}\n"
+    except Exception:
+        return f"\n[Tool Preview: {tool_name}] (args not displayable)\n"
 
 
 # Compiled regex for detecting sensitive environment variables.
 # This covers common names, abbreviations (_PW, _PWD), and ignores case.
 SENSITIVE_ENV_REGEX = re.compile(
-    r"(API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|_PW|_PWD|CREDENTIAL|PRIVATE_KEY|AUTH_)",
+    r"(API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|_PW|_PWD|CREDENTIAL|PRIVATE_KEY|AUTH_|"
+    r"AWS_KEY|AWS_SECRET|AWS_ACCESS|AWS_SECRET_ACCESS|DATABASE_URL|DB_PASSWORD|"
+    r"DB_PASS|DB_USER|DB_NAME|POSTGRES_PASSWORD|MYSQL_PASSWORD|MONGO_URI|"
+    r"REDIS_URL|REDIS_PASSWORD|JWT_SECRET|SESSION_SECRET|ENCRYPTION_KEY|"
+    r"SSH_KEY|SSH_PRIVATE_KEY|GPG_KEY|SIGNING_KEY|WEBHOOK_SECRET|WEBHOOK_TOKEN|"
+    r"SLACK_TOKEN|DISCORD_TOKEN|TELEGRAM_TOKEN|STRIPE_KEY|STRIPE_SECRET|"
+    r"PAYPAL_CLIENT_ID|PAYPAL_SECRET|SENDGRID_API_KEY|MAILGUN_API_KEY|"
+    r"SENTRY_DSN|NEW_RELIC_KEY|DATADOG_API_KEY|HEROKU_API_KEY|VERCEL_TOKEN|"
+    r"NETLIFY_AUTH_TOKEN|CLOUDFLARE_API_KEY|DIGITALOCEAN_TOKEN|GITHUB_TOKEN|"
+    r"GITLAB_TOKEN|BITBUCKET_TOKEN|NPM_TOKEN|PYPI_TOKEN|DOCKER_PASSWORD|"
+    r"DOCKER_USERNAME|KUBECONFIG|KUBE_TOKEN|VAULT_TOKEN|CONSUL_TOKEN)",
     re.IGNORECASE,
 )
 
@@ -374,11 +486,8 @@ def scrub_env(env: Dict[str, str]) -> Dict[str, str]:
     """
     Remove sensitive environment variables before passing to subprocess.
     Uses regex to catch common credential patterns and abbreviations.
+    Matching keys are dropped, not set to a placeholder: GITHUB_TOKEN=***REDACTED***
+    makes tools attempt (and fail) auth instead of running anonymously, and
+    breaks unrelated vars such as TOKENIZERS_PARALLELISM.
     """
-    scrubbed = {}
-    for k, v in env.items():
-        if SENSITIVE_ENV_REGEX.search(k):
-            scrubbed[k] = "***REDACTED***"
-        else:
-            scrubbed[k] = v
-    return scrubbed
+    return {k: v for k, v in env.items() if not SENSITIVE_ENV_REGEX.search(k)}

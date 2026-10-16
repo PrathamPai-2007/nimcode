@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nimcode"
-version = "0.6.0"
+dynamic = ["version"]
 description = "Terminal-first AI coding agent driven by NVIDIA NIM"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,7 +16,17 @@ dependencies = [
     "rich>=13.0.0",
     "prompt_toolkit>=3.0.0",
     "playwright>=1.40.0",
+    'colorama>=0.4.6; sys_platform == "win32"',
 ]
 
 [project.scripts]
 nimcode = "nimcode.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "nimcode.__version__"}
+
+[tool.setuptools.package-data]
+nimcode = ["bin/*"]

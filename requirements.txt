@@ -4,3 +4,5 @@ python-dotenv>=1.0.0
 tomli>=2.0.0
 rich>=13.0.0
 prompt_toolkit>=3.0.0
+playwright>=1.40.0
+colorama>=0.4.6; sys_platform == "win32"

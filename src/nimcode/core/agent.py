@@ -2,10 +2,19 @@ import os
 import sys
 import json
 import time
+import functools
 import typer
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
+
+# Optional tiktoken for accurate token counting
+try:
+    import tiktoken
+
+    HAS_TIKTOKEN = True
+except ImportError:
+    HAS_TIKTOKEN = False
 
 from nimcode.config import Config, get_project_nimcode_dir
 from nimcode.core.prompts import (
@@ -51,26 +60,33 @@ def _clean_json_args(raw: str) -> str:
     """Strip markdown code fences and whitespace that models sometimes add around JSON."""
     import re
 
-    # Remove ```json ... ``` or ``` ... ``` fences
-    raw = re.sub(r"```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-    raw = re.sub(r"```", "", raw)
+    # Only strip leading/trailing fences — never touch backticks inside JSON strings.
+    raw = re.sub(r"^\s*```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\s*```\s*$", "", raw)
     return raw.strip()
 
 
 def parse_xml_tool_calls(text: str) -> List[MockToolCall]:
     import re
+    import uuid
 
     tool_calls = []
-    # Match <tool_call name="...">...</tool_call> with quoted or unquoted name
+    # Match <tool_call name="...">...</tool_call> with quoted names (strict).
     matches = re.finditer(
-        r"<tool_call\s+name=[\"\']?(.*?)[\"\']?\s*>(.*?)</tool_call>",
+        r"<tool_call\s+name=(?:\"([^\"]+)\"|'([^']+)')\s*>(.*?)</tool_call>",
         text,
         re.DOTALL | re.IGNORECASE,
     )
-    for idx, match in enumerate(matches):
-        name = match.group(1).strip().strip("'\"")
-        args_str = _clean_json_args(match.group(2))
-        tc_id = f"call_xml_{idx}_{int(time.time())}"
+    for match in matches:
+        name = (match.group(1) or match.group(2) or "").strip()
+        if not name:
+            continue
+        args_str = _clean_json_args(match.group(3)) or "{}"
+        try:
+            json.loads(args_str)
+        except Exception:
+            continue
+        tc_id = f"call_xml_{uuid.uuid4().hex[:8]}"
         tool_calls.append(MockToolCall(tc_id, "function", MockFunction(name, args_str)))
     return tool_calls
 
@@ -87,7 +103,7 @@ def clean_surrogates(val: Any) -> Any:
     elif isinstance(val, tuple):
         return tuple(clean_surrogates(x) for x in val)
     elif isinstance(val, dict):
-        return {k: clean_surrogates(v) for k, v in val.items()}
+        return {clean_surrogates(k): clean_surrogates(v) for k, v in val.items()}
     return val
 
 
@@ -151,33 +167,37 @@ def normalize_messages(
             other_messages.append(msg)
 
     # 3. Merge consecutive messages with the same role in other_messages
+    # Never drop "tool" messages (orphaned tool_calls break the OpenAI API),
+    # and only merge assistant messages when neither side carries tool_calls.
     merged_others: List[Dict[str, Any]] = []
     for msg in other_messages:
         if (
             not msg.get("content")
             and not msg.get("tool_calls")
-            and msg.get("role") != "assistant"
+            and msg.get("role") not in ("assistant", "tool")
         ):
-            # Skip empty content if it's not assistant (which could have tool_calls)
+            # Skip empty content (but keep assistant/tool placeholders for pairing)
             continue
+        if msg.get("role") == "tool" and not msg.get("content"):
+            msg["content"] = "[empty tool result]"
         if not merged_others:
             merged_others.append(msg)
             continue
 
         last = merged_others[-1]
-        if last.get("role") == msg.get("role") and last.get("role") in (
-            "user",
-            "assistant",
-        ):
+        can_merge = (
+            last.get("role") == msg.get("role")
+            and last.get("role") in ("user", "assistant")
+            and not last.get("tool_calls")
+            and not msg.get("tool_calls")
+        )
+        if can_merge:
             last_content = last.get("content") or ""
             msg_content = msg.get("content") or ""
             if last_content and msg_content:
                 last["content"] = f"{last_content}\n\n{msg_content}"
             elif msg_content:
                 last["content"] = msg_content
-
-            if "tool_calls" in msg:
-                last["tool_calls"] = last.get("tool_calls", []) + msg["tool_calls"]
         else:
             merged_others.append(msg)
 
@@ -202,6 +222,186 @@ def normalize_messages(
     return normalized
 
 
+@functools.lru_cache(maxsize=None)
+def _get_token_estimator(model: str = "cl100k_base"):
+    """
+    Returns a function to estimate tokens in text.
+    Uses tiktoken if available, otherwise falls back to char/4 approximation.
+    """
+    if HAS_TIKTOKEN:
+        try:
+            encoding = tiktoken.get_encoding(model)
+            # disallowed_special=(): text containing e.g. "<|endoftext|>" (read
+            # from a file) must count as plain text, not raise ValueError.
+            return lambda text: len(encoding.encode(text, disallowed_special=()))
+        except Exception:
+            pass
+    # Fallback: rough approximation (1 token ≈ 4 chars)
+    return lambda text: max(1, len(text) // 4)
+
+
+def count_message_tokens(
+    messages: List[Dict[str, Any]], model: str = "cl100k_base"
+) -> int:
+    """
+    Count tokens in a message list using tiktoken if available.
+    """
+    estimator = _get_token_estimator(model)
+    total = 0
+    for msg in messages:
+        content = str(msg.get("content", ""))
+        tool_calls = str(msg.get("tool_calls", ""))
+        total += estimator(content) + estimator(tool_calls)
+        # Add overhead for message structure
+        total += 4  # role, content, etc.
+    return total
+
+
+def prune_history(
+    messages: List[Dict[str, Any]],
+    context_budget_tokens: int = 16000,
+    max_turns_retained: int = 20,
+) -> List[Dict[str, Any]]:
+    """
+    Prunes long conversation histories to satisfy context budget constraints.
+    First, it truncates older tool messages.
+    If the list is still over the token budget, it drops older user/assistant turns
+    while preserving the system prompt, first user prompt, and the most recent turns.
+    """
+    if not messages:
+        return []
+
+    # Calculate current token estimate using tiktoken if available
+    estimated_tokens = count_message_tokens(messages)
+    if (
+        len(messages) <= max_turns_retained
+        and estimated_tokens <= context_budget_tokens
+    ):
+        return messages
+
+    # Step 1: Truncate older tool results
+    pruned = []
+    # Always keep system message and initial user prompt intact
+    keep_indices = set(range(min(2, len(messages))))
+    cutoff_index = max(2, len(messages) - max_turns_retained)
+
+    for i in range(len(messages)):
+        msg = messages[i]
+        if i in keep_indices:
+            pruned.append(dict(msg))
+        else:
+            msg_copy = dict(msg)
+            if i < cutoff_index and msg_copy.get("role") == "tool":
+                msg_copy["content"] = (
+                    str(msg_copy.get("content", ""))[:150]
+                    + "\n... [Older tool result truncated to conserve context]"
+                )
+            pruned.append(msg_copy)
+
+    # Check if we are still over budget
+    if count_message_tokens(pruned) <= context_budget_tokens:
+        return pruned
+
+    # Step 2: Over budget even after tool truncation.
+    # We must drop older messages. We must keep:
+    # - System message at index 0 (if present)
+    # - First user query at index 1 (if present)
+    # - The most recent messages
+    #
+    # CRITICAL: assistant messages that carry `tool_calls` must stay grouped
+    # with their subsequent `tool` result messages. Dropping either half
+    # violates the API contract (tool messages must be paired with the
+    # assistant tool_calls that produced them). We therefore group the
+    # conversation into "units" and drop whole units from the oldest end.
+    system_msg = pruned[0] if pruned and pruned[0].get("role") == "system" else None
+    first_user_msg = None
+    start_idx = 0
+    if system_msg:
+        start_idx = 1
+    if len(pruned) > start_idx and pruned[start_idx].get("role") == "user":
+        first_user_msg = pruned[start_idx]
+        start_idx += 1
+
+    # Keep list of system and first user message
+    essential = []
+    if system_msg:
+        essential.append(system_msg)
+    if first_user_msg:
+        essential.append(first_user_msg)
+
+    essential_tokens = count_message_tokens(essential)
+    budget_left = context_budget_tokens - essential_tokens
+
+    # Build units: a standalone message, or an (assistant + tool results) block.
+    units: List[List[Dict[str, Any]]] = []
+    k = 0
+    remaining = pruned[start_idx:]
+    while k < len(remaining):
+        msg = remaining[k]
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            j = k + 1
+            while j < len(remaining) and remaining[j].get("role") == "tool":
+                j += 1
+            units.append(remaining[k:j])
+            k = j
+        else:
+            units.append([msg])
+            k += 1
+
+    # Collect units from the newest end until we run out of budget.
+    recent_msgs: List[Dict[str, Any]] = []
+    for unit in reversed(units):
+        unit_tokens = count_message_tokens(unit)
+        # Always keep the newest unit (the live turn), then only what fits.
+        if not recent_msgs or budget_left - unit_tokens >= 0:
+            recent_msgs = unit + recent_msgs
+            budget_left -= unit_tokens
+        else:
+            # Out of budget! Stop including older messages.
+            break
+
+    # Construct pruned list
+    final_messages = essential + recent_msgs
+    return final_messages
+
+
+def _fallback_to_xml_tool_calling(
+    config: Config, messages: List[Dict[str, Any]], reason: str
+) -> None:
+    """Flip an endpoint off native function calling (shared by all fallbacks).
+
+    Sets ``disable_native_tools``, rebuilds the system prompt with XML
+    instructions, and normalizes history on the next call. Never raises.
+    """
+    try:
+        secho(
+            f"\nWarning: {reason}",
+            fg=typer.colors.YELLOW,
+            bold=True,
+        )
+        secho(
+            "Falling back to prompt-based XML tool calling...\n",
+            fg=typer.colors.YELLOW,
+        )
+        config.disable_native_tools = True
+        if (
+            messages
+            and isinstance(messages, list)
+            and messages[0].get("role") == "system"
+        ):
+            from nimcode.context import generate_workspace_map
+
+            w_map = generate_workspace_map(str(config.workspace_root))
+            messages[0]["content"] = build_system_prompt(
+                str(config.workspace_root), w_map, disable_native_tools=True
+            )
+    except Exception:
+        try:
+            config.disable_native_tools = True
+        except Exception:
+            pass
+
+
 def call_nim_with_retry(
     client: OpenAI,
     messages: List[Dict[str, Any]],
@@ -210,6 +410,7 @@ def call_nim_with_retry(
     config: Config,
     max_retries: int = 3,
     timeout: Optional[float] = None,
+    _context_budget: Optional[int] = None,
 ):
     """
     Calls the NVIDIA NIM OpenAI endpoint with exponential backoff for transient errors.
@@ -218,7 +419,8 @@ def call_nim_with_retry(
     import threading
 
     # Prune history to satisfy context budget constraint!
-    pruned_messages = prune_history(messages, config.context_budget_tokens)
+    budget = _context_budget or config.context_budget_tokens
+    pruned_messages = prune_history(messages, budget)
 
     normalized_messages = normalize_messages(
         pruned_messages, disable_native_tools=config.disable_native_tools
@@ -255,20 +457,36 @@ def call_nim_with_retry(
             t.start()
 
             while t.is_alive():
-                if sys.platform == "win32":
-                    import msvcrt
+                from nimcode.ui import output
 
-                    if msvcrt.kbhit():
-                        key = msvcrt.getch()
-                        if key in [b"\x1b", b"\x03"]:
-                            raise KeyboardInterrupt("ESC_CANCELLED")
+                tui_instance = getattr(output, "TUI_INSTANCE", None)
+                if tui_instance is not None:
+                    if getattr(tui_instance, "_interrupted", False):
+                        tui_instance._interrupted = False
+                        raise KeyboardInterrupt("ESC_CANCELLED")
+                else:
+                    if (
+                        sys.platform == "win32"
+                        and sys.stdin is not None
+                        and sys.stdin.isatty()
+                    ):
+                        import msvcrt
+
+                        if msvcrt.kbhit():
+                            key = msvcrt.getch()
+                            if key in [b"\x1b", b"\x03"]:
+                                raise KeyboardInterrupt("ESC_CANCELLED")
                 time.sleep(0.05)
 
             if "err" in error_box:
                 raise error_box["err"]
 
             res = result_box.get("res")
-            if res and hasattr(res, "choices") and not res.choices:
+            if res is None:
+                raise RuntimeError(
+                    "The model API call failed without a response or error. Retrying may help."
+                )
+            if hasattr(res, "choices") and not getattr(res, "choices", None):
                 raise RuntimeError(
                     f"The model API returned a response with an empty 'choices' list. "
                     f"This commonly occurs for models like MiniMax-M3 if the 'max_tokens' parameter is not specified or if there is a server-side error. "
@@ -288,150 +506,215 @@ def call_nim_with_retry(
                     or "enable-auto-tool-choice" in err_str
                 )
             ):
+                _fallback_to_xml_tool_calling(
+                    config,
+                    messages,
+                    "Native auto tool choice is not supported/configured on this server.",
+                )
+                # Retry immediately
+                return call_nim_with_retry(
+                    client,
+                    messages,
+                    None,
+                    model,
+                    config,
+                    max_retries=max_retries,
+                    timeout=timeout,
+                    _context_budget=_context_budget,
+                )
+
+            if not config.disable_native_tools and (
+                ("degraded function" in err_str)
+                or ("degraded" in err_str and "function" in err_str)
+            ):
+                _fallback_to_xml_tool_calling(
+                    config, messages, "Function calling is degraded on this server."
+                )
+                return call_nim_with_retry(
+                    client,
+                    messages,
+                    None,
+                    model,
+                    config,
+                    max_retries=max_retries,
+                    timeout=timeout,
+                    _context_budget=_context_budget,
+                )
+
+            if (
+                tools
+                and not config.disable_native_tools
+                and (
+                    "function" in err_str
+                    and ("not found" in err_str or "not_found" in err_str)
+                    and (
+                        "404" in err_str
+                        or "no longer" in err_str
+                        or "unknown function" in err_str
+                    )
+                )
+            ):
+                # NIM account-scoped function registry rejects the native call
+                # (e.g. 404 "Function '<id>': Not found for account"). The
+                # endpoint can't do native function calling here — go XML.
+                _fallback_to_xml_tool_calling(
+                    config,
+                    messages,
+                    "This endpoint rejected native function calling "
+                    "(function not found for your account).",
+                )
+                return call_nim_with_retry(
+                    client,
+                    messages,
+                    None,
+                    model,
+                    config,
+                    max_retries=max_retries,
+                    timeout=timeout,
+                    _context_budget=_context_budget,
+                )
+
+            if (
+                "function" in err_str
+                and ("not found" in err_str or "not_found" in err_str)
+                and ("404" in err_str or "unknown function" in err_str)
+            ):
+                # Still failing with no native tools in play: the model (or
+                # the key's account) is rejected server-side. No retry
+                # strategy can fix that — say what to change instead of
+                # dumping the raw payload.
+                raise RuntimeError(
+                    f"Request rejected (404 function-not-found for your account) "
+                    f"even without function calling. Model: '{model}'. This is "
+                    f"an account/model issue, not a tools issue. Try: "
+                    f"1) '/models-refresh' then '/model' to switch to a model "
+                    f"available to your key; 2) verify NVIDIA_API_KEY belongs "
+                    f"to an account entitled for '{model}'. "
+                    f"Server detail: {e}"
+                )
+
+            if (
+                "max context length" in err_str
+                or "context length exceeded" in err_str
+                or "context window" in err_str
+                or "too many tokens" in err_str
+            ):
+                # Halve the budget on every overflow (with a floor). Previously
+                # each retry re-halved config's budget -> identical payload ->
+                # unbounded recursion until RecursionError.
+                new_budget = budget // 2
+                if new_budget < 1000:
+                    raise
                 secho(
-                    "\nWarning: Native auto tool choice is not supported/configured on this server.",
+                    "\nWarning: Context length exceeded. Pruning history and retrying...",
                     fg=typer.colors.YELLOW,
                     bold=True,
                 )
-                secho(
-                    "Falling back to prompt-based XML tool calling...\n",
-                    fg=typer.colors.YELLOW,
-                )
-                config.disable_native_tools = True
-                # Re-build system prompt for messages to include XML instructions
-                if messages and messages[0].get("role") == "system":
-                    from nimcode.context import generate_workspace_map
 
-                    w_map = generate_workspace_map(str(config.workspace_root))
-                    messages[0]["content"] = build_system_prompt(
-                        str(config.workspace_root), w_map, disable_native_tools=True
-                    )
-                # Retry immediately
+                pruned_messages = prune_history(
+                    messages,
+                    context_budget_tokens=new_budget,
+                    max_turns_retained=max(10, config.max_loop_iterations),
+                )
                 return call_nim_with_retry(
-                    client, messages, None, model, config, max_retries=max_retries
+                    client,
+                    pruned_messages,
+                    tools,
+                    model,
+                    config,
+                    max_retries=max_retries,
+                    timeout=timeout,
+                    _context_budget=new_budget,
                 )
 
-            # Catch OpenAI API errors or timeout errors
             if attempt == max_retries - 1:
+                if any(
+                    s in err_str
+                    for s in (
+                        "429",
+                        "rate limit",
+                        "resourceexhausted",
+                        "503",
+                        "service unavailable",
+                        "overloaded",
+                    )
+                ):
+                    secho(
+                        "Tip: the endpoint is rate-limiting or out of capacity "
+                        "— wait ~1 min and retry, or '/model' to switch to a "
+                        "model with more headroom.",
+                        fg=typer.colors.YELLOW,
+                    )
                 raise
-            wait_time = (2**attempt) * 2
+            # Don't retry deterministic client errors (except rate limits):
+            # re-sending the identical request can only fail identically.
+            if (
+                any(
+                    s in err_str
+                    for s in (
+                        "400",
+                        "bad request",
+                        "401",
+                        "unauthorized",
+                        "invalid api key",
+                        "incorrect api key",
+                        "403",
+                        "forbidden",
+                        "404",
+                        "not found",
+                        "422",
+                        "unprocessable",
+                    )
+                )
+                and "429" not in err_str
+                and "rate limit" not in err_str
+            ):
+                if "404" in err_str and "model" in err_str:
+                    secho(
+                        "Tip: the model id may be retired — run "
+                        "'nimcode refresh-models' or '/models-refresh'.",
+                        fg=typer.colors.YELLOW,
+                    )
+                raise
+            import random as _rand
+
+            wait_time = min(30, (2**attempt) * 2 + _rand.uniform(0, 1))
             echo(
-                f"\nAPI error ({e}). Retrying in {wait_time}s... (Attempt {attempt + 1}/{max_retries})"
+                f"\nAPI error ({e}). Retrying in {wait_time:.1f}s... (Attempt {attempt + 1}/{max_retries})"
             )
             time.sleep(wait_time)
-
-
-def prune_history(
-    messages: List[Dict[str, Any]],
-    context_budget_tokens: int = 16000,
-    max_turns_retained: int = 20,
-) -> List[Dict[str, Any]]:
-    """
-    Prunes long conversation histories to satisfy context budget constraints.
-    First, it truncates older tool messages.
-    If the list is still over the token budget, it drops older user/assistant turns
-    while preserving the system prompt, first user prompt, and the most recent turns.
-    """
-    if not messages:
-        return []
-
-    # Calculate current token estimate
-    def get_tokens(msg_list):
-        return sum(
-            (len(str(m.get("content", ""))) + len(str(m.get("tool_calls", "")))) // 4
-            for m in msg_list
-        )
-
-    estimated_tokens = get_tokens(messages)
-    if (
-        len(messages) <= max_turns_retained
-        and estimated_tokens <= context_budget_tokens
-    ):
-        return messages
-
-    # Step 1: Truncate older tool results
-    pruned = []
-    # Always keep system message and initial user prompt intact
-    keep_indices = set(range(min(2, len(messages))))
-    cutoff_index = max(2, len(messages) - max_turns_retained)
-
-    for i in range(len(messages)):
-        msg = messages[i]
-        if i in keep_indices:
-            pruned.append(dict(msg))
-        else:
-            msg_copy = dict(msg)
-            if i < cutoff_index and msg_copy.get("role") == "tool":
-                msg_copy["content"] = (
-                    str(msg_copy.get("content", ""))[:150]
-                    + "\n... [Older tool result truncated to conserve context]"
-                )
-            pruned.append(msg_copy)
-
-    # Check if we are still over budget
-    if get_tokens(pruned) <= context_budget_tokens:
-        return pruned
-
-    # Step 2: Over budget even after tool truncation.
-    # We must drop older messages. We must keep:
-    # - System message at index 0 (if present)
-    # - First user query at index 1 (if present)
-    # - The most recent messages
-    system_msg = pruned[0] if pruned and pruned[0].get("role") == "system" else None
-    first_user_msg = None
-    start_idx = 0
-    if system_msg:
-        start_idx = 1
-    if len(pruned) > start_idx and pruned[start_idx].get("role") == "user":
-        first_user_msg = pruned[start_idx]
-        start_idx += 1
-
-    # Keep list of system and first user message
-    essential = []
-    if system_msg:
-        essential.append(system_msg)
-    if first_user_msg:
-        essential.append(first_user_msg)
-
-    essential_tokens = get_tokens(essential)
-    budget_left = context_budget_tokens - essential_tokens
-
-    # Collect remaining messages from the end of the list until we run out of budget
-    recent_msgs = []
-    for msg in reversed(pruned[start_idx:]):
-        msg_tokens = get_tokens([msg])
-        if budget_left - msg_tokens >= 0 or not recent_msgs:
-            recent_msgs.append(msg)
-            budget_left -= msg_tokens
-        else:
-            # Out of budget! Stop including older messages.
-            break
-
-    recent_msgs.reverse()
-
-    # Construct pruned list
-    final_messages = essential + recent_msgs
-    return final_messages
 
 
 def log_turn(message_or_dict: Any, session_path: Path):
     """
     Logs the turn and persists session history to the specific session file.
+    Atomic (temp + os.replace) and JSON-safe (default=str) so a crash or
+    non-serializable tool args can never corrupt the session.
     """
+    import tempfile
+
     try:
+        try:
+            cleaned = clean_surrogates(message_or_dict)
+        except Exception:
+            cleaned = message_or_dict
         data = []
         if session_path.exists():
-            with open(session_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            try:
+                with open(session_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    data = loaded if isinstance(loaded, list) else []
+            except Exception:
+                data = []
 
-        if isinstance(message_or_dict, dict):
-            entry = message_or_dict
+        if isinstance(cleaned, dict):
+            entry = cleaned
         else:
             entry = {
-                "role": getattr(message_or_dict, "role", "assistant"),
-                "content": getattr(message_or_dict, "content", ""),
+                "role": getattr(cleaned, "role", "assistant"),
+                "content": getattr(cleaned, "content", ""),
             }
-            if hasattr(message_or_dict, "tool_calls") and message_or_dict.tool_calls:
+            if hasattr(cleaned, "tool_calls") and cleaned.tool_calls:
                 entry["tool_calls"] = [
                     {
                         "id": tc.id,
@@ -441,21 +724,259 @@ def log_turn(message_or_dict: Any, session_path: Path):
                             "arguments": tc.function.arguments,
                         },
                     }
-                    for tc in message_or_dict.tool_calls
+                    for tc in cleaned.tool_calls
                 ]
 
         data.append(entry)
-        with open(session_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        # Don't crash agent loop on logging issue
-        pass
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(session_path.parent), prefix=".session_tmp_"
+        )
+        try:
+            with open(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+            os.replace(tmp_name, session_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except Exception:
+                pass
+            raise
+    except Exception as e:
+        # Don't crash agent loop on logging issue, but don't swallow silently.
+        try:
+            print(f"Warning: failed to persist session turn: {e}", flush=True)
+        except Exception:
+            pass
+
+
+def aggregate_session_stats(workspace_root: Path) -> Dict[str, Any]:
+    """
+    Aggregates statistics from all session files in the project's session directory.
+    Returns a dictionary with overview, cost/tokens, and tool usage statistics.
+    """
+    from collections import Counter
+    from datetime import datetime
+
+    session_dir = get_project_nimcode_dir(workspace_root) / SESSION_DIR
+    if not session_dir.exists():
+        return {
+            "overview": {"total_sessions": 0, "total_messages": 0, "days_active": 0},
+            "tokens": {"input": 0, "output": 0, "total": 0},
+            "tool_usage": {},
+            "error": "No session directory found",
+        }
+
+    session_files = list(session_dir.glob("*.json"))
+    if not session_files:
+        return {
+            "overview": {"total_sessions": 0, "total_messages": 0, "days_active": 0},
+            "tokens": {"input": 0, "output": 0, "total": 0},
+            "tool_usage": {},
+            "error": "No session files found",
+        }
+
+    total_messages = 0
+    tool_counter: Counter[str] = Counter()
+    dates = set()
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    for session_file in session_files:
+        try:
+            with open(session_file, "r", encoding="utf-8") as f:
+                messages = json.load(f)
+
+            if not isinstance(messages, list):
+                continue
+
+            # Extract date from filename if possible (session_YYYYMMDD_HHMMSS.json)
+            try:
+                date_str = session_file.stem.split("_")[1]
+                date_obj = datetime.strptime(date_str, "%Y%m%d")
+                dates.add(date_obj.date())
+            except Exception:
+                # Fallback to file modification time
+                mtime = datetime.fromtimestamp(session_file.stat().st_mtime)
+                dates.add(mtime.date())
+
+            total_messages += len(messages)
+
+            for msg in messages:
+                role = msg.get("role", "")
+                content = msg.get("content", "") or ""
+
+                # Count tokens roughly (input = user + system, output = assistant + tool)
+                if role in ("user", "system"):
+                    total_input_tokens += len(content) // 4
+                elif role == "assistant":
+                    total_output_tokens += len(content) // 4
+
+                # Count tool calls
+                tool_calls = msg.get("tool_calls", [])
+                if tool_calls:
+                    for tc in tool_calls:
+                        func = tc.get("function", {})
+                        name = func.get("name", "unknown")
+                        tool_counter[name] += 1
+
+        except Exception:
+            # Skip corrupt session files
+            continue
+
+    return {
+        "overview": {
+            "total_sessions": len(session_files),
+            "total_messages": total_messages,
+            "days_active": len(dates),
+        },
+        "tokens": {
+            "input": total_input_tokens,
+            "output": total_output_tokens,
+            "total": total_input_tokens + total_output_tokens,
+        },
+        "tool_usage": dict(tool_counter),
+        "error": None,
+    }
+
+
+def render_stats_rich(
+    stats: Dict[str, Any], console: Optional[Any] = None, tui: Optional[Any] = None
+) -> None:
+    """
+    Renders statistics using Rich components (Panels, Tables, text histograms), or returns markdown if TUI is provided.
+    """
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich.console import Group
+
+    overview = stats.get("overview", {})
+    tokens = stats.get("tokens", {})
+    tool_usage = stats.get("tool_usage", {})
+    error = stats.get("error")
+
+    if tui is not None:
+        if error:
+            tui.add_message(
+                "system",
+                f"\n[yellow]No historical data found yet.[/yellow]\n*Detail: {error}*",
+                markdown=True,
+            )
+            return None
+
+        lines = [
+            "### nimcode Usage Statistics",
+            "",
+            "**Overview**",
+            f"- **Total Sessions:** {overview.get('total_sessions', 0):,}",
+            f"- **Total Messages:** {overview.get('total_messages', 0):,}",
+            f"- **Days Active:** {overview.get('days_active', 0):,}",
+            "",
+            "**Tokens**",
+            f"- **Input Tokens:** {tokens.get('input', 0):,}",
+            f"- **Output Tokens:** {tokens.get('output', 0):,}",
+            f"- **Total Tokens:** {tokens.get('total', 0):,}",
+            "",
+        ]
+        if tool_usage:
+            lines.append("**Tool Usage**")
+            sorted_tools = sorted(tool_usage.items(), key=lambda x: x[1], reverse=True)
+            max_count = sorted_tools[0][1] if sorted_tools else 1
+            for tool, count in sorted_tools:
+                pct = (count / max_count) * 100
+                lines.append(f"- **{tool}:** {count} ({pct:.1f}%)")
+        else:
+            lines.append("No tool usage recorded.")
+        tui.add_message("system", "\n".join(lines), markdown=True)
+        return None
+
+    if console is None:
+        from nimcode.ui.output import console as global_console
+
+        console = global_console
+
+    if error:
+        console.print(
+            Panel(
+                f"[yellow]No historical data found yet.[/yellow]\n[dim]{error}[/dim]",
+                title="[bold cyan]nimcode Stats[/bold cyan]",
+                border_style="yellow",
+            )
+        )
+        return None
+
+    # Overview Panel
+    overview_table = Table(show_header=False, box=None, padding=(0, 1))
+    overview_table.add_column("Metric", style="bold cyan")
+    overview_table.add_column("Value", style="bold white")
+    overview_table.add_row("Total Sessions", f"{overview.get('total_sessions', 0):,}")
+    overview_table.add_row("Total Messages", f"{overview.get('total_messages', 0):,}")
+    overview_table.add_row("Days Active", f"{overview.get('days_active', 0):,}")
+
+    # Tokens Panel
+    token_table = Table(show_header=False, box=None, padding=(0, 1))
+    token_table.add_column("Type", style="bold cyan")
+    token_table.add_column("Count", style="bold white")
+    token_table.add_row("Input Tokens", f"{tokens.get('input', 0):,}")
+    token_table.add_row("Output Tokens", f"{tokens.get('output', 0):,}")
+    token_table.add_row("Total Tokens", f"{tokens.get('total', 0):,}")
+
+    # Tool Usage Histogram
+    if tool_usage:
+        sorted_tools = sorted(tool_usage.items(), key=lambda x: x[1], reverse=True)
+        max_count = sorted_tools[0][1] if sorted_tools else 1
+        max_bar_width = 30
+
+        tool_lines = []
+        for tool, count in sorted_tools:
+            pct = (count / max_count) * 100
+            bar_width = int((count / max_count) * max_bar_width)
+            bar = "█" * bar_width
+            tool_lines.append(
+                Text.assemble(
+                    (f"{tool:<20}", "bold white"),
+                    (f" {count:>5} ", "bold cyan"),
+                    (f" ({pct:5.1f}%) ", "dim"),
+                    (bar, "green"),
+                )
+            )
+        tool_content = (
+            Group(*tool_lines)
+            if tool_lines
+            else Text("No tool usage recorded", style="dim")
+        )
+    else:
+        tool_content = Text("No tool usage recorded", style="dim")
+
+    # Combine all panels
+    console.print(
+        Panel(
+            Group(
+                Panel(
+                    overview_table, title="[bold]Overview[/bold]", border_style="cyan"
+                ),
+                "",
+                Panel(token_table, title="[bold]Tokens[/bold]", border_style="green"),
+                "",
+                Panel(
+                    tool_content,
+                    title="[bold]Tool Usage[/bold]",
+                    border_style="magenta",
+                ),
+            ),
+            title="[bold cyan]nimcode Usage Statistics[/bold cyan]",
+            border_style="blue",
+            padding=(1, 2),
+        )
+    )
 
 
 def run_init_command(
     config: Config,
     client: Optional[OpenAI] = None,
     workspace_root: Optional[Path] = None,
+    tui: Optional[Any] = None,
 ) -> str:
     """
     Initializes or updates an AGENTS.md file in the workspace root.
@@ -466,7 +987,13 @@ def run_init_command(
     root = Path(workspace_root if workspace_root else config.workspace_root).resolve()
     agents_md_path = root / "AGENTS.md"
 
-    console.print(
+    def _output(msg: str, **kwargs):
+        if tui is not None:
+            tui.add_message("system", msg)
+        else:
+            console.print(msg, **kwargs)
+
+    _output(
         f"[bold cyan]Scanning workspace at {root} for initialization markers...[/bold cyan]"
     )
 
@@ -490,21 +1017,21 @@ def run_init_command(
     stack_summary = (
         ", ".join(stack_info) if stack_info else "General Project / Unknown Stack"
     )
-    console.print(f"[dim]Detected Tech Stack: {stack_summary}[/dim]")
+    _output(f"[dim]Detected Tech Stack: {stack_summary}[/dim]")
 
     existing_content = ""
     is_update = agents_md_path.exists()
     if is_update:
         existing_content = agents_md_path.read_text(encoding="utf-8").strip()
-        console.print(
+        _output(
             f"[yellow]Found existing AGENTS.md ({len(existing_content)} chars). Updating/Enriching...[/yellow]"
         )
     else:
-        console.print("[cyan]Creating new AGENTS.md...[/cyan]")
+        _output("[cyan]Creating new AGENTS.md...[/cyan]")
 
     # If we have an active client, use the AI model to generate/update
     if client is not None:
-        console.print(
+        _output(
             f"[cyan]Asking model ({config.fast_model}) to generate/enrich AGENTS.md for this repository...[/cyan]"
         )
         try:
@@ -542,22 +1069,19 @@ Please output an updated, enriched, and well-structured markdown for `AGENTS.md`
                 res.choices[0].message.content or ""
             ).strip()
             # If model wrapped in ```markdown ... ``` strip the fences
-            if new_content.startswith("```markdown"):
-                new_content = new_content[len("```markdown") :].strip()
-                if new_content.endswith("```"):
-                    new_content = new_content[:-3].strip()
-            elif new_content.startswith("```"):
-                new_content = new_content[3:].strip()
+            # (any info string: ```markdown, ```md, ...)
+            if new_content.startswith("```"):
+                new_content = new_content.partition("\n")[2].strip()
                 if new_content.endswith("```"):
                     new_content = new_content[:-3].strip()
 
             if new_content:
                 agents_md_path.write_text(new_content, encoding="utf-8")
                 msg = f"AGENTS.md successfully {'updated' if is_update else 'created'} via AI at {agents_md_path}"
-                console.print(f"[bold green]{msg}[/bold green]")
+                _output(f"[bold green]{msg}[/bold green]")
                 return msg
         except Exception as e:
-            console.print(
+            _output(
                 f"[yellow]AI generation failed ({e}). Falling back to template initialization.[/yellow]"
             )
 
@@ -586,18 +1110,18 @@ Please output an updated, enriched, and well-structured markdown for `AGENTS.md`
 """
         agents_md_path.write_text(template.strip() + "\n", encoding="utf-8")
         msg = f"AGENTS.md initialized from template at {agents_md_path}"
-        console.print(f"[bold green]{msg}[/bold green]")
+        _output(f"[bold green]{msg}[/bold green]")
         return msg
     else:
         msg = f"AGENTS.md already exists at {agents_md_path} and client is offline."
-        console.print(f"[yellow]{msg}[/yellow]")
+        _output(f"[yellow]{msg}[/yellow]")
         return msg
 
 
 def enable_persistent_prompt(state, config, workspace_root, last_input):
     import shutil
     import sys
-    from nimcode.config import AVAILABLE_MODELS
+    from nimcode.config_models import display_name
 
     term_width, term_height = shutil.get_terminal_size()
     # Scroll region: lines 1 to height-4
@@ -622,11 +1146,7 @@ def enable_persistent_prompt(state, config, workspace_root, last_input):
         if state != AgentState.AWAITING_PLAN_APPROVAL
         else config.plan_model
     )
-    model_name = model_id
-    for m in AVAILABLE_MODELS.values():
-        if m["id"] == model_id:
-            model_name = m["name"]
-            break
+    model_name = display_name(model_id)
 
     hline = symbol("hline")
     mode_label = f"{hline}{hline} {mode_name} "
@@ -925,7 +1445,7 @@ def run_agent_loop(
 
             def get_bottom_toolbar():
                 import shutil
-                from nimcode.config import AVAILABLE_MODELS
+                from nimcode.config_models import display_name
 
                 term_width = shutil.get_terminal_size().columns
                 if (
@@ -945,11 +1465,7 @@ def run_agent_loop(
                     else config.plan_model
                 )
 
-                model_name = model_id
-                for m in AVAILABLE_MODELS.values():
-                    if m["id"] == model_id:
-                        model_name = m["name"]
-                        break
+                model_name = display_name(model_id)
 
                 hline = symbol("hline")
                 left_str = f"{hline}{hline} ({pwd}) "
@@ -1652,6 +2168,13 @@ def run_agent_loop(
                     .strip()
                     .lower()
                 )
+                is_yolo_target = approval == "yolo" or (
+                    approval == "y"
+                    and (
+                        state == AgentState.YOLO
+                        or getattr(config, "mode", "") == "yolo"
+                    )
+                )
                 if approval in ("q", "n", ""):
                     # Cancel plan — stay in session, let user redirect
                     secho(
@@ -1687,7 +2210,7 @@ def run_agent_loop(
                     log_turn(user_msg, session_path)
                     loop_count = 0
                     continue
-                elif approval == "yolo":
+                elif is_yolo_target:
                     state = AgentState.YOLO
                     config.mode = "yolo"
                     current_model = config.fast_model
@@ -1781,14 +2304,15 @@ def run_agent_loop(
                         fg=typer.colors.YELLOW,
                         bold=True,
                     )
-                    for tc in raw_message.tool_calls:
-                        cancel_msg = {
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": "Execution cancelled by user (loop limit reached). Awaiting new instructions.",
-                        }
-                        messages.append(cancel_msg)
-                        log_turn(cancel_msg, session_path)
+                    if raw_message and raw_message.tool_calls:
+                        for tc in raw_message.tool_calls:
+                            cancel_msg = {
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": "Execution cancelled by user (loop limit reached). Awaiting new instructions.",
+                            }
+                            messages.append(cancel_msg)
+                            log_turn(cancel_msg, session_path)
                     loop_count = 0
                     user_input = get_user_turn()
                     if user_input is None or user_input.lower() in [
@@ -1812,14 +2336,15 @@ def run_agent_loop(
                     loop_count = 0
                     continue
                 elif user_input.lower() != "y":
-                    for tc in raw_message.tool_calls:
-                        cancel_msg = {
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": f"Execution redirected by user. Feedback: {user_input}",
-                        }
-                        messages.append(cancel_msg)
-                        log_turn(cancel_msg, session_path)
+                    if raw_message and raw_message.tool_calls:
+                        for tc in raw_message.tool_calls:
+                            cancel_msg = {
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": f"Execution redirected by user. Feedback: {user_input}",
+                            }
+                            messages.append(cancel_msg)
+                            log_turn(cancel_msg, session_path)
                     loop_count = 0
                     continue
                 loop_count = 0
@@ -1877,7 +2402,7 @@ def run_agent_loop(
                             "patch_file_ast",
                             "patch_file_blocks",
                         ]:
-                            from nimcode.tools import execute_test_runner
+                            from nimcode.tools import execute_test_runner, tests_passed
 
                             secho(
                                 "\n[YOLO Mode] Code changed. Auto-running test suite for verification...",
@@ -1889,10 +2414,7 @@ def run_agent_loop(
                                 f"--- Test Results ---\n{test_res}\n--------------------",
                                 fg=typer.colors.CYAN,
                             )
-                            if (
-                                "[exit code: 0]" not in test_res
-                                and "exit code: 0" not in test_res
-                            ):
+                            if not tests_passed(test_res):
                                 result += f"\n\n[CRITICAL WARNING: Auto-run tests failed! Please fix this immediately]\n{test_res}"
                     else:
                         feedback = prompt_user(

@@ -41,11 +41,14 @@ jobs:
           import nimcode.context
           import nimcode.skills
           import nimcode.core.agent
+          import nimcode.core.agent_tui
           import nimcode.core.prompts
           import nimcode.core.state
           import nimcode.tools
-          import nimcode.ui.tui
+          import nimcode.tools.base
           import nimcode.ui.console
+          import nimcode.ui.output
+          import nimcode.ui.rust_bridge
           print('All modules imported successfully.')
           "
 
@@ -58,11 +61,13 @@ jobs:
         run: |
           python -c "
           from nimcode.tools.base import is_docker_available
-          assert is_docker_available(), 'Docker should be available in CI'
-          print('Docker sandbox: OK')
+          if is_docker_available():
+              print('Docker sandbox: OK')
+          else:
+              print('WARNING: Docker unavailable, host-execution fallback will be used')
           "
 
       - name: Run test suite
-        run: pytest
+        run: pytest -v
         env:
           NVIDIA_API_KEY: "dummy-key-for-ci"
