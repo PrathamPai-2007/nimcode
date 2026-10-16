@@ -3,7 +3,6 @@ TUI-aware async agent loop - replaces the old ANSI-based run_agent_loop.
 """
 
 import asyncio
-import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
@@ -28,10 +27,13 @@ from nimcode.core.agent import (
     parse_xml_tool_calls,
     MockMessage,
     SESSION_DIR,
+    migrate_legacy_session,
+    open_session_path,
     count_message_tokens,
     aggregate_session_stats,
     render_stats_rich,
 )
+from nimcode.config_models import effective_budget
 from nimcode.context import generate_workspace_map
 from nimcode.ui.rust_bridge import RustTUI
 from nimcode.tools.swarm import ACTIVE_SUBAGENTS
@@ -181,20 +183,14 @@ async def _run_agent_loop_tui_internal(
     session_dir = get_project_nimcode_dir(workspace_root) / SESSION_DIR
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    legacy_session = workspace_root / ".nimcode_session.json"
-    if legacy_session.exists():
-        import shutil
+    try:
+        migrated = migrate_legacy_session(workspace_root, session_dir)
+        if migrated:
+            tui.add_message("system", f"Migrated legacy session to {migrated}")
+    except OSError as e:
+        tui.add_message("system", f"Warning: could not migrate legacy session: {e}")
 
-        shutil.move(str(legacy_session), str(session_dir / "legacy_session.json"))
-        tui.add_message(
-            "system", f"Migrated legacy session to {SESSION_DIR}/legacy_session.json"
-        )
-
-    if not session_file_name:
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        session_file_name = f"session_{timestamp}.json"
-
-    session_path = session_dir / session_file_name
+    session_path = open_session_path(session_dir, session_file_name, existing_messages)
     user_input: Optional[str] = user_prompt
 
     messages: list[dict[str, Any]] = []
@@ -214,6 +210,15 @@ async def _run_agent_loop_tui_internal(
     skip_first_api_call = False
 
     loop_count = 0
+
+    def _budget() -> int:
+        """Pruning budget for the model the next call will use."""
+        model = (
+            config.plan_model
+            if state == AgentState.AWAITING_PLAN_APPROVAL
+            else config.fast_model
+        )
+        return effective_budget(config, model)
 
     async def handle_command(user_input: str) -> str:
         nonlocal state, messages, session_path, loop_count, skip_first_api_call
@@ -310,7 +315,7 @@ async def _run_agent_loop_tui_internal(
                 )
                 return "command"
             tui.add_message("system", "Refreshing model catalog from NIM API...")
-            catalog, msg = _cm.refresh_models_blocking(client)
+            catalog, msg = await asyncio.to_thread(_cm.refresh_models_blocking, client)
             tui.add_message("system", msg)
             notice = _cm.reconcile_saved_model(config, catalog)
             if notice:
@@ -343,7 +348,9 @@ async def _run_agent_loop_tui_internal(
                 "system",
                 "\nRunning test suite inside validation sandbox...",
             )
-            res = execute_test_runner(root_path, config, test_cmd)
+            res = await asyncio.to_thread(
+                execute_test_runner, root_path, config, test_cmd
+            )
             tui.add_message(
                 "tool",
                 f"\n--- Test Runner Results ---\n{res}\n---------------------------",
@@ -382,7 +389,7 @@ async def _run_agent_loop_tui_internal(
         elif cmd_lower == "/compact":
             tui.add_message("system", "Compacting session history...")
             before = len(messages)
-            messages = prune_history(messages, config.context_budget_tokens)
+            messages = prune_history(messages, _budget())
             freed = before - len(messages)
             if freed:
                 tui.add_message(
@@ -423,8 +430,12 @@ async def _run_agent_loop_tui_internal(
         elif cmd_lower == "/init":
             from nimcode.core.agent import run_init_command
 
-            run_init_command(
-                config, client=client, workspace_root=workspace_root, tui=tui
+            await asyncio.to_thread(
+                run_init_command,
+                config,
+                client=client,
+                workspace_root=workspace_root,
+                tui=tui,
             )
             loop_count = 0
             return "command"
@@ -446,11 +457,28 @@ async def _run_agent_loop_tui_internal(
                 tui.add_message("system", "Usage: /install-skill <url>")
             else:
                 url = parts[1].strip()
-                tui.add_message("system", f"Installing skill from {url}...")
+                tui.add_message("system", f"Fetching skill from {url}...")
                 from nimcode import skills as _skills
 
-                result = await asyncio.to_thread(_skills.install_skill, url)
-                tui.add_message("system", result)
+                try:
+                    staging, preview, sha = await asyncio.to_thread(
+                        _skills.fetch_skill, url
+                    )
+                except ValueError as e:
+                    tui.add_message("system", f"Error: {e}")
+                else:
+                    # Human gate: nothing is installed until the user has
+                    # seen the file list, size, sha256 and SKILL.md head.
+                    tui.add_message("tool", preview, markdown=False)
+                    answer = await tui.get_user_confirmation("Install this skill?")
+                    if answer in ("y", "yes"):
+                        result = _skills.commit_skill(
+                            staging, _skills._get_skill_name_from_url(url), url, sha
+                        )
+                    else:
+                        _skills.discard_skill(staging)
+                        result = "Skill install cancelled."
+                    tui.add_message("system", result)
             loop_count = 0
             return "command"
 
@@ -462,6 +490,14 @@ async def _run_agent_loop_tui_internal(
             skill_name = parts[0][1:]
             if skill_name and skill_name in _skills.list_skills():
                 content = _skills.get_skill_content(skill_name)
+                if content is None:
+                    tui.add_message(
+                        "system",
+                        f"Error: skill '{skill_name}' could not be read "
+                        "(missing, unreadable or too large).",
+                    )
+                    loop_count = 0
+                    return "command"
                 rest = parts[1] if len(parts) > 1 else ""
                 user_msg = {
                     "role": "user",
@@ -574,6 +610,15 @@ async def _run_agent_loop_tui_internal(
         except Exception:
             pass
 
+    def _sync_state() -> None:
+        nonlocal state
+        if config.mode == "yolo":
+            state = AgentState.YOLO
+        elif config.mode == "plan":
+            state = AgentState.AWAITING_PLAN_APPROVAL
+        elif config.mode == "build":
+            state = AgentState.EXECUTING
+
     def update_token_estimate():
         """Update token count in sidebar."""
         tokens = count_message_tokens(messages)
@@ -622,12 +667,7 @@ async def _run_agent_loop_tui_internal(
     while True:
         try:
             # Sync state with config.mode (e.g. if switched via Shift+Tab or /config)
-            if config.mode == "yolo":
-                state = AgentState.YOLO
-            elif config.mode == "plan":
-                state = AgentState.AWAITING_PLAN_APPROVAL
-            elif config.mode == "build":
-                state = AgentState.EXECUTING
+            _sync_state()
 
             update_token_estimate()
             update_sidebar_data()
@@ -1022,6 +1062,10 @@ async def _run_agent_loop_tui_internal(
             cancelled_mid_tools = False
             pending_calls = list(raw_message.tool_calls)
             for _call_idx, tool_call in enumerate(pending_calls):
+                # Apply Shift+Tab / Ctrl+C pressed during the previous tool:
+                # leaving YOLO mid-batch restores the approval prompt.
+                tui.poll_events()
+                _sync_state()
                 if _cancel_requested():
                     tui.add_message(
                         "system",
@@ -1082,8 +1126,15 @@ async def _run_agent_loop_tui_internal(
                     elif approval == "y":
                         tui.add_message("system", f"Executing {tool_name}...")
                         try:
-                            result = execute_local_tool(
-                                tool_name, args, workspace_root, config
+                            # ponytail: a running tool can't be interrupted;
+                            # Ctrl+C takes effect before the next tool call.
+                            # Per-tool cancellation is the upgrade path.
+                            result = await asyncio.to_thread(
+                                execute_local_tool,
+                                tool_name,
+                                args,
+                                workspace_root,
+                                config,
                             )
                         except Exception as e:
                             result = f"Error executing '{tool_name}': {e}"
@@ -1107,7 +1158,9 @@ async def _run_agent_loop_tui_internal(
                                 "[YOLO Mode] Code changed. Auto-running test suite for verification...",
                             )
                             try:
-                                test_res = execute_test_runner(workspace_root, config)
+                                test_res = await asyncio.to_thread(
+                                    execute_test_runner, workspace_root, config
+                                )
                             except Exception as e:
                                 test_res = f"Error running tests: {e}"
                             tui.add_message(
@@ -1131,7 +1184,7 @@ async def _run_agent_loop_tui_internal(
                 messages.append(tool_result_msg)
                 log_turn(tool_result_msg, session_path)
 
-            messages = prune_history(messages, config.context_budget_tokens)
+            messages = prune_history(messages, _budget())
             if cancelled_mid_tools:
                 # Back to the user, not straight into another API call.
                 loop_count = 0

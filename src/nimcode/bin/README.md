@@ -1,11 +1,15 @@
-# Bundled nim-tui sidecar binaries (one per platform).
+# Bundled nim-tui sidecar binary (not committed; gitignored).
 #
-# Refresh after changing tui-rs/:
+# Release wheels are built per platform by .github/workflows/release.yml,
+# which compiles tui-rs/ for the target and copies the binary here before
+# `python -m build --wheel`, then retags the wheel for that platform.
+#
+# Local development needs nothing here: find_rust_binary() in
+# ../ui/rust_bridge.py also finds tui-rs/target/release/ after
 #   cargo build --release --manifest-path tui-rs/Cargo.toml
-#   cp tui-rs/target/release/nim-tui[.exe] src/nimcode/bin/
+# or set NIM_TUI_BIN to a binary's path.
 #
-# find_rust_binary() in ../rust_bridge.py picks the bundled binary first,
-# so `pip install .` just works with no extra setup. Linux/macOS contributors:
-# add your `nim-tui` build here alongside the Windows .exe.
+# To build a local wheel by hand, copy tui-rs/target/release/nim-tui[.exe]
+# here first.
 #
 # Standalone check (no Python needed): `nim-tui[.exe] --demo`

@@ -1,0 +1,34 @@
+{
+  "py_to_rust": [
+    {"type": "add_message", "role": "assistant", "content": "**hi** café 😀"},
+    {"type": "system", "content": "notice"},
+    {
+      "type": "update",
+      "sidebar": {
+        "mode": "Build Mode",
+        "model": "MiniMax-M3",
+        "tokens_used": 1200,
+        "tokens_budget": 128000,
+        "cwd": "/work/repo",
+        "is_working": false,
+        "working_message": "",
+        "todos": [{"text": "write tests", "done": false}],
+        "subagents": [{"role": "reviewer", "status": "RUNNING"}],
+        "procs": [{"command": "npm run dev", "pid": "bg_1"}]
+      }
+    },
+    {"type": "set_working", "working": true, "message": "Thinking..."},
+    {"type": "clear"},
+    {"type": "prompt_select", "title": "Select model", "items": ["a", "b"]},
+    {"type": "set_completions", "items": ["/help", "/exit"]},
+    {"type": "quit"}
+  ],
+  "rust_to_py": [
+    {"type": "input", "text": "hello café"},
+    {"type": "select_result", "index": 1},
+    {"type": "select_result", "index": null},
+    {"type": "mode_cycle", "mode": "YOLO Mode"},
+    {"type": "interrupt"},
+    {"type": "eof"}
+  ]
+}

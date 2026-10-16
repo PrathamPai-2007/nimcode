@@ -280,8 +280,9 @@ def resume_subagent_thread(agent_id: str, workspace_root: Path, config: Any):
             max_steps = max(1, max_steps)
 
             from nimcode.core.agent import prune_history
+            from nimcode.config_models import effective_budget
 
-            budget = getattr(config, "context_budget_tokens", None) or 16000
+            budget = effective_budget(config, getattr(config, "fast_model", ""))
             for step in range(max_steps):
                 with _SUBAGENTS_LOCK:
                     status = sub["status"]

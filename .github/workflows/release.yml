@@ -1,0 +1,118 @@
+name: Release
+
+on:
+  push:
+    tags: [ "v*" ]
+
+jobs:
+  wheels:
+    name: wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe: nim-tui.exe
+            plat: win_amd64
+          - os: ubuntu-latest
+            # static musl binary runs on any x86_64 Linux, glibc or musl
+            target: x86_64-unknown-linux-musl
+            exe: nim-tui
+            plat: manylinux_2_17_x86_64.musllinux_1_1_x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            exe: nim-tui
+            plat: macosx_11_0_arm64
+          # macos-13 (the old Intel label) is retired; macos-15-intel is
+          # GitHub's x86_64 macOS image.
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            exe: nim-tui
+            plat: macosx_10_12_x86_64
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl-tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build sidecar
+        run: |
+          cargo build --release --target ${{ matrix.target }} --manifest-path tui-rs/Cargo.toml
+          cp tui-rs/target/${{ matrix.target }}/release/${{ matrix.exe }} src/nimcode/bin/
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build and retag wheel
+        run: |
+          python -m pip install --upgrade pip build wheel
+          python -m build --wheel --outdir dist
+          python -m wheel tags --python-tag py3 --abi-tag none \
+            --platform-tag ${{ matrix.plat }} --remove dist/*.whl
+          ls dist
+
+      - name: Smoke test wheel in a fresh venv
+        env:
+          NVIDIA_API_KEY: "dummy-key-for-ci"
+        # src-layout: the repo root has no importable nimcode/, so this
+        # exercises the installed wheel. Relative paths avoid Windows
+        # backslashes in bash globs.
+        run: |
+          python -m venv .smoke
+          if [ "$RUNNER_OS" = "Windows" ]; then PY=.smoke/Scripts/python.exe; else PY=.smoke/bin/python; fi
+          "$PY" -m pip install dist/*.whl
+          "$PY" -m nimcode status
+          "$PY" -c "
+          import os, pathlib, nimcode
+          b = pathlib.Path(nimcode.__file__).parent / 'bin' / '${{ matrix.exe }}'
+          assert b.is_file() and os.access(b, os.X_OK), b
+          from nimcode.ui.rust_bridge import find_rust_binary
+          assert find_rust_binary().resolve() == b.resolve(), find_rust_binary()
+          print('sidecar OK:', b)
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: dist/*.whl
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist (no sidecar binary)
+        run: |
+          python -m pip install build
+          python -m build --sdist --outdir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  release:
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

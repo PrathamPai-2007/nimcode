@@ -14,10 +14,12 @@ def _tui(monkeypatch):
     return rb.RustTUI(Config())
 
 
-def test_strip_backup_stamp():
-    assert rb._strip_backup_stamp("1712_4321_src_a.py") == "src_a.py"
-    assert rb._strip_backup_stamp("1712_4321_blocks_src_a.py") == "blocks_src_a.py"
-    assert rb._strip_backup_stamp("1712_src_a.py") == "src_a.py"
+def test_parse_legacy_backup_names():
+    from nimcode.tools.base import _parse_backup_name
+
+    assert _parse_backup_name("1712_4321_src_a.py")[1:] == ("src_a.py", "")
+    assert _parse_backup_name("1712_4321_blocks_src_a.py")[1:] == ("src_a.py", "blocks")
+    assert _parse_backup_name("1712_src_a.py")[1:] == ("src_a.py", "")
 
 
 def test_stale_interrupt_does_not_answer_next_prompt(monkeypatch):

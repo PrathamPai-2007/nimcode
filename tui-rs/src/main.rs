@@ -2,7 +2,6 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::{execute, terminal::*};
 use futures::StreamExt;
 use pulldown_cmark::{Event as MdEv, Options, Parser, Tag, TagEnd};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -15,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::Write;
 use tokio::sync::mpsc;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
@@ -156,7 +156,11 @@ impl TermGuard {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
-            let _ = execute!(std::io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+            let _ = execute!(
+                std::io::stdout(),
+                LeaveAlternateScreen,
+                crossterm::cursor::Show
+            );
             prev(info);
         }));
         enable_raw_mode()?;
@@ -167,7 +171,11 @@ impl TermGuard {
 impl Drop for TermGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+        let _ = execute!(
+            std::io::stdout(),
+            LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
     }
 }
 
@@ -284,11 +292,7 @@ fn markdown_lines(md: &str) -> Vec<Line<'static>> {
                     }
                     line_prefix = format!("{}{}", "  ".repeat(depth), marker);
                 }
-                Tag::Paragraph => {
-                    if !cur.is_empty() {
-                        flush(&mut cur, &mut out);
-                    }
-                }
+                Tag::Paragraph if !cur.is_empty() => flush(&mut cur, &mut out),
                 _ => {}
             },
             MdEv::End(end) => match end {
@@ -309,9 +313,7 @@ fn markdown_lines(md: &str) -> Vec<Line<'static>> {
                 TagEnd::List(_) => {
                     list_stack.pop();
                 }
-                TagEnd::TableRow
-                | TagEnd::TableHead
-                | TagEnd::Table => flush(&mut cur, &mut out),
+                TagEnd::TableRow | TagEnd::TableHead | TagEnd::Table => flush(&mut cur, &mut out),
                 TagEnd::Item | TagEnd::Paragraph => flush(&mut cur, &mut out),
                 _ => {}
             },
@@ -330,14 +332,8 @@ fn markdown_lines(md: &str) -> Vec<Line<'static>> {
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::BOLD),
                         ));
-                    } else if sty.quote
-                        && cur.is_empty()
-                        && !part.is_empty()
-                    {
-                        cur.push(Span::styled(
-                            "▌ ",
-                            Style::default().fg(Color::Gray),
-                        ));
+                    } else if sty.quote && cur.is_empty() && !part.is_empty() {
+                        cur.push(Span::styled("▌ ", Style::default().fg(Color::Gray)));
                     }
                     if !part.is_empty() {
                         cur.push(Span::styled(part.to_string(), sty.style()));
@@ -720,9 +716,7 @@ async fn main() -> R {
                     stick_bottom = true;
                     dirty = true;
                 }
-                PyMsg::PromptSelect { title, items } => {
-                    selector = Some((title, items, 0, 0))
-                }
+                PyMsg::PromptSelect { title, items } => selector = Some((title, items, 0, 0)),
                 PyMsg::SetCompletions { items } => {
                     completions = items;
                     comp_idx = 0;
@@ -773,9 +767,7 @@ async fn main() -> R {
                     KeyCode::Up => *idx = idx.saturating_sub(1),
                     KeyCode::Down => *idx = (*idx + 1).min(items.len().saturating_sub(1)),
                     KeyCode::PageUp => *idx = idx.saturating_sub(10),
-                    KeyCode::PageDown => {
-                        *idx = (*idx + 10).min(items.len().saturating_sub(1))
-                    }
+                    KeyCode::PageDown => *idx = (*idx + 10).min(items.len().saturating_sub(1)),
                     KeyCode::Home => *idx = 0,
                     KeyCode::End => *idx = items.len().saturating_sub(1),
                     KeyCode::Enter if !empty => {
@@ -792,9 +784,7 @@ async fn main() -> R {
                         selector = None;
                         out.emit(&RustMsg::SelectResult { index: None }).await;
                     }
-                    KeyCode::Char('c')
-                        if k.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                         selector = None;
                         out.emit(&RustMsg::SelectResult { index: None }).await;
                     }
@@ -811,8 +801,7 @@ async fn main() -> R {
             } else {
                 // slash-command autocomplete popup (client-side filter)
                 let matches = popup_matches(&completions, &input);
-                let dismissed =
-                    comp_dismissed_for.as_deref() == Some(input.as_str());
+                let dismissed = comp_dismissed_for.as_deref() == Some(input.as_str());
                 let popup_open = !matches.is_empty() && !dismissed;
                 if popup_open && comp_idx >= matches.len() {
                     comp_idx = 0;
@@ -832,15 +821,11 @@ async fn main() -> R {
                             };
                         }
                     }
-                    KeyCode::Up if popup_open => {
-                        comp_idx = comp_idx.saturating_sub(1)
-                    }
+                    KeyCode::Up if popup_open => comp_idx = comp_idx.saturating_sub(1),
                     KeyCode::Down if popup_open => {
                         comp_idx = (comp_idx + 1).min(matches.len().saturating_sub(1))
                     }
-                    KeyCode::Esc if popup_open => {
-                        comp_dismissed_for = Some(input.clone())
-                    }
+                    KeyCode::Esc if popup_open => comp_dismissed_for = Some(input.clone()),
                     KeyCode::Enter => {
                         out.emit(&RustMsg::Input {
                             text: std::mem::take(&mut input),
@@ -910,8 +895,8 @@ async fn main() -> R {
         }
 
         let w_for_md: usize = term.size()?.width.saturating_sub(41) as usize;
-        let spin_due = sidebar.is_working
-            && last_spin.elapsed() >= std::time::Duration::from_millis(100);
+        let spin_due =
+            sidebar.is_working && last_spin.elapsed() >= std::time::Duration::from_millis(100);
         if spin_due {
             last_spin = tokio::time::Instant::now();
             spinner = spinner.wrapping_add(1);
@@ -923,23 +908,23 @@ async fn main() -> R {
             dirty = false;
             let mut lines: Vec<Line> = vec![];
             for (role, content) in messages.iter() {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{}:", role),
-                Style::default()
-                    .fg(role_color(role))
-                    .add_modifier(Modifier::BOLD),
-            )]));
-            if role == "assistant" || role == "system" {
-                lines.extend(render_md(content, w_for_md.max(20)));
-            } else {
-                for chunk in textwrap::wrap(content, w_for_md.max(20)).iter() {
-                    lines.push(Line::from(Span::styled(
-                        chunk.to_string(),
-                        Style::default().fg(Color::White),
-                    )));
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{}:", role),
+                    Style::default()
+                        .fg(role_color(role))
+                        .add_modifier(Modifier::BOLD),
+                )]));
+                if role == "assistant" || role == "system" {
+                    lines.extend(render_md(content, w_for_md.max(20)));
+                } else {
+                    for chunk in textwrap::wrap(content, w_for_md.max(20)).iter() {
+                        lines.push(Line::from(Span::styled(
+                            chunk.to_string(),
+                            Style::default().fg(Color::White),
+                        )));
+                    }
                 }
-            }
-            lines.push(Line::from(""));
+                lines.push(Line::from(""));
             }
             cached = lines;
         }
@@ -970,11 +955,13 @@ async fn main() -> R {
             }
             let start = scroll.min(cached.len());
             let end = (start + h).min(cached.len());
-            let list: Vec<ListItem> =
-                cached[start..end].iter().cloned().map(ListItem::new).collect();
+            let list: Vec<ListItem> = cached[start..end]
+                .iter()
+                .cloned()
+                .map(ListItem::new)
+                .collect();
             f.render_widget(
-                List::new(list)
-                    .block(Block::default().borders(Borders::ALL).title(" nimcode ")),
+                List::new(list).block(Block::default().borders(Borders::ALL).title(" nimcode ")),
                 body[0],
             );
 
@@ -1000,7 +987,11 @@ async fn main() -> R {
             ];
             if sidebar.is_working {
                 s.push(Line::from(vec![Span::styled(
-                    format!("{} {}", frames[spinner % frames.len()], sidebar.working_message),
+                    format!(
+                        "{} {}",
+                        frames[spinner % frames.len()],
+                        sidebar.working_message
+                    ),
                     Style::default().fg(Color::Cyan),
                 )]));
             }
@@ -1040,8 +1031,7 @@ async fn main() -> R {
                 Style::default().fg(Color::DarkGray),
             )));
             f.render_widget(
-                Paragraph::new(s)
-                    .block(Block::default().borders(Borders::ALL).title(" status ")),
+                Paragraph::new(s).block(Block::default().borders(Borders::ALL).title(" status ")),
                 body[1],
             );
 
@@ -1072,8 +1062,7 @@ async fn main() -> R {
                     )]));
                 }
                 sl.push(Line::from(""));
-                let mut hint =
-                    String::from("↑/↓ navigate • PgUp/PgDn • Enter select • Esc cancel");
+                let mut hint = String::from("↑/↓ navigate • PgUp/PgDn • Enter select • Esc cancel");
                 if top > 0 {
                     hint = format!("▲{top} more • {hint}");
                 }
@@ -1110,12 +1099,16 @@ async fn main() -> R {
             // slash-command autocomplete popup, anchored above the input bar
             if selector.is_none() {
                 let pm = popup_matches(&completions, &input);
-                let dismissed =
-                    comp_dismissed_for.as_deref() == Some(input.as_str());
+                let dismissed = comp_dismissed_for.as_deref() == Some(input.as_str());
                 if !pm.is_empty() && !dismissed {
                     let ci = comp_idx.min(pm.len() - 1);
                     // scroll the 8-row window so the highlight stays visible
-                    let rows = pm.iter().skip(ci.saturating_sub(7)).take(8).cloned().collect::<Vec<_>>();
+                    let rows = pm
+                        .iter()
+                        .skip(ci.saturating_sub(7))
+                        .take(8)
+                        .cloned()
+                        .collect::<Vec<_>>();
                     let sel_ci = pm[ci];
                     let mut cl: Vec<Line> = vec![];
                     for mi in rows {
@@ -1191,7 +1184,12 @@ mod tests {
     fn plain(lines: &[Line]) -> String {
         lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1205,8 +1203,14 @@ mod tests {
         assert!(t.contains("• a"), "{t}");
         assert!(t.contains("fn x()"), "{t}");
         // heading style is bold cyan
-        let h = lines.iter().find(|l| l.spans.iter().any(|s| s.content.contains("Hi"))).unwrap();
-        assert!(h.spans.iter().any(|s| s.style.add_modifier.contains(Modifier::BOLD)));
+        let h = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("Hi")))
+            .unwrap();
+        assert!(h
+            .spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::BOLD)));
     }
     #[test]
     fn wrap_keeps_words() {
@@ -1237,13 +1241,28 @@ mod tests {
     #[test]
     fn protocol_round_trip() {
         let py = vec![
-            PyMsg::AddMessage { role: "user".into(), content: "hi".into() },
-            PyMsg::Update { sidebar: Sidebar::default() },
-            PyMsg::SetWorking { working: true, message: "x".into() },
+            PyMsg::AddMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            },
+            PyMsg::Update {
+                sidebar: Sidebar::default(),
+            },
+            PyMsg::SetWorking {
+                working: true,
+                message: "x".into(),
+            },
             PyMsg::Clear,
-            PyMsg::PromptSelect { title: "t".into(), items: vec!["a".into()] },
-            PyMsg::SetCompletions { items: vec!["/help".into()] },
-            PyMsg::System { content: "s".into() },
+            PyMsg::PromptSelect {
+                title: "t".into(),
+                items: vec!["a".into()],
+            },
+            PyMsg::SetCompletions {
+                items: vec!["/help".into()],
+            },
+            PyMsg::System {
+                content: "s".into(),
+            },
             PyMsg::Quit,
         ];
         for m in py {
@@ -1255,7 +1274,9 @@ mod tests {
             RustMsg::Input { text: "hi".into() },
             RustMsg::SelectResult { index: Some(0) },
             RustMsg::SelectResult { index: None },
-            RustMsg::ModeCycle { mode: "Build Mode".into() },
+            RustMsg::ModeCycle {
+                mode: "Build Mode".into(),
+            },
             RustMsg::Interrupt,
             RustMsg::Eof,
         ];
@@ -1271,6 +1292,51 @@ mod tests {
         let v2: serde_json::Value =
             serde_json::from_str(r#"{"type":"set_completions","items":["/help"]}"#).unwrap();
         assert!(serde_json::from_str::<PyMsg>(&v2.to_string()).is_ok());
+    }
+    #[test]
+    fn protocol_matches_shared_samples() {
+        // Shared with tests/test_bridge_protocol.py: drift on either side fails.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/protocol_samples.json"
+        );
+        let raw = std::fs::read_to_string(path).expect("read protocol_samples.json");
+        let samples: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        for s in samples["py_to_rust"].as_array().unwrap() {
+            let m: PyMsg = serde_json::from_value(s.clone())
+                .unwrap_or_else(|e| panic!("PyMsg rejects {s}: {e}"));
+            assert_eq!(serde_json::to_value(&m).unwrap()["type"], s["type"]);
+        }
+        let rust_samples = samples["rust_to_py"].as_array().unwrap();
+        for s in rust_samples {
+            let m: RustMsg = serde_json::from_value(s.clone())
+                .unwrap_or_else(|e| panic!("RustMsg rejects {s}: {e}"));
+            assert_eq!(&serde_json::to_value(&m).unwrap(), s);
+        }
+        // every message Rust can emit has a sample with the same keys
+        let emitted = vec![
+            RustMsg::Input { text: "x".into() },
+            RustMsg::SelectResult { index: Some(0) },
+            RustMsg::ModeCycle {
+                mode: "Build Mode".into(),
+            },
+            RustMsg::Interrupt,
+            RustMsg::Eof,
+        ];
+        for m in emitted {
+            let v = serde_json::to_value(&m).unwrap();
+            let keys = |o: &serde_json::Value| {
+                let mut k: Vec<String> = o.as_object().unwrap().keys().cloned().collect();
+                k.sort();
+                k
+            };
+            assert!(
+                rust_samples
+                    .iter()
+                    .any(|s| s["type"] == v["type"] && keys(s) == keys(&v)),
+                "no sample for {v}"
+            );
+        }
     }
     #[test]
     fn completion_filter_and_accept() {
@@ -1305,17 +1371,22 @@ mod tests {
     }
     #[test]
     fn wrap_preserves_bold_and_chunks_long_words() {
-        let lines = render_md("**boldword** https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 20);
+        let lines = render_md(
+            "**boldword** https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            20,
+        );
         assert!(lines.iter().all(|l| l.width() <= 20), "{}", plain(&lines));
         let all_bold = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
-            s.content.contains("boldword")
-                && s.style.add_modifier.contains(Modifier::BOLD)
+            s.content.contains("boldword") && s.style.add_modifier.contains(Modifier::BOLD)
         });
         assert!(all_bold, "{}", plain(&lines));
     }
     #[test]
     fn ascii_emit_and_clean_text() {
-        let j = serde_json::to_string(&RustMsg::Input { text: "é😀".into() }).unwrap();
+        let j = serde_json::to_string(&RustMsg::Input {
+            text: "é😀".into()
+        })
+        .unwrap();
         let a = ascii_json(&j);
         assert!(a.is_ascii(), "{a}");
         let back: RustMsg = serde_json::from_str(&a).unwrap();
@@ -1326,6 +1397,9 @@ mod tests {
     fn wide_chars_respect_display_width() {
         let lines = render_md("\u{3042}".repeat(30).as_str(), 20);
         assert!(lines.iter().all(|l| l.width() <= 20), "{}", plain(&lines));
-        assert_eq!(trunc("\u{3042}\u{3042}\u{3042}\u{3042}\u{3042}", 8), "\u{3042}\u{3042}\u{3042}…");
+        assert_eq!(
+            trunc("\u{3042}\u{3042}\u{3042}\u{3042}\u{3042}", 8),
+            "\u{3042}\u{3042}\u{3042}…"
+        );
     }
 }

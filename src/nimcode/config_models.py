@@ -258,6 +258,23 @@ def resolve_context(model_id: str) -> Optional[int]:
     return MODEL_CONTEXT_TOKENS.get(model_id)
 
 
+def effective_budget(config: Any, model_id: str) -> int:
+    """Prompt-token budget for pruning: never more than the model's real
+    window, minus room for the reply (`max_tokens`) and a 1024 margin."""
+    try:
+        budget = int(getattr(config, "context_budget_tokens", DEFAULT_BUDGET))
+    except (TypeError, ValueError):
+        budget = DEFAULT_BUDGET
+    window = resolve_context(model_id)
+    if window:
+        budget = min(budget, window)
+    try:
+        reply = int(getattr(config, "max_tokens", None) or 4096)
+    except (TypeError, ValueError):
+        reply = 4096
+    return max(2000, budget - reply - 1024)
+
+
 def apply_model_context(
     config: Any, model_id: str, force: bool = False
 ) -> Tuple[bool, str]:

@@ -1,6 +1,5 @@
 import os
 import sys
-import json
 import asyncio
 import typer
 from dotenv import load_dotenv
@@ -14,7 +13,12 @@ from nimcode.config import (
     select_interactive_session,
 )
 from nimcode.context import generate_workspace_map
-from nimcode.core.agent import run_init_command
+from nimcode.core.agent import (
+    list_sessions,
+    load_session,
+    migrate_legacy_session,
+    run_init_command,
+)
 from nimcode.core.agent_tui import run_agent_loop_tui
 
 
@@ -252,7 +256,7 @@ def status():
     except Exception:
         pass
     session_dir = get_project_nimcode_dir(workspace_root) / "sessions"
-    session_count = len(list(session_dir.glob("*.json"))) if session_dir.exists() else 0
+    session_count = len(list_sessions(session_dir))
     typer.echo(
         f"  • Session Logs:       {'Active (' + str(session_count) + ' sessions)' if session_count > 0 else 'None'}"
     )
@@ -312,48 +316,27 @@ def resume(
     client, config, workspace_root, workspace_map = _get_client_and_setup()
     session_dir = get_project_nimcode_dir(workspace_root) / "sessions"
 
-    legacy_session = workspace_root / ".nimcode_session.json"
-    if legacy_session.exists():
-        try:
-            session_dir.mkdir(parents=True, exist_ok=True)
-            import shutil
-            import time as _t
-
-            # Must match the picker's "session_*.json" glob or it is invisible.
-            dest = session_dir / f"session_legacy_{int(_t.time())}.json"
-            shutil.move(str(legacy_session), str(dest))
-            typer.secho(
-                f"\nMigrated legacy session to {dest}",
-                fg=typer.colors.CYAN,
-            )
-        except Exception as e:
-            typer.secho(
-                f"Warning: could not migrate legacy session: {e}",
-                fg=typer.colors.YELLOW,
-            )
-
-    if not session_dir.exists() or not list(session_dir.glob("*.json")):
+    try:
+        dest = migrate_legacy_session(workspace_root, session_dir)
+        if dest:
+            typer.secho(f"\nMigrated legacy session to {dest}", fg=typer.colors.CYAN)
+    except OSError as e:
         typer.secho(
-            "No active sessions found. Use 'start' or 'run' to begin a new session.",
+            f"Warning: could not migrate legacy session: {e}",
             fg=typer.colors.YELLOW,
         )
-        raise typer.Exit()
 
     try:
-        sessions = sorted(
-            list(session_dir.glob("*.json")),
-            key=lambda x: x.stat().st_mtime,
-            reverse=True,
-        )
-    except FileNotFoundError:
-        typer.secho(
-            "No active sessions found. Use 'start' or 'run' to begin a new session.",
-            fg=typer.colors.YELLOW,
-        )
-        raise typer.Exit()
+        sessions = list_sessions(session_dir)
     except OSError as e:
         typer.secho(f"Error listing sessions: {e}", fg=typer.colors.RED)
         raise typer.Exit(code=1)
+    if not sessions:
+        typer.secho(
+            "No active sessions found. Use 'start' or 'run' to begin a new session.",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit()
 
     if latest:
         selected_session = sessions[0]
@@ -363,17 +346,10 @@ def resume(
             raise typer.Exit()
 
     try:
-        with open(selected_session, "r", encoding="utf-8") as f:
-            existing_messages = json.load(f)
+        existing_messages = load_session(selected_session)
     except Exception as e:
         typer.secho(f"Error loading session log: {e}", fg=typer.colors.RED)
         raise typer.Exit(code=1)
-    if not isinstance(existing_messages, list):
-        typer.secho(
-            "Session file is corrupt (not a message list). Starting a new session.",
-            fg=typer.colors.YELLOW,
-        )
-        existing_messages = []
 
     if not existing_messages:
         typer.secho(

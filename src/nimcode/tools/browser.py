@@ -3,83 +3,18 @@ import time
 from pathlib import Path
 from typing import Dict, Any
 from nimcode.tools.registry import register_tool
-from nimcode.tools.base import resolve_and_validate_path
+from nimcode.tools.base import (  # noqa: F401  (re-exported for callers/tests)
+    resolve_and_validate_path,
+    _LOCAL_HOSTS,
+    _check_url,
+    _ip_is_internal,
+    _is_url_allowed,
+)
 
 try:
     from playwright.sync_api import sync_playwright
 except ImportError:
     sync_playwright = None  # type: ignore
-
-
-_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
-
-
-def _ip_is_internal(ip) -> bool:
-    # is_global (not just is_private) also covers CGNAT 100.64/10, 0.0.0.0,
-    # documentation/benchmark ranges, etc. Embedded IPv4 in IPv6 (mapped,
-    # 6to4, Teredo) is checked too.
-    if ip.version == 6:
-        embedded = ip.ipv4_mapped or ip.sixtofour or (ip.teredo or (None, None))[1]
-        if embedded is not None and _ip_is_internal(embedded):
-            return True
-    return not ip.is_global or ip.is_multicast
-
-
-def _check_url(url: str) -> tuple[bool, str, list]:
-    """Return (ok, reason, vetted_ips). See _is_url_allowed."""
-    import ipaddress
-    import socket
-    from urllib.parse import urlparse
-
-    if not isinstance(url, str) or any(c in "\\ " or ord(c) < 0x20 for c in url):
-        # Backslashes/whitespace parse differently in urllib vs Chromium
-        # (http://10.0.0.5\@example.com is example.com to urllib, 10.0.0.5 to Chromium).
-        return False, "URL contains disallowed characters", []
-    try:
-        parsed = urlparse(url)
-        scheme = (parsed.scheme or "").lower()
-        host = (parsed.hostname or "").lower()
-        parsed.port  # raises ValueError on garbage ports
-    except Exception:
-        return False, "unparseable URL", []
-    if scheme not in ("http", "https"):
-        return False, f"URL scheme '{scheme}' not allowed (http/https only)", []
-    if not host:
-        return False, "URL has no host", []
-    if host in ("169.254.169.254", "metadata.google.internal"):
-        return False, "URL target is blocked", []
-
-    try:
-        ips = [ipaddress.ip_address(host)]
-    except ValueError:
-        try:
-            ips = [
-                ipaddress.ip_address(info[4][0].split("%")[0])
-                for info in socket.getaddrinfo(host, None)
-            ]
-        except Exception:
-            return False, "URL host does not resolve", []
-        if not ips:
-            return False, "URL host does not resolve", []
-    for ip in ips:
-        if _ip_is_internal(ip):
-            # Explicit localhost stays allowed for the dev-server verify loop,
-            # but only when it resolves to loopback (never to a LAN address).
-            if host in _LOCAL_HOSTS and ip.is_loopback:
-                continue
-            return False, "URL resolves to a private/internal address", []
-    return True, "", ips
-
-
-def _is_url_allowed(url: str) -> tuple[bool, str]:
-    """SSRF guard: allow public hosts + explicit localhost; block everything else.
-
-    Hostnames are DNS-resolved and *every* returned IP is checked, so decimal/
-    octal/hex IP spellings (2130706433, 127.1, 0x7f.0.0.1) and wildcard-DNS
-    tricks (127.0.0.1.nip.io) cannot smuggle loopback/private targets past us.
-    """
-    ok, reason, _ = _check_url(url)
-    return ok, reason
 
 
 def _make_request_guard(workspace_root, blocked: list):

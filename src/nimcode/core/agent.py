@@ -1,12 +1,12 @@
-import os
 import sys
 import json
+import re
 import time
 import functools
 import typer
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from openai import OpenAI
+from openai import APIConnectionError, OpenAI, RateLimitError
 
 # Optional tiktoken for accurate token counting
 try:
@@ -17,19 +17,12 @@ except ImportError:
     HAS_TIKTOKEN = False
 
 from nimcode.config import Config, get_project_nimcode_dir
+from nimcode.config_models import effective_budget
 from nimcode.core.prompts import (
     build_system_prompt,
     strip_reasoning_spans,
-    extract_plan_block,
 )
-from nimcode.tools import (
-    AVAILABLE_TOOLS_SPEC,
-    is_valid_tool_call,
-    render_preview,
-    execute_local_tool,
-)
-from nimcode.core.state import AgentState
-from nimcode.ui.output import echo, secho, symbol
+from nimcode.ui.output import echo, secho
 
 
 SESSION_DIR = "sessions"
@@ -257,6 +250,36 @@ def count_message_tokens(
     return total
 
 
+def _shrink_unit(
+    unit: List[Dict[str, Any]], available: int, unit_tokens: int
+) -> List[Dict[str, Any]]:
+    """Scale tool/user contents of one unit down to ~`available` tokens.
+
+    Uses head+tail `truncate_output` so the start (context) and the end
+    (errors, stack traces) survive. Assistant tool_calls are left intact.
+    """
+    from nimcode.tools.base import truncate_output
+
+    def trimmable(m: Dict[str, Any]) -> bool:
+        return m.get("role") in ("tool", "user") and isinstance(m.get("content"), str)
+
+    trim_tokens = count_message_tokens([m for m in unit if trimmable(m)])
+    fixed = unit_tokens - trim_tokens
+    # ponytail: char-proportional scaling with 5% slack for the truncation
+    # marker / tokenizer drift; exact fit would need per-message re-counting.
+    ratio = 0.95 * max(available - fixed, 0) / max(trim_tokens, 1)
+    out = []
+    for msg in unit:
+        msg = dict(msg)
+        content = msg.get("content")
+        if trimmable(msg):
+            msg["content"] = truncate_output(
+                content, max(500, int(len(content) * ratio))
+            )
+        out.append(msg)
+    return out
+
+
 def prune_history(
     messages: List[Dict[str, Any]],
     context_budget_tokens: int = 16000,
@@ -353,6 +376,11 @@ def prune_history(
     for unit in reversed(units):
         unit_tokens = count_message_tokens(unit)
         # Always keep the newest unit (the live turn), then only what fits.
+        if not recent_msgs and unit_tokens > budget_left:
+            # A single huge tool result / pasted prompt would overflow the
+            # window on its own: head+tail trim it into what's left.
+            unit = _shrink_unit(unit, budget_left, unit_tokens)
+            unit_tokens = count_message_tokens(unit)
         if not recent_msgs or budget_left - unit_tokens >= 0:
             recent_msgs = unit + recent_msgs
             budget_left -= unit_tokens
@@ -419,7 +447,7 @@ def call_nim_with_retry(
     import threading
 
     # Prune history to satisfy context budget constraint!
-    budget = _context_budget or config.context_budget_tokens
+    budget = _context_budget or effective_budget(config, model)
     pruned_messages = prune_history(messages, budget)
 
     normalized_messages = normalize_messages(
@@ -497,8 +525,17 @@ def call_nim_with_retry(
             raise
         except Exception as e:
             err_str = str(e).lower()
+            status = getattr(e, "status_code", None)
+            if not isinstance(status, int):
+                status = None
+            # NIM reports tool-choice / degraded-function / context-overflow
+            # only in the message text, always as a client error. Gate the
+            # text checks on those statuses so a 5xx body can't trip them.
+            semantic = status is None or status in (400, 404, 422)
+            is_404 = status == 404 if status is not None else "404" in err_str
             if (
-                not config.disable_native_tools
+                semantic
+                and not config.disable_native_tools
                 and "auto" in err_str
                 and (
                     "tool choice" in err_str
@@ -523,9 +560,13 @@ def call_nim_with_retry(
                     _context_budget=_context_budget,
                 )
 
-            if not config.disable_native_tools and (
-                ("degraded function" in err_str)
-                or ("degraded" in err_str and "function" in err_str)
+            if (
+                semantic
+                and not config.disable_native_tools
+                and (
+                    ("degraded function" in err_str)
+                    or ("degraded" in err_str and "function" in err_str)
+                )
             ):
                 _fallback_to_xml_tool_calling(
                     config, messages, "Function calling is degraded on this server."
@@ -541,18 +582,16 @@ def call_nim_with_retry(
                     _context_budget=_context_budget,
                 )
 
+            fn_not_found = (
+                semantic
+                and "function" in err_str
+                and ("not found" in err_str or "not_found" in err_str)
+            )
             if (
                 tools
                 and not config.disable_native_tools
-                and (
-                    "function" in err_str
-                    and ("not found" in err_str or "not_found" in err_str)
-                    and (
-                        "404" in err_str
-                        or "no longer" in err_str
-                        or "unknown function" in err_str
-                    )
-                )
+                and fn_not_found
+                and (is_404 or "no longer" in err_str or "unknown function" in err_str)
             ):
                 # NIM account-scoped function registry rejects the native call
                 # (e.g. 404 "Function '<id>': Not found for account"). The
@@ -574,11 +613,7 @@ def call_nim_with_retry(
                     _context_budget=_context_budget,
                 )
 
-            if (
-                "function" in err_str
-                and ("not found" in err_str or "not_found" in err_str)
-                and ("404" in err_str or "unknown function" in err_str)
-            ):
+            if fn_not_found and (is_404 or "unknown function" in err_str):
                 # Still failing with no native tools in play: the model (or
                 # the key's account) is rejected server-side. No retry
                 # strategy can fix that — say what to change instead of
@@ -593,7 +628,7 @@ def call_nim_with_retry(
                     f"Server detail: {e}"
                 )
 
-            if (
+            if semantic and (
                 "max context length" in err_str
                 or "context length exceeded" in err_str
                 or "context window" in err_str
@@ -627,18 +662,33 @@ def call_nim_with_retry(
                     _context_budget=new_budget,
                 )
 
-            if attempt == max_retries - 1:
-                if any(
-                    s in err_str
-                    for s in (
-                        "429",
-                        "rate limit",
-                        "resourceexhausted",
-                        "503",
-                        "service unavailable",
-                        "overloaded",
+            if isinstance(e, (RateLimitError, APIConnectionError)):
+                fail_fast, capacity = False, True  # incl. APITimeoutError
+            elif status is not None:
+                # Deterministic client errors: re-sending can only fail again.
+                fail_fast = status in (400, 401, 403, 404, 422)
+                capacity = status in (429, 503)
+            else:
+                # No status code (non-openai exception): fall back to text,
+                # with word boundaries so "4000 tokens" is not a 400.
+                capacity = bool(
+                    re.search(
+                        r"\b(429|503)\b|rate limit|resourceexhausted|"
+                        r"service unavailable|overloaded",
+                        err_str,
                     )
-                ):
+                )
+                fail_fast = not capacity and bool(
+                    re.search(
+                        r"\b(400|401|403|404|422)\b|bad request|unauthorized|"
+                        r"invalid api key|incorrect api key|forbidden|"
+                        r"not found|unprocessable",
+                        err_str,
+                    )
+                )
+
+            if attempt == max_retries - 1 and not fail_fast:
+                if capacity:
                     secho(
                         "Tip: the endpoint is rate-limiting or out of capacity "
                         "— wait ~1 min and retry, or '/model' to switch to a "
@@ -646,30 +696,8 @@ def call_nim_with_retry(
                         fg=typer.colors.YELLOW,
                     )
                 raise
-            # Don't retry deterministic client errors (except rate limits):
-            # re-sending the identical request can only fail identically.
-            if (
-                any(
-                    s in err_str
-                    for s in (
-                        "400",
-                        "bad request",
-                        "401",
-                        "unauthorized",
-                        "invalid api key",
-                        "incorrect api key",
-                        "403",
-                        "forbidden",
-                        "404",
-                        "not found",
-                        "422",
-                        "unprocessable",
-                    )
-                )
-                and "429" not in err_str
-                and "rate limit" not in err_str
-            ):
-                if "404" in err_str and "model" in err_str:
+            if fail_fast:
+                if is_404 and "model" in err_str:
                     secho(
                         "Tip: the model id may be retired — run "
                         "'nimcode refresh-models' or '/models-refresh'.",
@@ -685,27 +713,83 @@ def call_nim_with_retry(
             time.sleep(wait_time)
 
 
+def list_sessions(session_dir: Path) -> List[Path]:
+    """Session files (JSONL and legacy JSON lists), newest first."""
+    if not session_dir.is_dir():
+        return []
+    files = [*session_dir.glob("session_*.json"), *session_dir.glob("session_*.jsonl")]
+    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def load_session(path: Path) -> List[Dict[str, Any]]:
+    """Load a session: one JSON message per line (.jsonl) or a legacy JSON list.
+
+    A corrupt *last* line (crash mid-append) is skipped; corruption anywhere
+    else raises, since silently dropping history would mislead the model.
+    """
+    text = Path(path).read_text(encoding="utf-8")
+    if Path(path).suffix == ".json":
+        data = json.loads(text) if text.strip() else []
+        return data if isinstance(data, list) else []
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    messages = []
+    for i, line in enumerate(lines):
+        try:
+            messages.append(json.loads(line))
+        except json.JSONDecodeError:
+            if i == len(lines) - 1:
+                break
+            raise
+    return messages
+
+
+def open_session_path(
+    session_dir: Path,
+    session_file_name: Optional[str],
+    existing_messages: Optional[List[Dict[str, Any]]] = None,
+) -> Path:
+    """Path to append this session's turns to.
+
+    `.jsonl` sessions continue in place. Anything else (a new session, or a
+    legacy `.json` list that must not be appended to) gets a fresh `.jsonl`,
+    seeded with `existing_messages`; the old file is left untouched.
+    """
+    if session_file_name and session_file_name.endswith(".jsonl"):
+        return session_dir / session_file_name
+    path = session_dir / f"session_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
+    for msg in existing_messages or []:
+        log_turn(msg, path)
+    return path
+
+
+def migrate_legacy_session(workspace_root: Path, session_dir: Path) -> Optional[Path]:
+    """Move a pre-0.4 in-repo `.nimcode_session.json` into the session dir.
+
+    Named `session_legacy_<ts>.json` so `list_sessions` sees it. Returns the
+    destination, or None when there was nothing to migrate. May raise OSError.
+    """
+    import shutil
+
+    legacy = Path(workspace_root) / ".nimcode_session.json"
+    if not legacy.exists():
+        return None
+    session_dir.mkdir(parents=True, exist_ok=True)
+    dest = session_dir / f"session_legacy_{int(time.time())}.json"
+    shutil.move(str(legacy), str(dest))
+    return dest
+
+
 def log_turn(message_or_dict: Any, session_path: Path):
     """
-    Logs the turn and persists session history to the specific session file.
-    Atomic (temp + os.replace) and JSON-safe (default=str) so a crash or
-    non-serializable tool args can never corrupt the session.
+    Appends one message as a JSON line to the session file (`.jsonl`).
+    JSON-safe (default=str); a crash mid-write can only corrupt the last
+    line, which `load_session` skips.
     """
-    import tempfile
-
     try:
         try:
             cleaned = clean_surrogates(message_or_dict)
         except Exception:
             cleaned = message_or_dict
-        data = []
-        if session_path.exists():
-            try:
-                with open(session_path, "r", encoding="utf-8") as f:
-                    loaded = json.load(f)
-                    data = loaded if isinstance(loaded, list) else []
-            except Exception:
-                data = []
 
         if isinstance(cleaned, dict):
             entry = cleaned
@@ -727,21 +811,10 @@ def log_turn(message_or_dict: Any, session_path: Path):
                     for tc in cleaned.tool_calls
                 ]
 
-        data.append(entry)
+        line = json.dumps(entry, ensure_ascii=False, default=str) + "\n"
         session_path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(session_path.parent), prefix=".session_tmp_"
-        )
-        try:
-            with open(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False, default=str)
-            os.replace(tmp_name, session_path)
-        except BaseException:
-            try:
-                os.unlink(tmp_name)
-            except Exception:
-                pass
-            raise
+        with open(session_path, "a", encoding="utf-8") as f:
+            f.write(line)
     except Exception as e:
         # Don't crash agent loop on logging issue, but don't swallow silently.
         try:
@@ -767,7 +840,7 @@ def aggregate_session_stats(workspace_root: Path) -> Dict[str, Any]:
             "error": "No session directory found",
         }
 
-    session_files = list(session_dir.glob("*.json"))
+    session_files = list_sessions(session_dir)
     if not session_files:
         return {
             "overview": {"total_sessions": 0, "total_messages": 0, "days_active": 0},
@@ -784,13 +857,9 @@ def aggregate_session_stats(workspace_root: Path) -> Dict[str, Any]:
 
     for session_file in session_files:
         try:
-            with open(session_file, "r", encoding="utf-8") as f:
-                messages = json.load(f)
+            messages = load_session(session_file)
 
-            if not isinstance(messages, list):
-                continue
-
-            # Extract date from filename if possible (session_YYYYMMDD_HHMMSS.json)
+            # Extract date from filename if possible (session_YYYYMMDD_HHMMSS.jsonl)
             try:
                 date_str = session_file.stem.split("_")[1]
                 date_obj = datetime.strptime(date_str, "%Y%m%d")
@@ -1116,1372 +1185,3 @@ Please output an updated, enriched, and well-structured markdown for `AGENTS.md`
         msg = f"AGENTS.md already exists at {agents_md_path} and client is offline."
         _output(f"[yellow]{msg}[/yellow]")
         return msg
-
-
-def enable_persistent_prompt(state, config, workspace_root, last_input):
-    import shutil
-    import sys
-    from nimcode.config_models import display_name
-
-    term_width, term_height = shutil.get_terminal_size()
-    # Scroll region: lines 1 to height-4
-    sys.stdout.write(f"\033[1;{term_height - 4}r")
-
-    if (
-        state == AgentState.AWAITING_PLAN_APPROVAL
-        or getattr(config, "mode", "") == "plan"
-    ):
-        mode_name = "PLAN MODE"
-        sep_class_ansi = "\033[1;34m"  # Blue
-    elif state == AgentState.YOLO or getattr(config, "mode", "") == "yolo":
-        mode_name = "YOLO MODE"
-        sep_class_ansi = "\033[1;31m"  # Red
-    else:
-        mode_name = "BUILD MODE"
-        sep_class_ansi = "\033[1;32m"  # Green
-
-    pwd = os.getcwd()
-    model_id = (
-        config.fast_model
-        if state != AgentState.AWAITING_PLAN_APPROVAL
-        else config.plan_model
-    )
-    model_name = display_name(model_id)
-
-    hline = symbol("hline")
-    mode_label = f"{hline}{hline} {mode_name} "
-    remaining_upper = term_width - len(mode_label)
-    upper_border = mode_label + (hline * max(0, remaining_upper))
-
-    left_str = f"{hline}{hline} ({pwd}) "
-    right_str = f" ({model_name}) {hline}{hline}"
-    padding = term_width - len(left_str) - len(right_str)
-    if padding < 0:
-        avail = term_width - len(right_str) - 6
-        if avail > 5:
-            left_str = f"{hline}{hline} (..{pwd[-(avail - 2) :]}) "
-        else:
-            left_str = f"{hline}{hline} "
-        padding = term_width - len(left_str) - len(right_str)
-    lower_border = left_str + (hline * max(0, padding)) + right_str
-
-    sys.stdout.write(
-        f"\033[{term_height - 2};1H\033[2K{sep_class_ansi}{upper_border}\033[0m"
-    )
-
-    input_str = last_input or ""
-    input_str = input_str.replace("\n", " ")
-    if len(input_str) > term_width - 6:
-        input_str = input_str[: term_width - 9] + "..."
-    sys.stdout.write(
-        f"\033[{term_height - 1};1H\033[2K\033[1;36m{symbol('prompt')} \033[0m{input_str}"
-    )
-    sys.stdout.write(
-        f"\033[{term_height};1H\033[2K{sep_class_ansi}{lower_border}\033[0m"
-    )
-    sys.stdout.write(f"\033[{term_height - 3};1H\033[2K")
-    sys.stdout.write(f"\033[{term_height - 4};1H")
-    sys.stdout.flush()
-
-
-def disable_persistent_prompt():
-    import sys
-    import shutil
-
-    term_width, term_height = shutil.get_terminal_size()
-    sys.stdout.write("\033[r")
-    sys.stdout.write(f"\033[{term_height};1H\n")
-    sys.stdout.flush()
-
-
-def print_session_history(messages: List[Dict[str, Any]]):
-    """
-    Renders the conversation history of a resumed session in a structured, readable format.
-    """
-    if not messages:
-        return
-
-    secho("\n=== Resumed Session History ===", fg=typer.colors.BLUE, bold=True)
-    for msg in messages:
-        role = msg.get("role")
-        content = msg.get("content") or ""
-
-        if role == "system":
-            continue
-        elif role == "user":
-            secho(f"\n{symbol('prompt')} {content}", fg=typer.colors.CYAN, bold=True)
-        elif role == "assistant":
-            if content.strip():
-                echo(f"\n{content}")
-            if msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    func = tc.get("function", {})
-                    name = func.get("name", "unknown")
-                    secho(
-                        f"  {symbol('tool')} Tool Call: {name}", fg=typer.colors.YELLOW
-                    )
-        elif role == "tool":
-            snippet = content.strip().replace("\n", " ")
-            if len(snippet) > 80:
-                snippet = snippet[:80] + "..."
-            secho(f"  {symbol('arrow')} Tool Result: {snippet}", fg=typer.colors.GREEN)
-    secho("===============================\n", fg=typer.colors.BLUE, bold=True)
-
-
-def run_agent_loop(
-    client: OpenAI,
-    user_prompt: str,
-    config: Config,
-    workspace_root: Path,
-    workspace_map: str,
-    existing_messages: Optional[List[Dict[str, Any]]] = None,
-    initial_state: str = "AWAITING_PLAN_APPROVAL",
-    session_file_name: Optional[str] = None,
-):
-    """
-    The continuous REPL and state loop for nimcode.
-    Enforces Plan-Before-Execution (`AWAITING_PLAN_APPROVAL` -> `EXECUTING`).
-    Supports resuming from existing session history (`existing_messages`).
-    """
-    import atexit
-
-    atexit.register(disable_persistent_prompt)
-    session_dir = get_project_nimcode_dir(workspace_root) / SESSION_DIR
-    session_dir.mkdir(parents=True, exist_ok=True)
-
-    legacy_session = workspace_root / ".nimcode_session.json"
-    if legacy_session.exists():
-        import shutil
-
-        shutil.move(str(legacy_session), str(session_dir / "legacy_session.json"))
-        secho(
-            f"\nMigrated legacy session to {SESSION_DIR}/legacy_session.json",
-            fg=typer.colors.CYAN,
-        )
-
-    if not session_file_name:
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        session_file_name = f"session_{timestamp}.json"
-
-    session_path = session_dir / session_file_name
-    user_input: Optional[str] = user_prompt
-
-    messages = []
-    state = initial_state
-    if state == "YOLO":
-        config.mode = "yolo"
-    elif state == "AWAITING_PLAN_APPROVAL":
-        config.mode = "plan"
-    else:
-        config.mode = "build"
-
-    skip_first_api_call = False
-
-    if existing_messages:
-        messages = existing_messages
-        print_session_history(messages)
-        # Always wait for user input after loading a session — never auto-fire the agent.
-        # The user should decide whether to continue, redirect, or start fresh.
-        skip_first_api_call = True
-    else:
-        system_prompt = build_system_prompt(
-            str(workspace_root),
-            workspace_map,
-            disable_native_tools=config.disable_native_tools,
-        )
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-
-    loop_count = 0
-
-    def prompt_user(text, **kwargs):
-        """Prompt the user for simple y/n/feedback input.
-
-        Uses plain built-in input() to avoid prompt_toolkit deadlocks on Windows
-        when called outside the normal TUI event loop (e.g. after a Rich spinner).
-        """
-        disable_persistent_prompt()
-        prompt_text = (
-            text
-            if text.endswith(": ")
-            else (text + " " if text.endswith(":") else text + ": ")
-        )
-        # Flush any pending output so the prompt appears before we block on input
-        try:
-            sys.stdout.flush()
-        except Exception:
-            pass
-        try:
-            res = input(prompt_text)
-        except KeyboardInterrupt:
-            echo("\n")
-            res = "q"
-        except EOFError:
-            res = "q"
-        enable_persistent_prompt(state, config, workspace_root, res)
-        return res
-
-    def get_user_turn() -> Optional[str]:
-        nonlocal state, session_path
-        while True:
-            from prompt_toolkit import PromptSession
-            from prompt_toolkit.completion import WordCompleter
-            from prompt_toolkit.key_binding import KeyBindings
-
-            commands = [
-                "/help",
-                "/plan",
-                "/build",
-                "/yolo",
-                "/resume",
-                "/model",
-                "/config",
-                "/changes",
-                "/diff",
-                "/test",
-                "/team",
-                "/compact",
-                "/recap",
-                "/skills",
-                "/install-skill",
-                "/init",
-                "/quit",
-                "/exit",
-                "/kill",
-                "/restore",
-            ]
-            try:
-                from nimcode import skills
-
-                commands.extend([f"/{s}" for s in skills.list_skills()])
-            except Exception:
-                pass
-            completer = WordCompleter(commands, ignore_case=True, WORD=True)
-            bindings = KeyBindings()
-
-            @bindings.add("escape")
-            def _(event):
-                if event.app.current_buffer.text:
-                    event.app.current_buffer.reset()
-                else:
-                    event.app.current_buffer.reset()
-
-            @bindings.add("backspace")
-            def _(event):
-                b = event.app.current_buffer
-                if b.cursor_position > 0:
-                    b.delete_before_cursor(count=event.arg)
-
-            @bindings.add("tab")
-            def _(event):
-                b = event.app.current_buffer
-                if b.complete_state:
-                    b.complete_next()
-                else:
-                    b.start_completion(select_first=True)
-
-            @bindings.add("s-tab")
-            def _(event):
-                b = event.app.current_buffer
-                if b.complete_state:
-                    b.complete_previous()
-                else:
-                    nonlocal state
-                    if state == AgentState.AWAITING_PLAN_APPROVAL:
-                        state = AgentState.EXECUTING
-                        config.mode = "build"
-                    elif state == AgentState.EXECUTING:
-                        state = AgentState.YOLO
-                        config.mode = "yolo"
-                    else:
-                        state = AgentState.AWAITING_PLAN_APPROVAL
-                        config.mode = "plan"
-                    event.app.invalidate()
-
-            from prompt_toolkit.styles import Style
-            from prompt_toolkit.formatted_text import FormattedText
-
-            style = Style.from_dict(
-                {
-                    "bottom-toolbar": "bg:default #aaaaaa",
-                    "separator": "#666666",
-                    "sep-plan": "bold #0088ff",
-                    "sep-build": "bold #00cc44",
-                    "sep-yolo": "bold #ff2200",
-                    "prompt": "bold #00ffff",
-                }
-            )
-            session: PromptSession = PromptSession(key_bindings=bindings, style=style)
-
-            def get_prompt_message():
-                import shutil
-
-                term_width = shutil.get_terminal_size().columns
-                if (
-                    state == AgentState.AWAITING_PLAN_APPROVAL
-                    or getattr(config, "mode", "") == "plan"
-                ):
-                    mode_name = "PLAN MODE"
-                    sep_class = "class:sep-plan"
-                elif state == AgentState.YOLO or getattr(config, "mode", "") == "yolo":
-                    mode_name = "YOLO MODE"
-                    sep_class = "class:sep-yolo"
-                else:
-                    mode_name = "BUILD MODE"
-                    sep_class = "class:sep-build"
-
-                hline = symbol("hline")
-                mode_label = f"{hline}{hline} {mode_name} "
-                remaining_width = term_width - len(mode_label)
-                if remaining_width < 0:
-                    sep = mode_label[:term_width] + "\n"
-                else:
-                    sep = mode_label + (hline * remaining_width) + "\n"
-                return FormattedText(
-                    [(sep_class, sep), ("class:prompt", f"{symbol('prompt')} ")]
-                )
-
-            def get_bottom_toolbar():
-                import shutil
-                from nimcode.config_models import display_name
-
-                term_width = shutil.get_terminal_size().columns
-                if (
-                    state == AgentState.AWAITING_PLAN_APPROVAL
-                    or getattr(config, "mode", "") == "plan"
-                ):
-                    sep_class = "class:sep-plan"
-                elif state == AgentState.YOLO or getattr(config, "mode", "") == "yolo":
-                    sep_class = "class:sep-yolo"
-                else:
-                    sep_class = "class:sep-build"
-
-                pwd = os.getcwd()
-                model_id = (
-                    config.fast_model
-                    if state != AgentState.AWAITING_PLAN_APPROVAL
-                    else config.plan_model
-                )
-
-                model_name = display_name(model_id)
-
-                hline = symbol("hline")
-                left_str = f"{hline}{hline} ({pwd}) "
-                right_str = f" ({model_name}) {hline}{hline}"
-
-                padding = term_width - len(left_str) - len(right_str)
-                if padding < 0:
-                    avail = term_width - len(right_str) - 6
-                    if avail > 5:
-                        left_str = f"{hline}{hline} (..{pwd[-(avail - 2) :]}) "
-                    else:
-                        left_str = f"{hline}{hline} "
-                    padding = term_width - len(left_str) - len(right_str)
-
-                status_line = left_str + (hline * max(0, padding)) + right_str
-                return FormattedText([(sep_class, status_line)])
-
-            disable_persistent_prompt()
-            secho("\nUser Input (or 'exit' to finish task)", fg=typer.colors.CYAN)
-            try:
-                sys.stdout.write("\033[999B\r")
-                sys.stdout.flush()
-            except Exception:
-                pass
-
-            try:
-                user_input = session.prompt(
-                    get_prompt_message,
-                    completer=completer,
-                    bottom_toolbar=get_bottom_toolbar,
-                    reserve_space_for_menu=2,
-                ).strip()
-            except (KeyboardInterrupt, EOFError):
-                echo("\nPrompt cancelled. Exiting.")
-                return None
-            if not user_input:
-                continue
-            if user_input.lower() in ["/plan", "/build", "/yolo"] or any(
-                user_input.lower().startswith(prefix + " ")
-                for prefix in ["/plan", "/build", "/yolo"]
-            ):
-                parts = user_input.split(" ", 1)
-                cmd = parts[0].lower()
-                if cmd == "/plan":
-                    state = AgentState.AWAITING_PLAN_APPROVAL
-                    config.mode = "plan"
-                    secho(
-                        "\nSwitched to Plan Mode (AWAITING_PLAN_APPROVAL). Tools disabled until plan is approved.\n",
-                        fg=typer.colors.CYAN,
-                        bold=True,
-                    )
-                elif cmd == "/build":
-                    state = AgentState.EXECUTING
-                    config.mode = "build"
-                    secho(
-                        "\nSwitched to Build Mode (EXECUTING with human-in-the-loop approval).\n",
-                        fg=typer.colors.GREEN,
-                        bold=True,
-                    )
-                elif cmd == "/yolo":
-                    state = AgentState.YOLO
-                    config.mode = "yolo"
-                    secho(
-                        "\nSwitched to YOLO Mode (EXECUTING with auto-approval of edits and commands).\n",
-                        fg=typer.colors.RED,
-                        bold=True,
-                    )
-                if len(parts) > 1 and parts[1].strip():
-                    return parts[1].strip()
-                continue
-            if user_input.strip() in ["?", "/help", "help"]:
-                from nimcode.ui.console import show_help
-
-                show_help()
-                continue
-            elif user_input.strip().lower() in ["/changes", "/diff"]:
-                from nimcode.config import show_changes
-
-                show_changes(
-                    Path(workspace_root).resolve()
-                    if workspace_root
-                    else Path(".").resolve()
-                )
-                continue
-            elif user_input.strip().lower() == "/restore":
-                from nimcode.config import restore_interactive_backup
-
-                restore_interactive_backup(
-                    Path(workspace_root).resolve()
-                    if workspace_root
-                    else Path(".").resolve()
-                )
-                continue
-            elif user_input.strip().lower() == "/config":
-                from nimcode.config import configure_interactive
-
-                configure_interactive(config)
-                continue
-            elif user_input.strip().lower().startswith("/test"):
-                parts = user_input.strip().split(" ", 1)
-                test_cmd = parts[1].strip() if len(parts) > 1 else None
-                from nimcode.tools import execute_test_runner
-
-                root_path = (
-                    Path(workspace_root).resolve()
-                    if workspace_root
-                    else Path(".").resolve()
-                )
-                secho(
-                    "\nRunning test suite inside validation sandbox...",
-                    fg=typer.colors.CYAN,
-                    bold=True,
-                )
-                res = execute_test_runner(root_path, config, test_cmd)
-                secho(
-                    f"\n--- Test Runner Results ---\n{res}\n---------------------------",
-                    fg=typer.colors.CYAN,
-                )
-                continue
-            elif user_input.strip().lower() == "/team":
-                from nimcode.tools import ACTIVE_SUBAGENTS
-
-                if not ACTIVE_SUBAGENTS:
-                    secho(
-                        "No subagents spawned yet. Use `spawn_agent` tool or ask nimcode to delegate tasks.",
-                        fg=typer.colors.YELLOW,
-                    )
-                else:
-                    secho(
-                        "\nActive Subagent Swarm Team:", fg=typer.colors.CYAN, bold=True
-                    )
-                    for aid, sub in ACTIVE_SUBAGENTS.items():
-                        echo(f"  [{aid}] Role: {sub['role']} | Status: {sub['status']}")
-                        echo(
-                            f"       Summary: {sub['output'][:120]}...\n"
-                            if len(sub["output"]) > 120
-                            else f"       Summary: {sub['output']}\n"
-                        )
-                continue
-            if user_input.startswith("/install-skill "):
-                url = user_input.split(" ", 1)[1].strip()
-                secho(f"Installing skill from {url}...", fg=typer.colors.CYAN)
-                from nimcode import skills
-
-                result = skills.install_skill(url)
-                secho(result, fg=typer.colors.GREEN, bold=True)
-                continue
-            elif user_input.strip().lower().startswith("/kill"):
-                parts = user_input.strip().split(" ", 1)
-                if len(parts) < 2 or not parts[1].strip():
-                    secho(
-                        "Usage: /kill <agent_id> or /kill <process_id>",
-                        fg=typer.colors.YELLOW,
-                    )
-                else:
-                    aid = parts[1].strip()
-                    from nimcode.tools.swarm import ACTIVE_SUBAGENTS
-                    from nimcode.tools.cmd import (
-                        BACKGROUND_PROCESSES,
-                        stop_process_tool,
-                    )
-
-                    if aid in ACTIVE_SUBAGENTS:
-                        ACTIVE_SUBAGENTS[aid]["status"] = "KILLED"
-                        ACTIVE_SUBAGENTS[aid]["output"] = (
-                            "Killed by user slash command."
-                        )
-                        secho(
-                            f"Subagent '{aid}' has been killed.", fg=typer.colors.GREEN
-                        )
-                    elif aid in BACKGROUND_PROCESSES:
-                        res = stop_process_tool(
-                            {"process_id": aid}, workspace_root, config
-                        )
-                        secho(res, fg=typer.colors.GREEN)
-                    else:
-                        secho(
-                            f"No subagent or background process found with ID '{aid}'.",
-                            fg=typer.colors.RED,
-                        )
-                continue
-            elif user_input.lower() == "/model":
-                from nimcode.config import select_interactive_model
-
-                select_interactive_model(
-                    config,
-                    client,
-                    workspace_root=workspace_root,
-                    messages=messages,
-                    session_path=session_path,
-                )
-                continue
-            elif user_input.strip().lower() == "/compact":
-                from nimcode.config import generate_summary_with_progress
-                from nimcode.ui.output import console
-
-                _con = console
-                user_messages = [m for m in messages if m.get("role") == "user"]
-                if len(user_messages) < 2:
-                    _con.print(
-                        "[yellow]Not enough conversation history to compact yet. Send at least one message first.[/yellow]\n"
-                    )
-                else:
-                    # Estimate rough token count for display
-                    total_chars = sum(
-                        len(str(m.get("content", "")))
-                        + len(str(m.get("tool_calls", "")))
-                        for m in messages
-                    )
-                    est_tokens = total_chars // 4
-                    _con.print(
-                        f"[bold cyan][compact] /compact[/bold cyan] Current history: [bold]{len(messages)}[/bold] messages (~[bold]{est_tokens:,}[/bold] tokens).\n"
-                        f"This will ask the model to summarise the conversation, then [bold red]erase[/bold red] the full history\n"
-                        f"and replace it with the summary to free up context space.\n"
-                    )
-                    try:
-                        from prompt_toolkit import prompt as pt_prompt
-                        from prompt_toolkit.patch_stdout import patch_stdout
-
-                        with patch_stdout():
-                            ans = (
-                                pt_prompt("Proceed with compaction? (y/n) [n]: ")
-                                .strip()
-                                .lower()
-                            )
-                        confirmed = ans in ("y", "yes")
-                    except (KeyboardInterrupt, EOFError):
-                        _con.print("[dim]Compact cancelled.[/dim]\n")
-                        continue
-
-                    if not confirmed:
-                        _con.print("[dim]Compact cancelled.[/dim]\n")
-                    else:
-                        current_model = (
-                            config.fast_model
-                            if state != AgentState.AWAITING_PLAN_APPROVAL
-                            else config.plan_model
-                        )
-                        _con.print(
-                            f"[cyan]Asking {current_model} to summarise the conversation...[/cyan]"
-                        )
-                        success = generate_summary_with_progress(
-                            client, messages, current_model, config, workspace_root
-                        )
-                        if success:
-                            sys_prompt = None
-                            if messages and messages[0].get("role") == "system":
-                                sys_prompt = messages[0]
-                            messages.clear()
-                            if sys_prompt:
-                                messages.append(sys_prompt)
-
-                            summary_file = (
-                                get_project_nimcode_dir(workspace_root) / "summary.md"
-                            )
-                            if summary_file.exists():
-                                summary_text = summary_file.read_text(encoding="utf-8")
-                                handoff_block = (
-                                    "<model_handoff_context>\n"
-                                    "Context has been compacted to save tokens.\n"
-                                    "Here is the accurate summary (`summary.md`) of the previous conversation:\n\n"
-                                    f"{summary_text}\n"
-                                    "</model_handoff_context>\n"
-                                )
-                                inj_msg = {"role": "user", "content": handoff_block}
-                                messages.append(inj_msg)
-                                if session_path:
-                                    log_turn(inj_msg, session_path)
-
-                            after_chars = sum(
-                                len(str(m.get("content", ""))) for m in messages
-                            )
-                            after_tokens = after_chars // 4
-                            _con.print(
-                                f"[bold green][OK] Compacted.[/bold green] History now: [bold]{len(messages)}[/bold] messages (~[bold]{after_tokens:,}[/bold] tokens).\n"
-                            )
-                        else:
-                            _con.print(
-                                "[red]Compaction failed; history has not been modified.[/red]\n"
-                            )
-
-                continue
-            elif user_input.strip().lower() == "/recap":
-                from nimcode.ui.output import console
-                from rich.panel import Panel
-
-                _con = console
-                user_messages = [m for m in messages if m.get("role") == "user"]
-                if len(user_messages) < 1:
-                    _con.print(
-                        "[yellow]No conversation history yet. Send at least one message first.[/yellow]\n"
-                    )
-                else:
-                    current_model = (
-                        config.fast_model
-                        if state != AgentState.AWAITING_PLAN_APPROVAL
-                        else config.plan_model
-                    )
-                    _con.print(
-                        "[cyan]Asking Mistral Small to recap the session...[/cyan]"
-                    )
-
-                    recap_prompt = [
-                        {
-                            "role": "user",
-                            "content": "Please provide a very brief, high-level summary of what has happened in this session so far (such as tasks completed, main code files edited, and current status). The summary must be at most 4 to 5 lines long.",
-                        }
-                    ]
-                    pruned_msgs = prune_history(messages, config.context_budget_tokens)
-                    recap_req_messages = list(pruned_msgs) + recap_prompt
-
-                    try:
-                        recap_res = call_nim_with_retry(
-                            client,
-                            recap_req_messages,
-                            None,
-                            "mistralai/mistral-small-4-119b-2603",
-                            config,
-                            timeout=30.0,
-                        )
-                    except Exception:
-                        try:
-                            recap_res = call_nim_with_retry(
-                                client,
-                                recap_req_messages,
-                                None,
-                                current_model,
-                                config,
-                                timeout=30.0,
-                            )
-                        except Exception as e:
-                            _con.print(f"[red]Error generating recap: {e}[/red]\n")
-                            continue
-
-                    recap_text = strip_reasoning_spans(
-                        recap_res.choices[0].message.content or ""
-                    ).strip()
-                    _con.print(
-                        Panel(
-                            recap_text,
-                            title="Session Recap",
-                            border_style="green",
-                            padding=(1, 2),
-                        )
-                    )
-                    _con.print()
-                continue
-            elif user_input.lower() == "/skills":
-                from nimcode import skills
-
-                skill_list = skills.list_skills()
-                if not skill_list:
-                    secho("No skills installed yet.", fg=typer.colors.CYAN)
-                else:
-                    secho("\nInstalled Skills:", fg=typer.colors.CYAN, bold=True)
-                    for s in skill_list:
-                        echo(f"  /{s}")
-                continue
-            elif user_input.lower() == "/init":
-                run_init_command(config, client=client, workspace_root=workspace_root)
-                continue
-            elif user_input.lower() == "/resume":
-                from nimcode.config import select_interactive_session
-
-                selected_session = select_interactive_session(config, workspace_root)
-                if selected_session:
-                    try:
-                        with open(selected_session, "r", encoding="utf-8") as f:
-                            existing_msgs = json.load(f)
-                        messages[:] = existing_msgs
-                        session_path = selected_session
-                        secho(
-                            f"\nResumed session: {selected_session.name}",
-                            fg=typer.colors.GREEN,
-                            bold=True,
-                        )
-                        print_session_history(messages)
-
-                        # Patch up dangling tool calls so the history is valid
-                        if messages:
-                            last_msg = messages[-1]
-                            if last_msg.get("role") == "assistant" and last_msg.get(
-                                "tool_calls"
-                            ):
-                                for tc in last_msg["tool_calls"]:
-                                    dummy_res = {
-                                        "role": "tool",
-                                        "tool_call_id": tc.get("id"),
-                                        "content": "Execution aborted due to session suspension.",
-                                    }
-                                    messages.append(dummy_res)
-                                    log_turn(dummy_res, session_path)
-
-                        # Show a brief summary of where the session left off
-                        last_non_system = next(
-                            (
-                                m
-                                for m in reversed(messages)
-                                if m.get("role") != "system"
-                            ),
-                            None,
-                        )
-                        if last_non_system:
-                            role = last_non_system.get("role", "?")
-                            snippet = (
-                                str(last_non_system.get("content") or "")
-                                .strip()
-                                .replace("\n", " ")
-                            )
-                            if len(snippet) > 120:
-                                snippet = snippet[:120] + "..."
-                            secho(
-                                f"\nSession last left off with a [{role}] message:",
-                                fg=typer.colors.CYAN,
-                            )
-                            secho(f"  {snippet}", fg=typer.colors.WHITE)
-
-                        secho(
-                            "\nWhat would you like to do?",
-                            fg=typer.colors.CYAN,
-                            bold=True,
-                        )
-                        secho(
-                            "  y          → Continue where it left off (agent picks up from last state)",
-                            fg=typer.colors.GREEN,
-                        )
-                        secho(
-                            "  <message>  → Give the agent new instructions",
-                            fg=typer.colors.GREEN,
-                        )
-                        secho(
-                            "  n / enter  → Stay in session but do nothing (type your own prompt)",
-                            fg=typer.colors.GREEN,
-                        )
-
-                        try:
-                            sys.stdout.flush()
-                            resume_choice = input(
-                                "\nContinue / new instructions / n: "
-                            ).strip()
-                        except (KeyboardInterrupt, EOFError):
-                            resume_choice = ""
-
-                        if resume_choice.lower() == "y":
-                            return "__RESUME_AI_LOOP__"
-                        elif resume_choice.lower() in ("n", ""):
-                            # Stay in session, loop back to get_user_turn for fresh prompt
-                            secho(
-                                "\nSession loaded. Type your instructions below.\n",
-                                fg=typer.colors.CYAN,
-                            )
-                            continue
-                        else:
-                            # Treat whatever they typed as a new user message
-                            user_msg = {"role": "user", "content": resume_choice}
-                            messages.append(user_msg)
-                            log_turn(user_msg, session_path)
-                            return "__RESUME_AI_LOOP__"
-
-                    except Exception as e:
-                        secho(f"Error loading session: {e}", fg=typer.colors.RED)
-                continue
-            elif (
-                user_input.startswith("/")
-                and user_input.strip().lower().split()[0]
-                not in [
-                    "/exit",
-                    "/quit",
-                    "/help",
-                    "/model",
-                    "/config",
-                    "/changes",
-                    "/diff",
-                    "/test",
-                    "/team",
-                    "/compact",
-                    "/recap",
-                    "/skills",
-                    "/init",
-                    "/resume",
-                    "/kill",
-                    "?",
-                ]
-                and not user_input.strip().lower().startswith("/install-skill")
-            ):
-                from nimcode import skills
-
-                parts = user_input.split(" ", 1)
-                skill_name = parts[0][1:]
-                installed = skills.list_skills()
-                if skill_name in installed:
-                    content = skills.get_skill_content(skill_name)
-                    rest_of_prompt = parts[1] if len(parts) > 1 else ""
-                    secho(
-                        f"Injecting context from skill: {skill_name}...",
-                        fg=typer.colors.CYAN,
-                    )
-                    return f"<skill_context>\n{content}\n</skill_context>\n\n{rest_of_prompt}"
-                else:
-                    secho(
-                        f"Unknown command: {user_input.split()[0]}. Type /help or ? for available commands.",
-                        fg=typer.colors.YELLOW,
-                    )
-                    continue
-            return user_input
-
-    while True:
-        try:
-            enable_persistent_prompt(state, config, workspace_root, user_input)
-
-            if skip_first_api_call:
-                skip_first_api_call = False
-                user_input = get_user_turn()
-                if user_input is None or user_input.lower() in [
-                    "exit",
-                    "quit",
-                    "/exit",
-                    "/quit",
-                    "q",
-                    "done",
-                ]:
-                    secho(
-                        "\nTask completed. Exiting nimcode session.",
-                        fg=typer.colors.GREEN,
-                        bold=True,
-                    )
-                    break
-
-                if user_input == "__RESUME_AI_LOOP__":
-                    loop_count = 0
-                    continue
-
-                user_msg = {"role": "user", "content": user_input}
-                messages.append(user_msg)
-                log_turn(user_msg, session_path)
-                loop_count = 0
-                continue
-
-            # Refresh system prompt with latest AGENTS.md and live workspace tree
-            if messages and len(messages) > 0 and messages[0].get("role") == "system":
-                from nimcode.context import generate_workspace_map
-
-                workspace_map = generate_workspace_map(str(workspace_root))
-                messages[0]["content"] = build_system_prompt(
-                    str(workspace_root),
-                    workspace_map,
-                    disable_native_tools=config.disable_native_tools,
-                )
-
-            current_model = (
-                config.plan_model
-                if state == AgentState.AWAITING_PLAN_APPROVAL
-                else config.fast_model
-            )
-            # During AWAITING_PLAN_APPROVAL or when native tools are disabled, do not pass tools
-            tools_arg = (
-                None
-                if (
-                    state == AgentState.AWAITING_PLAN_APPROVAL
-                    or config.disable_native_tools
-                )
-                else AVAILABLE_TOOLS_SPEC
-            )
-
-            if config.pending_summary_injection:
-                summary_file = (
-                    get_project_nimcode_dir(
-                        workspace_root if workspace_root else Path.cwd()
-                    )
-                    / "summary.md"
-                )
-                if summary_file.exists():
-                    summary_text = summary_file.read_text(encoding="utf-8")
-                    old_m = config.pending_summary_old_model or "previous model"
-                    new_m = config.pending_summary_new_model or current_model
-                    handoff_block = f"<model_handoff_context>\nAI Model has been switched from {old_m} to {new_m}.\nTo ensure proper context continuity, here is the accurate summary (`summary.md`) generated by the previous model:\n\n{summary_text}\n</model_handoff_context>\n\n"
-                    last_user_idx = -1
-                    for idx in range(len(messages) - 1, -1, -1):
-                        if messages[idx].get("role") == "user":
-                            last_user_idx = idx
-                            break
-                    if last_user_idx != -1:
-                        messages[last_user_idx]["content"] = handoff_block + str(
-                            messages[last_user_idx].get("content", "")
-                        )
-                        if session_path:
-                            log_turn(messages[last_user_idx], session_path)
-                    else:
-                        if messages and messages[-1].get("role") == "tool":
-                            dummy_ack = {
-                                "role": "assistant",
-                                "content": "Context handoff.",
-                            }
-                            messages.append(dummy_ack)
-                            if session_path:
-                                log_turn(dummy_ack, session_path)
-                        inj_msg = {
-                            "role": "user",
-                            "content": handoff_block
-                            + "Please review this context and proceed.",
-                        }
-                        messages.append(inj_msg)
-                        if session_path:
-                            log_turn(inj_msg, session_path)
-                    secho(
-                        f"\nInjected summary.md context into prompt for {current_model}.",
-                        fg=typer.colors.CYAN,
-                        bold=True,
-                    )
-                config.pending_summary_injection = False
-
-            try:
-                import sys
-                import rich.spinner
-                from nimcode.ui.output import console
-
-                rich.spinner.SPINNERS["working_dots"] = {
-                    "interval": 300,
-                    "frames": ["working", "working.", "working..", "working..."],
-                }
-                c = console
-                import shutil
-
-                term_height = shutil.get_terminal_size().lines
-                sys.stdout.write(f"\033[{term_height - 3};1H")
-                sys.stdout.flush()
-                try:
-                    with c.status(
-                        "[dim](Press esc to cancel)[/dim]",
-                        spinner="working_dots",
-                        spinner_style="cyan",
-                    ):
-                        response = call_nim_with_retry(
-                            client, messages, tools_arg, current_model, config
-                        )
-                finally:
-                    sys.stdout.write(f"\033[{term_height - 4};1H")
-                    sys.stdout.flush()
-
-            except Exception as e:
-                secho(f"\nFatal API error: {e}", fg=typer.colors.RED, bold=True)
-                break
-
-            raw_message = response.choices[0].message
-            cleaned_content = strip_reasoning_spans(raw_message.content or "")
-
-            if config.disable_native_tools:
-                xml_calls = parse_xml_tool_calls(cleaned_content)
-                raw_message = MockMessage(cleaned_content, xml_calls)
-
-            # Build serializable message for history
-            msg_dict: Dict[str, Any] = {"role": "assistant", "content": cleaned_content}
-            if raw_message.tool_calls:
-                msg_dict["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": tc.type,
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in raw_message.tool_calls
-                ]
-            messages.append(msg_dict)
-            log_turn(msg_dict, session_path)
-
-            # State 1: AWAITING_PLAN_APPROVAL
-            if state == AgentState.AWAITING_PLAN_APPROVAL:
-                plan_text = extract_plan_block(cleaned_content)
-                if not plan_text:
-                    secho(
-                        "\n--- Proposed Architectural Plan ---",
-                        fg=typer.colors.BLUE,
-                        bold=True,
-                    )
-                    echo(cleaned_content)
-                    secho(
-                        "-----------------------------------",
-                        fg=typer.colors.BLUE,
-                        bold=True,
-                    )
-                else:
-                    secho(
-                        "\n--- Proposed Architectural Plan (<plan>) ---",
-                        fg=typer.colors.BLUE,
-                        bold=True,
-                    )
-                    echo(plan_text)
-                    secho(
-                        "--------------------------------------------",
-                        fg=typer.colors.BLUE,
-                        bold=True,
-                    )
-
-                approval = (
-                    prompt_user(
-                        "Approve this plan to begin execution? (y/n/yolo for yolo mode)"
-                    )
-                    .strip()
-                    .lower()
-                )
-                is_yolo_target = approval == "yolo" or (
-                    approval == "y"
-                    and (
-                        state == AgentState.YOLO
-                        or getattr(config, "mode", "") == "yolo"
-                    )
-                )
-                if approval in ("q", "n", ""):
-                    # Cancel plan — stay in session, let user redirect
-                    secho(
-                        "\nPlan cancelled. You can refine your request or type a new prompt.\n",
-                        fg=typer.colors.YELLOW,
-                        bold=True,
-                    )
-                    cancel_msg = {
-                        "role": "user",
-                        "content": "[Plan rejected/cancelled by user. Awaiting new instructions.]",
-                    }
-                    messages.append(cancel_msg)
-                    log_turn(cancel_msg, session_path)
-                    loop_count = 0
-                    user_input = get_user_turn()
-                    if user_input is None or user_input.lower() in [
-                        "exit",
-                        "quit",
-                        "/exit",
-                        "/quit",
-                    ]:
-                        secho(
-                            "\nExiting nimcode session.",
-                            fg=typer.colors.GREEN,
-                            bold=True,
-                        )
-                        break
-                    if user_input == "__RESUME_AI_LOOP__":
-                        loop_count = 0
-                        continue
-                    user_msg = {"role": "user", "content": user_input}
-                    messages.append(user_msg)
-                    log_turn(user_msg, session_path)
-                    loop_count = 0
-                    continue
-                elif is_yolo_target:
-                    state = AgentState.YOLO
-                    config.mode = "yolo"
-                    current_model = config.fast_model
-                    secho(
-                        f"\nPlan approved! Switching to {state} state (Auto-approval enabled) with fast model: {current_model}\n",
-                        fg=typer.colors.RED,
-                        bold=True,
-                    )
-                    trigger_msg = {
-                        "role": "user",
-                        "content": "Plan approved. Please proceed with step 1 using tool calls.",
-                    }
-                    messages.append(trigger_msg)
-                    log_turn(trigger_msg, session_path)
-                    continue
-                elif approval != "y":
-                    feedback = prompt_user(
-                        "Plan rejected. Enter feedback/revisions for the model"
-                    )
-                    user_msg = {
-                        "role": "user",
-                        "content": f"Plan rejected by user. Feedback: {feedback}. Please revise the <plan>.",
-                    }
-                    messages.append(user_msg)
-                    log_turn(user_msg, session_path)
-                    continue
-
-                state = AgentState.EXECUTING
-                config.mode = "build"
-                current_model = config.fast_model
-                secho(
-                    f"\nPlan approved! Switching to {state} state with fast model: {current_model}\n",
-                    fg=typer.colors.GREEN,
-                    bold=True,
-                )
-                # Ask the model to begin executing step 1
-                trigger_msg = {
-                    "role": "user",
-                    "content": "Plan approved. Please proceed with step 1 using tool calls.",
-                }
-                messages.append(trigger_msg)
-                log_turn(trigger_msg, session_path)
-                continue
-
-            # State 2: EXECUTING
-            if not raw_message.tool_calls:
-                if cleaned_content:
-                    echo(f"\n{cleaned_content}")
-
-                user_input = get_user_turn()
-                if user_input is None or user_input.lower() in [
-                    "exit",
-                    "quit",
-                    "/exit",
-                    "/quit",
-                    "q",
-                    "done",
-                ]:
-                    secho(
-                        "\nTask completed. Exiting nimcode session.",
-                        fg=typer.colors.GREEN,
-                        bold=True,
-                    )
-                    break
-
-                if user_input == "__RESUME_AI_LOOP__":
-                    loop_count = 0
-                    continue
-
-                user_msg = {"role": "user", "content": user_input}
-                messages.append(user_msg)
-                log_turn(user_msg, session_path)
-                loop_count = 0  # Reset loop counter on human input turn
-                continue
-
-            # If in YOLO mode, allow up to 50 steps before checking in, otherwise use config limit
-            loop_limit = 50 if state == AgentState.YOLO else config.max_loop_iterations
-            if loop_count >= loop_limit:
-                secho(
-                    f"\nWarning: Max consecutive loop iterations ({loop_limit}) reached without human check-in. Stopping runaway execution.",
-                    fg=typer.colors.YELLOW,
-                    bold=True,
-                )
-                user_input = prompt_user(
-                    "Resume loop? (y to continue / feedback to redirect / n or q to cancel & stay)"
-                ).strip()
-                if user_input.lower() in ("q", "n", ""):
-                    # Cancel the current loop — inject cancellation results and hand back to user
-                    secho(
-                        "\nLoop cancelled. You're still in the session — type a new prompt.\n",
-                        fg=typer.colors.YELLOW,
-                        bold=True,
-                    )
-                    if raw_message and raw_message.tool_calls:
-                        for tc in raw_message.tool_calls:
-                            cancel_msg = {
-                                "role": "tool",
-                                "tool_call_id": tc.id,
-                                "content": "Execution cancelled by user (loop limit reached). Awaiting new instructions.",
-                            }
-                            messages.append(cancel_msg)
-                            log_turn(cancel_msg, session_path)
-                    loop_count = 0
-                    user_input = get_user_turn()
-                    if user_input is None or user_input.lower() in [
-                        "exit",
-                        "quit",
-                        "/exit",
-                        "/quit",
-                    ]:
-                        secho(
-                            "\nExiting nimcode session.",
-                            fg=typer.colors.GREEN,
-                            bold=True,
-                        )
-                        break
-                    if user_input == "__RESUME_AI_LOOP__":
-                        loop_count = 0
-                        continue
-                    user_msg = {"role": "user", "content": user_input}
-                    messages.append(user_msg)
-                    log_turn(user_msg, session_path)
-                    loop_count = 0
-                    continue
-                elif user_input.lower() != "y":
-                    if raw_message and raw_message.tool_calls:
-                        for tc in raw_message.tool_calls:
-                            cancel_msg = {
-                                "role": "tool",
-                                "tool_call_id": tc.id,
-                                "content": f"Execution redirected by user. Feedback: {user_input}",
-                            }
-                            messages.append(cancel_msg)
-                            log_turn(cancel_msg, session_path)
-                    loop_count = 0
-                    continue
-                loop_count = 0
-
-            loop_count += 1
-
-            # Process tool calls
-            for tool_call in raw_message.tool_calls:
-                is_valid, tool_name, args = is_valid_tool_call(tool_call)
-                if not is_valid:
-                    raw_args = getattr(
-                        getattr(tool_call, "function", None), "arguments", ""
-                    )
-                    result = (
-                        f"Error: Tool call '{tool_name}' was rejected (malformed or unknown). "
-                        f"Raw arguments received: {raw_args!r}. "
-                        "Please re-issue the tool call with valid JSON arguments matching the tool schema. "
-                        "Do NOT wrap JSON in markdown code fences."
-                    )
-                    secho(f"\nWarning: {result}", fg=typer.colors.RED)
-                else:
-                    preview = render_preview(
-                        tool_name, args, workspace_root, config=config
-                    )
-                    echo(preview)
-
-                    if state == AgentState.YOLO:
-                        secho(
-                            f"[YOLO Mode] Auto-approving execution of {tool_name}...",
-                            fg=typer.colors.RED,
-                            bold=True,
-                        )
-                        approval = "y"
-                    else:
-                        approval = (
-                            prompt_user(
-                                f"Approve execution of {tool_name}? (y/n to skip)"
-                            )
-                            .strip()
-                            .lower()
-                        )
-                    if approval == "q":
-                        # Treat q same as n — cancel this tool call, stay in session
-                        approval = "n"
-                    elif approval == "y":
-                        result = execute_local_tool(
-                            tool_name, args, workspace_root, config
-                        )
-                        secho(
-                            f"--- Output ({len(result)} chars) ---\n{result}\n-----------------------------",
-                            fg=typer.colors.CYAN,
-                        )
-                        if state == AgentState.YOLO and tool_name in [
-                            "write_file",
-                            "patch_file_ast",
-                            "patch_file_blocks",
-                        ]:
-                            from nimcode.tools import execute_test_runner, tests_passed
-
-                            secho(
-                                "\n[YOLO Mode] Code changed. Auto-running test suite for verification...",
-                                fg=typer.colors.RED,
-                                bold=True,
-                            )
-                            test_res = execute_test_runner(workspace_root, config)
-                            secho(
-                                f"--- Test Results ---\n{test_res}\n--------------------",
-                                fg=typer.colors.CYAN,
-                            )
-                            if not tests_passed(test_res):
-                                result += f"\n\n[CRITICAL WARNING: Auto-run tests failed! Please fix this immediately]\n{test_res}"
-                    else:
-                        feedback = prompt_user(
-                            "Execution rejected. Enter feedback/reason (or leave blank for 'Rejected by user')"
-                        ).strip()
-                        result = feedback if feedback else "Rejected by user."
-                        secho("Execution rejected.", fg=typer.colors.YELLOW)
-
-                tool_result_msg = {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": result,
-                }
-                messages.append(tool_result_msg)
-                log_turn(tool_result_msg, session_path)
-
-            messages = prune_history(messages, config.context_budget_tokens)
-
-        except KeyboardInterrupt:
-            secho(
-                "\n\n[Stopped by ESC/Interrupt] Stopped working on current prompt. Standing by for next prompt...\n",
-                fg=typer.colors.YELLOW,
-                bold=True,
-            )
-            if messages and messages[-1].get("role") == "tool":
-                dummy_ack = {
-                    "role": "assistant",
-                    "content": "Tool execution interrupted.",
-                }
-                messages.append(dummy_ack)
-                log_turn(dummy_ack, session_path)
-
-            user_msg = {
-                "role": "user",
-                "content": "[Operation interrupted and cancelled by user via ESC/Ctrl+C. Standing by for new instructions.]",
-            }
-            messages.append(user_msg)
-            log_turn(user_msg, session_path)
-            loop_count = 0
-
-            user_input = get_user_turn()
-            if user_input is None or user_input.lower() in [
-                "exit",
-                "quit",
-                "/exit",
-                "/quit",
-                "q",
-                "done",
-            ]:
-                secho(
-                    "\nTask completed. Exiting nimcode session.",
-                    fg=typer.colors.GREEN,
-                    bold=True,
-                )
-                break
-
-            if user_input == "__RESUME_AI_LOOP__":
-                loop_count = 0
-                continue
-
-            user_msg = {"role": "user", "content": user_input}
-            messages.append(user_msg)
-            log_turn(user_msg, session_path)
-            continue
-
-    from nimcode.tools.cmd import cleanup_background_processes
-
-    cleanup_background_processes()
-    disable_persistent_prompt()
-    atexit.unregister(disable_persistent_prompt)

@@ -1,6 +1,7 @@
 """Rust TUI sidecar bridge — the nimcode TUI. Speaks NDJSON to nim-tui."""
 
 from __future__ import annotations
+import asyncio
 import json
 import logging
 import os
@@ -14,17 +15,27 @@ from typing import Any, Dict, List, Optional
 _log = logging.getLogger(__name__)
 
 
+BINARY_NAME = "nim-tui.exe" if os.name == "nt" else "nim-tui"
+
+BINARY_MISSING_MSG = (
+    f"nim-tui sidecar binary ({BINARY_NAME}) not found. Fix one of:\n"
+    "  1) install the nimcode wheel for your platform (it bundles the binary);\n"
+    "  2) build it: cd tui-rs && cargo build --release;\n"
+    "  3) set NIM_TUI_BIN to the path of an existing nim-tui binary."
+)
+
+
 def find_rust_binary() -> Optional[Path]:
+    """Order: NIM_TUI_BIN, bundled nimcode/bin, tui-rs/target/release, PATH."""
     env = os.environ.get("NIM_TUI_BIN")
     if env and Path(env).exists():
         return Path(env)
     here = Path(__file__).resolve()
     cands: List[Path] = [
-        # bundled with the pip package — works out of the box
-        here.parents[1] / "bin" / "nim-tui.exe",
-        here.parents[1] / "bin" / "nim-tui",
-        here.parents[3] / "tui-rs" / "target" / "release" / "nim-tui.exe",
-        here.parents[3] / "tui-rs" / "target" / "release" / "nim-tui",
+        # bundled with the platform wheel — works out of the box
+        here.parents[1] / "bin" / BINARY_NAME,
+        # source checkout: local cargo build
+        here.parents[3] / "tui-rs" / "target" / "release" / BINARY_NAME,
     ]
     which = shutil.which("nim-tui")
     if which:
@@ -35,21 +46,11 @@ def find_rust_binary() -> Optional[Path]:
     return None
 
 
-def _strip_backup_stamp(name: str) -> str:
-    """'<ts>_<pid>_src_a.py' (or legacy '<ts>_src_a.py') -> 'src_a.py'."""
-    import re
-
-    return re.sub(r"^\d+_(?:\d+_)?", "", name) or name
-
-
 def make_tui(config=None):
     """Create the nimcode TUI (Rust sidecar). Requires the bundled binary."""
     binary = find_rust_binary()
     if binary is None:
-        raise RuntimeError(
-            "nim-tui binary not found. Run: cargo build --release --manifest-path tui-rs/Cargo.toml "
-            "(or set NIM_TUI_BIN to its path)."
-        )
+        raise RuntimeError(BINARY_MISSING_MSG)
     return RustTUI(config)
 
 
@@ -65,9 +66,7 @@ class RustTUI:
             )
         self._bin = find_rust_binary()
         if not self._bin:
-            raise RuntimeError(
-                "nim-tui binary not found. Run: cargo build --release --manifest-path tui-rs/Cargo.toml"
-            )
+            raise RuntimeError(BINARY_MISSING_MSG)
         self._proc: Optional[subprocess.Popen] = None
         self._sock = None
         self._wfile = None
@@ -314,6 +313,29 @@ class RustTUI:
         for ev in keep:
             self._events.put(ev)
 
+    def poll_events(self) -> None:
+        """Non-blocking: apply queued mode_cycle / interrupt events now.
+
+        Called between tool calls so Shift+Tab out of YOLO takes effect for
+        the rest of the batch. Other events (input, eof, ...) stay queued.
+        """
+        keep = []
+        while True:
+            try:
+                ev = self._events.get_nowait()
+            except queue.Empty:
+                break
+            t = ev.get("type")
+            if t == "mode_cycle":
+                if self.config:
+                    self.update_mode(ev.get("mode", self.mode))
+            elif t == "interrupt":
+                self._interrupted = True
+            else:
+                keep.append(ev)
+        for ev in keep:
+            self._events.put(ev)
+
     # -- TUI API used by the agent loop --
     def consume_eof(self) -> bool:
         """Return-and-clear the sticky Ctrl+D request (polled by the agent loop)."""
@@ -462,21 +484,12 @@ class RustTUI:
 
     # Selectors: list-driven; model handoff summarizes via old model, injects into new.
     async def select_session(self, config, workspace_root: Path) -> Optional[Path]:
-        import glob
         import os
         import time
         from nimcode.config import get_project_nimcode_dir
+        from nimcode.core.agent import list_sessions
 
-        sdir = get_project_nimcode_dir(workspace_root) / "sessions"
-        sessions = (
-            sorted(
-                glob.glob(str(sdir / "session_*.json")),
-                key=os.path.getmtime,
-                reverse=True,
-            )
-            if sdir.exists()
-            else []
-        )
+        sessions = list_sessions(get_project_nimcode_dir(workspace_root) / "sessions")
         if not sessions:
             self.add_message("system", "No saved sessions found.")
             return None
@@ -536,7 +549,8 @@ class RustTUI:
                 summary_file = get_project_nimcode_dir(workspace_root) / "summary.md"
                 self.set_working(True, "Generating summary.md for model handoff...")
                 try:
-                    summary_res = call_nim_with_retry(
+                    summary_res = await asyncio.to_thread(
+                        call_nim_with_retry,
                         client,
                         list(messages)
                         + [
@@ -569,8 +583,8 @@ class RustTUI:
                     log_turn(handoff, session_path)
                 try:
                     self.set_working(True, "Injecting context into new model...")
-                    ack_res = call_nim_with_retry(
-                        client, messages, None, new_id, config
+                    ack_res = await asyncio.to_thread(
+                        call_nim_with_retry, client, messages, None, new_id, config
                     )
                 finally:
                     self.set_working(False)
@@ -593,45 +607,31 @@ class RustTUI:
         return new_id
 
     async def restore_backup(self, workspace_root: Path) -> None:
-        import os
         import shutil
-        from nimcode.config import get_project_nimcode_dir
+        from nimcode.tools.base import list_backups
 
-        bdir = get_project_nimcode_dir(workspace_root) / "backups"
-        backups = (
-            sorted(
-                [f for f in bdir.iterdir() if f.is_file()],
-                key=lambda x: x.stat().st_mtime,
-                reverse=True,
-            )
-            if bdir.exists()
-            else []
-        )
+        backups = list_backups(workspace_root)
         if not backups:
             self.add_message("system", "No backups found.")
             return
-        idx = await self._select("SELECT BACKUP TO RESTORE", [b.name for b in backups])
+        labels = [
+            f"[{b['when']}] {b['original'] or b['hint'] + ' (legacy)'}" for b in backups
+        ]
+        idx = await self._select("SELECT BACKUP TO RESTORE", labels)
         if idx is None:
             return
-        # Guess original path: strip "<timestamp>_<pid>_" (backup_file format;
-        # older backups lack the pid) + blocks_/ast_ prefixes.
-        guess = _strip_backup_stamp(backups[idx].name)
-        for prefix in ("blocks_", "ast_"):
-            if guess.startswith(prefix):
-                guess = guess[len(prefix) :]
-        guess_path = guess.replace("_", "/")
-        for candidate in workspace_root.rglob("*"):
-            if candidate.is_file():
-                rel = candidate.relative_to(workspace_root)
-                if str(rel).replace(os.sep, "_").replace("/", "_") == guess:
-                    guess_path = str(rel)
-                    break
-        target = await self.get_user_input(
-            f"Restore to (relative path) [default: {guess_path}]:"
-        )
-        if target is None:
-            return
-        rel = target.strip() or guess_path
+        chosen = backups[idx]
+        rel = chosen["original"]
+        if not rel:
+            # Legacy backup (no manifest entry): the flattened name can't be
+            # mapped back reliably, so ask with a best-effort default.
+            guess_path = chosen["hint"].replace("_", "/")
+            target = await self.get_user_input(
+                f"Restore to (relative path) [default: {guess_path}]:"
+            )
+            if target is None:
+                return
+            rel = target.strip() or guess_path
         dest = (workspace_root / rel).resolve()
         try:
             if not dest.is_relative_to(workspace_root.resolve()):
@@ -642,7 +642,7 @@ class RustTUI:
             return
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(backups[idx], dest)
+            shutil.copy2(chosen["path"], dest)
         except OSError as e:
             self.add_message("system", f"Error: restore failed: {e}")
             return

@@ -3,6 +3,7 @@ import re
 import difflib
 import shlex
 import subprocess
+import threading
 from pathlib import Path
 from typing import Dict, Any, Tuple
 from nimcode.tools.registry import ToolSandboxError
@@ -248,6 +249,10 @@ def scrub_text(text: str) -> str:
     return text
 
 
+BACKUP_MANIFEST = "manifest.jsonl"
+_BACKUP_LOCK = threading.Lock()
+
+
 def backup_file(target_path: Path, workspace_root: Path, tag: str = "") -> None:
     """Copy target_path into the project's backups dir. Never raises."""
     import os
@@ -263,15 +268,94 @@ def backup_file(target_path: Path, workspace_root: Path, tag: str = "") -> None:
         backup_dir.mkdir(parents=True, exist_ok=True)
         timestamp = int(time.time() * 1_000_000)
         try:
-            rel_path = target_path.relative_to(workspace_root.resolve())
+            rel_path = target_path.resolve().relative_to(workspace_root.resolve())
             safe_rel_name = str(rel_path).replace(os.sep, "_").replace("/", "_")
         except Exception:
+            rel_path = None
             safe_rel_name = target_path.name
         prefix = f"{tag}_" if tag else ""
         backup_path = backup_dir / f"{timestamp}_{os.getpid()}_{prefix}{safe_rel_name}"
         shutil.copy2(target_path, backup_path)
+        entry = {
+            "backup": backup_path.name,
+            "original": rel_path.as_posix() if rel_path is not None else None,
+            "tag": tag,
+            "ts": time.time(),
+        }
+        # Subagent threads back up files concurrently: serialize appends.
+        with _BACKUP_LOCK:
+            with open(backup_dir / BACKUP_MANIFEST, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
     except Exception:
         pass
+
+
+def _parse_backup_name(name: str) -> Tuple[Any, str, str]:
+    """Legacy (manifest-less) backup name -> (ts seconds | None, hint, tag).
+
+    Names are '<ts>_<pid>_<tag_><safe_rel>' (older ones lack the pid, and
+    use second rather than microsecond timestamps). `hint` is the
+    separator-flattened relative path, so it is only a guess.
+    """
+    ts_part, _, rest = name.partition("_")
+    hint = rest or name
+    pid, sep, after = hint.partition("_")
+    if sep and pid.isdigit() and after:
+        hint = after
+    try:
+        ts = int(ts_part)
+        if ts > 9999999999:  # microsecond timestamps
+            ts /= 1_000_000
+    except ValueError:
+        ts = None
+    tag = ""
+    for t in ("blocks", "ast"):
+        if hint.startswith(t + "_"):
+            tag, hint = t, hint[len(t) + 1 :]
+            break
+    return ts, hint, tag
+
+
+def list_backups(workspace_root: Path) -> list:
+    """Backups newest first: dicts with backup, path, original (relative posix
+    path, or None for legacy backups without a manifest entry), hint, tag,
+    ts and a display time `when`."""
+    import time
+
+    from nimcode.config import get_project_nimcode_dir
+
+    backup_dir = get_project_nimcode_dir(workspace_root) / "backups"
+    if not backup_dir.is_dir():
+        return []
+    manifest: Dict[str, Dict[str, Any]] = {}
+    try:
+        lines = (backup_dir / BACKUP_MANIFEST).read_text(encoding="utf-8")
+    except OSError:
+        lines = ""
+    for line in lines.splitlines():
+        try:
+            entry = json.loads(line)
+            manifest[entry["backup"]] = entry
+        except (ValueError, KeyError, TypeError):
+            continue
+    out = []
+    for f in backup_dir.iterdir():
+        if not f.is_file() or f.name == BACKUP_MANIFEST:
+            continue
+        entry = manifest.get(f.name)
+        if entry:
+            item = dict(entry, hint=entry.get("original") or f.name)
+        else:
+            ts, hint, tag = _parse_backup_name(f.name)
+            item = {"backup": f.name, "original": None, "hint": hint, "tag": tag}
+            item["ts"] = ts
+        if not isinstance(item.get("ts"), (int, float)):
+            item["ts"] = f.stat().st_mtime
+        item["path"] = f
+        item["when"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(item["ts"]))
+        out.append(item)
+    out.sort(key=lambda e: e["ts"], reverse=True)
+    return out
 
 
 def coerce_output_cap(config: Any, default: int = 100000) -> int:
@@ -491,3 +575,75 @@ def scrub_env(env: Dict[str, str]) -> Dict[str, str]:
     breaks unrelated vars such as TOKENIZERS_PARALLELISM.
     """
     return {k: v for k, v in env.items() if not SENSITIVE_ENV_REGEX.search(k)}
+
+
+# --- SSRF guard (shared by tools/browser.py and skills.py) ---
+_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def _ip_is_internal(ip) -> bool:
+    # is_global (not just is_private) also covers CGNAT 100.64/10, 0.0.0.0,
+    # documentation/benchmark ranges, etc. Embedded IPv4 in IPv6 (mapped,
+    # 6to4, Teredo) is checked too.
+    if ip.version == 6:
+        embedded = ip.ipv4_mapped or ip.sixtofour or (ip.teredo or (None, None))[1]
+        if embedded is not None and _ip_is_internal(embedded):
+            return True
+    return not ip.is_global or ip.is_multicast
+
+
+def _check_url(url: str) -> tuple[bool, str, list]:
+    """Return (ok, reason, vetted_ips). See _is_url_allowed."""
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    if not isinstance(url, str) or any(c in "\\ " or ord(c) < 0x20 for c in url):
+        # Backslashes/whitespace parse differently in urllib vs Chromium
+        # (http://10.0.0.5\@example.com is example.com to urllib, 10.0.0.5 to Chromium).
+        return False, "URL contains disallowed characters", []
+    try:
+        parsed = urlparse(url)
+        scheme = (parsed.scheme or "").lower()
+        host = (parsed.hostname or "").lower()
+        parsed.port  # raises ValueError on garbage ports
+    except Exception:
+        return False, "unparseable URL", []
+    if scheme not in ("http", "https"):
+        return False, f"URL scheme '{scheme}' not allowed (http/https only)", []
+    if not host:
+        return False, "URL has no host", []
+    if host in ("169.254.169.254", "metadata.google.internal"):
+        return False, "URL target is blocked", []
+
+    try:
+        ips = [ipaddress.ip_address(host)]
+    except ValueError:
+        try:
+            ips = [
+                ipaddress.ip_address(info[4][0].split("%")[0])
+                for info in socket.getaddrinfo(host, None)
+            ]
+        except Exception:
+            return False, "URL host does not resolve", []
+        if not ips:
+            return False, "URL host does not resolve", []
+    for ip in ips:
+        if _ip_is_internal(ip):
+            # Explicit localhost stays allowed for the dev-server verify loop,
+            # but only when it resolves to loopback (never to a LAN address).
+            if host in _LOCAL_HOSTS and ip.is_loopback:
+                continue
+            return False, "URL resolves to a private/internal address", []
+    return True, "", ips
+
+
+def _is_url_allowed(url: str) -> tuple[bool, str]:
+    """SSRF guard: allow public hosts + explicit localhost; block everything else.
+
+    Hostnames are DNS-resolved and *every* returned IP is checked, so decimal/
+    octal/hex IP spellings (2130706433, 127.1, 0x7f.0.0.1) and wildcard-DNS
+    tricks (127.0.0.1.nip.io) cannot smuggle loopback/private targets past us.
+    """
+    ok, reason, _ = _check_url(url)
+    return ok, reason

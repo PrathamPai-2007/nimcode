@@ -2,7 +2,7 @@ import os
 import sys
 import tomli
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+from typing import List, Any, Optional
 from pathlib import Path
 
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
@@ -104,7 +104,20 @@ class Config:
     docker_expose_ports: List[int] = field(default_factory=list)
     docker_extra_args: List[str] = field(default_factory=list)
     disable_docker: bool = False
+    # Container resource limits; "" / 0 disables a limit.
+    docker_memory: str = "2g"
+    docker_pids_limit: int = 512
+    docker_cpus: str = "2"
+    docker_network: str = "bridge"  # "bridge" or "none"; "host" is rejected
     api_base_url: Optional[str] = None
+
+
+_DOCKER_LIMIT_KEYS = (
+    "docker_memory",
+    "docker_pids_limit",
+    "docker_cpus",
+    "docker_network",
+)
 
 
 def save_last_used_model(
@@ -129,6 +142,7 @@ def save_last_used_model(
             "docker_expose_ports": config.docker_expose_ports,
             "docker_extra_args": config.docker_extra_args,
             "disable_docker": config.disable_docker,
+            **{k: getattr(config, k) for k in _DOCKER_LIMIT_KEYS},
         }
         # Atomic temp+replace so a crash mid-write can't corrupt model.json.
         tmp = model_file.with_suffix(".json.tmp")
@@ -205,6 +219,10 @@ def save_config(config: Config, workspace_root: Optional[Path] = None):
             f"docker_image = {q(str(config.docker_image))}",
             f"docker_expose_ports = [{', '.join(str(p) for p in ports)}]",
             f"docker_extra_args = {_json.dumps(list(config.docker_extra_args or []))}",
+            f"docker_memory = {q(str(config.docker_memory or ''))}",
+            f"docker_pids_limit = {_num(config.docker_pids_limit, 512)}",
+            f"docker_cpus = {q(str(config.docker_cpus or ''))}",
+            f"docker_network = {q(str(config.docker_network or ''))}",
             f"denylist = {_json.dumps(list(config.denylist or []))}",
         ]
         if getattr(config, "api_base_url", None):
@@ -222,6 +240,7 @@ def _validate_config(cfg: Config) -> None:
     Coerces first: a malformed nimcode.toml (e.g. timeout = "60") warns and
     falls back to defaults instead of crashing startup with TypeError.
     """
+    import re
     import warnings
 
     def _coerce(value, cast, default):
@@ -343,6 +362,32 @@ def _validate_config(cfg: Config) -> None:
         )
         cfg.docker_image = "python:3.11-slim"
 
+    # Docker resource limits: "" / 0 disables; malformed values fall back.
+    mem = str(cfg.docker_memory if cfg.docker_memory is not None else "").strip()
+    if mem in ("", "0"):
+        mem = ""
+    elif not re.fullmatch(r"\d+(\.\d+)?[bkmgBKMG]?", mem):
+        warnings.warn(f"Invalid docker_memory '{mem}'. Using '2g'.")
+        mem = "2g"
+    cfg.docker_memory = mem
+    cfg.docker_pids_limit = _coerce(cfg.docker_pids_limit, int, 512)
+    if isinstance(cfg.docker_pids_limit, bool) or cfg.docker_pids_limit < 0:
+        warnings.warn("docker_pids_limit must be >= 0. Using 512.")
+        cfg.docker_pids_limit = 512
+    cpus = str(cfg.docker_cpus if cfg.docker_cpus is not None else "").strip()
+    if _coerce(cpus or "0", float, -1.0) < 0:
+        warnings.warn(f"Invalid docker_cpus '{cpus}'. Using '2'.")
+        cpus = "2"
+    cfg.docker_cpus = "" if _coerce(cpus or "0", float, 0.0) == 0 else cpus
+    net = str(cfg.docker_network or "").strip().lower()
+    if net not in ("", "bridge", "none"):
+        # "host" / "container:x" would give the sandbox the host's network.
+        warnings.warn(
+            f"docker_network '{net}' not allowed (use 'bridge' or 'none'). Using 'bridge'."
+        )
+        net = "bridge"
+    cfg.docker_network = net
+
 
 def load_config(path: Optional[Any] = None) -> Config:
     import dataclasses
@@ -405,6 +450,9 @@ def load_config(path: Optional[Any] = None) -> Config:
                     cfg.docker_extra_args = mdata["docker_extra_args"]
                 if "disable_docker" in mdata:
                     cfg.disable_docker = mdata["disable_docker"]
+                for key in _DOCKER_LIMIT_KEYS:
+                    if key in mdata:
+                        setattr(cfg, key, mdata[key])
     except Exception:
         pass
 
@@ -413,36 +461,20 @@ def load_config(path: Optional[Any] = None) -> Config:
     return cfg
 
 
-def _format_backup_time(backup_name: str) -> tuple:
-    """Split '<ts>_<safe>' backup names into (display_time, original_hint).
-
-    Handles both second and microsecond timestamps. Never raises.
-    """
-    import time
-
-    parts = backup_name.split("_", 1)
-    original = parts[1] if len(parts) > 1 else backup_name
-    # backup_file() names are "<ts>_<pid>_<tag_><safe>": drop the pid segment.
-    pid, sep, rest = original.partition("_")
-    if sep and pid.isdigit() and rest:
-        original = rest
-    try:
-        ts = int(parts[0])
-        if ts > 9999999999:  # microsecond timestamps from backup_file()
-            ts //= 1_000_000
-        display = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
-    except Exception:
-        display = "Unknown Time"
-    return display, original
+def _backup_label(b: dict) -> str:
+    """Original path from the manifest, else the legacy name-parsed guess."""
+    if b.get("original"):
+        return b["original"]
+    return f"{b['hint']} (legacy, path guessed)"
 
 
 def show_changes(workspace_root: Path, tui: Optional[Any] = None):
     from rich.console import Console
     from rich.table import Table
+    from nimcode.tools.base import list_backups
 
     root = workspace_root.resolve()
-    nimcode_dir = get_project_nimcode_dir(root)
-    backup_dir = nimcode_dir / "backups"
+    backups = list_backups(root)[:15]
 
     git_status = ""
     try:
@@ -469,18 +501,12 @@ def show_changes(workspace_root: Path, tui: Optional[Any] = None):
         else:
             lines.append("*No uncommitted git working tree changes detected.*\n")
 
-        if backup_dir.exists() and any(backup_dir.iterdir()):
+        if backups:
             lines.append("**Recent File Backups (.nimcode/backups/):**")
             lines.append("| Backup Timestamp / File | Original Path / Target |")
             lines.append("| --- | --- |")
-            backups = sorted(
-                [f for f in backup_dir.iterdir() if f.is_file()],
-                key=lambda x: x.stat().st_mtime,
-                reverse=True,
-            )[:15]
             for b in backups:
-                ts_str, original_name = _format_backup_time(b.name)
-                lines.append(f"| {ts_str} | {original_name} |")
+                lines.append(f"| {b['when']} | {_backup_label(b)} |")
         else:
             lines.append("*No backup files stored in .nimcode/backups/ yet.*")
 
@@ -498,300 +524,18 @@ def show_changes(workspace_root: Path, tui: Optional[Any] = None):
     else:
         console.print("[dim]No uncommitted git working tree changes detected.[/dim]\n")
 
-    if backup_dir.exists() and any(backup_dir.iterdir()):
+    if backups:
         table = Table(
             title="Recent File Backups (.nimcode/backups/)", border_style="cyan"
         )
         table.add_column("Backup Timestamp / File", style="bold green")
         table.add_column("Original Path / Target", style="cyan")
-        backups = sorted(
-            [f for f in backup_dir.iterdir() if f.is_file()],
-            key=lambda x: x.stat().st_mtime,
-            reverse=True,
-        )[:15]
         for b in backups:
-            # Shared parser: microsecond timestamps crashed time.localtime().
-            ts_str, original_name = _format_backup_time(b.name)
-            table.add_row(f"{ts_str}", original_name)
+            table.add_row(b["when"], _backup_label(b))
         console.print(table)
     else:
         console.print("[dim]No backup files stored in .nimcode/backups/ yet.[/dim]")
     console.print()
-
-
-def restore_interactive_backup(workspace_root: Path):
-    from rich.console import Console
-    from prompt_toolkit.application import Application
-    from prompt_toolkit.key_binding import KeyBindings
-    from prompt_toolkit.layout.containers import Window
-    from prompt_toolkit.layout.controls import FormattedTextControl
-    from prompt_toolkit.layout.layout import Layout
-    import typer
-    import shutil
-
-    console = Console()
-    root = workspace_root.resolve()
-    nimcode_dir = get_project_nimcode_dir(root)
-    backup_dir = nimcode_dir / "backups"
-
-    if not backup_dir.exists() or not any(backup_dir.iterdir()):
-        console.print("[yellow]No backups found in .nimcode/backups/.[/yellow]\n")
-        return
-
-    backups = sorted(
-        [f for f in backup_dir.iterdir() if f.is_file()],
-        key=lambda x: x.stat().st_mtime,
-        reverse=True,
-    )
-
-    current_index = 0
-    kb = KeyBindings()
-
-    @kb.add("up")
-    def _(event):
-        nonlocal current_index
-        current_index = max(0, current_index - 1)
-
-    @kb.add("down")
-    def _(event):
-        nonlocal current_index
-        current_index = min(len(backups) - 1, current_index + 1)
-
-    @kb.add("enter")
-    def _(event):
-        event.app.exit(result=backups[current_index])
-
-    @kb.add("escape")
-    @kb.add("c-c")
-    def _(event):
-        event.app.exit(result=None)
-
-    def get_text():
-        lines = [("bold", "Select a Backup to Restore\n\n")]
-        for i, b in enumerate(backups):
-            ts_str, original_name = _format_backup_time(b.name)
-
-            if i == current_index:
-                prefix = "> "
-                style = "bold #00ffff"
-            else:
-                prefix = "  "
-                style = ""
-            lines.append((style, f"{prefix}[{ts_str}] {original_name}\n"))
-        lines.append(("", "\nKeyboard: ↑/↓ Navigate  enter Select  esc Cancel\n"))
-        return lines
-
-    layout = Layout(Window(content=FormattedTextControl(text=get_text)))
-    app: Application = Application(layout=layout, key_bindings=kb, erase_when_done=True)
-
-    selected_backup = app.run()
-    if not selected_backup:
-        return
-
-    _, guess_name = _format_backup_time(selected_backup.name)
-    if guess_name.startswith("blocks_"):
-        guess_name = guess_name[len("blocks_") :]
-    if guess_name.startswith("ast_"):
-        guess_name = guess_name[len("ast_") :]
-
-    # Try to find the original file in workspace by matching the backup name pattern
-    # The backup name has all path separators replaced with underscores
-    # We try to match it against actual files in the workspace
-    from nimcode.context import DEFAULT_EXCLUDES
-
-    guess_path = None
-    # Prune node_modules/.git/venvs: a bare rglob walked them all on big repos.
-    for dirpath, dirs, files in os.walk(root):
-        dirs[:] = [d for d in dirs if d not in DEFAULT_EXCLUDES]
-        for name in files:
-            rel = (Path(dirpath) / name).relative_to(root)
-            if str(rel).replace(os.sep, "_").replace("/", "_") == guess_name:
-                guess_path = str(rel)
-                break
-        if guess_path:
-            break
-    if guess_path is None:
-        # Fallback: replace underscores with path separators (may be wrong for files with underscores)
-        guess_path = guess_name.replace("_", "/")
-
-    target_rel = typer.prompt(
-        "Enter target path to restore to (relative to workspace)", default=guess_path
-    )
-    target_path = (root / target_rel).resolve()
-
-    if not target_path.is_relative_to(root):
-        console.print("[red]Error: Target path is outside workspace.[/red]\n")
-        return
-
-    try:
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(selected_backup, target_path)
-        console.print(
-            f"[bold green]Successfully restored backup to {target_rel}[/bold green]\n"
-        )
-    except Exception as e:
-        console.print(f"[bold red]Failed to restore backup: {e}[/bold red]\n")
-
-
-def configure_interactive(config: Config):
-    from rich.console import Console
-    from rich.table import Table
-    import typer
-
-    console = Console()
-    table = Table(title="Current Nimcode Configuration", border_style="cyan")
-    table.add_column("Setting Key", style="bold cyan")
-    table.add_column("Current Value", style="bold green")
-    table.add_column("Description", style="dim")
-
-    table.add_row(
-        "1. output_cap",
-        str(config.output_cap),
-        "Max characters returned by tool outputs",
-    )
-    table.add_row(
-        "2. timeout",
-        str(config.timeout),
-        "Seconds before long-running commands timeout",
-    )
-    table.add_row(
-        "3. auto_backup",
-        str(config.auto_backup),
-        "Automatically backup files before overwriting",
-    )
-    table.add_row(
-        "4. max_loop_iterations",
-        str(config.max_loop_iterations),
-        "Max consecutive AI loop steps without user prompt",
-    )
-    table.add_row(
-        "5. temperature_fast",
-        str(config.temperature_fast),
-        "Temperature for fast/build model generation",
-    )
-    table.add_row(
-        "6. temperature_plan",
-        str(config.temperature_plan),
-        "Temperature for plan model generation",
-    )
-    table.add_row(
-        "7. disable_docker",
-        str(config.disable_docker),
-        "Disable Docker and always execute shell commands on host",
-    )
-    table.add_row(
-        "8. docker_image",
-        str(config.docker_image),
-        "Docker image to use for command sandboxing",
-    )
-
-    console.print(table)
-    choice = (
-        typer.prompt(
-            "Enter setting number to modify (1-8) or press Enter/q to exit",
-            default="q",
-        )
-        .strip()
-        .lower()
-    )
-    if choice == "q" or not choice:
-        return
-
-    if choice == "1":
-        val = typer.prompt(
-            "Enter new output_cap (e.g. 2000, 5000)", default=str(config.output_cap)
-        )
-        try:
-            config.output_cap = int(val)
-            console.print(f"[green]output_cap updated to {config.output_cap}[/green]\n")
-        except ValueError:
-            console.print("[red]Invalid integer.[/red]\n")
-    elif choice == "2":
-        val = typer.prompt(
-            "Enter new timeout in seconds (e.g. 30, 60, 120)",
-            default=str(config.timeout),
-        )
-        try:
-            config.timeout = int(val)
-            console.print(f"[green]timeout updated to {config.timeout}[/green]\n")
-        except ValueError:
-            console.print("[red]Invalid integer.[/red]\n")
-    elif choice == "3":
-        val = (
-            typer.prompt(
-                "Enable auto_backup? (y/n)",
-                default="y" if config.auto_backup else "n",
-            )
-            .strip()
-            .lower()
-        )
-        config.auto_backup = val == "y"
-        console.print(f"[green]auto_backup updated to {config.auto_backup}[/green]\n")
-    elif choice == "4":
-        val = typer.prompt(
-            "Enter max_loop_iterations (e.g. 10, 20)",
-            default=str(config.max_loop_iterations),
-        )
-        try:
-            config.max_loop_iterations = int(val)
-            console.print(
-                f"[green]max_loop_iterations updated to {config.max_loop_iterations}[/green]\n"
-            )
-        except ValueError:
-            console.print("[red]Invalid integer.[/red]\n")
-    elif choice == "5":
-        val = typer.prompt(
-            "Enter temperature_fast (0.0 to 1.0)",
-            default=str(config.temperature_fast),
-        )
-        try:
-            config.temperature_fast = float(val)
-            console.print(
-                f"[green]temperature_fast updated to {config.temperature_fast}[/green]\n"
-            )
-        except ValueError:
-            console.print("[red]Invalid float.[/red]\n")
-    elif choice == "6":
-        val = typer.prompt(
-            "Enter temperature_plan (0.0 to 1.0)",
-            default=str(config.temperature_plan),
-        )
-        try:
-            config.temperature_plan = float(val)
-            console.print(
-                f"[green]temperature_plan updated to {config.temperature_plan}[/green]\n"
-            )
-        except ValueError:
-            console.print("[red]Invalid float.[/red]\n")
-    elif choice == "7":
-        val = (
-            typer.prompt(
-                "Disable Docker? (y/n)",
-                default="y" if config.disable_docker else "n",
-            )
-            .strip()
-            .lower()
-        )
-        config.disable_docker = val == "y"
-        console.print(
-            f"[green]disable_docker updated to {config.disable_docker}[/green]\n"
-        )
-    elif choice == "8":
-        val = typer.prompt(
-            "Enter Docker image name",
-            default=str(config.docker_image),
-        ).strip()
-        if val:
-            config.docker_image = val
-            console.print(
-                f"[green]docker_image updated to {config.docker_image}[/green]\n"
-            )
-        else:
-            console.print("[red]Invalid empty string.[/red]\n")
-
-    # Clamp bad input (e.g. timeout=-5) before it is persisted and used.
-    _validate_config(config)
-    save_config(config)
 
 
 AVAILABLE_MODELS = {
@@ -814,292 +558,6 @@ AVAILABLE_MODELS = {
 }
 
 
-def select_interactive_model(
-    config: Config,
-    client: Optional[Any] = None,
-    messages: Optional[List[Dict[str, Any]]] = None,
-    workspace_root: Optional[Path] = None,
-    session_path: Optional[Path] = None,
-):
-    from prompt_toolkit.application import Application
-    from prompt_toolkit.key_binding import KeyBindings
-    from prompt_toolkit.layout.containers import Window
-    from prompt_toolkit.layout.controls import FormattedTextControl
-    from prompt_toolkit.layout.layout import Layout
-    import typer
-    from rich.console import Console
-
-    console = Console()
-    try:
-        from nimcode.config_models import get_model_catalog
-
-        model_list = get_model_catalog()
-    except Exception:
-        model_list = list(AVAILABLE_MODELS.values())
-    if not model_list:
-        model_list = list(AVAILABLE_MODELS.values())
-    current_model_id = config.fast_model
-
-    current_index = 0
-    for i, m in enumerate(model_list):
-        if m["id"] == current_model_id:
-            current_index = i
-            break
-
-    kb = KeyBindings()
-
-    @kb.add("up")
-    def _(event):
-        nonlocal current_index
-        current_index = max(0, current_index - 1)
-
-    @kb.add("down")
-    def _(event):
-        nonlocal current_index
-        current_index = min(len(model_list) - 1, current_index + 1)
-
-    @kb.add("enter")
-    def _(event):
-        event.app.exit(result=model_list[current_index]["id"])
-
-    @kb.add("escape")
-    @kb.add("c-c")
-    def _(event):
-        event.app.exit(result=None)
-
-    def get_text():
-        lines = [("bold", "Switch Model\n\n")]
-        for i, m in enumerate(model_list):
-            is_curr = m["id"] == current_model_id
-            if i == current_index:
-                prefix = "> "
-                style = "bold #00ffff"
-            else:
-                prefix = "  "
-                style = ""
-
-            suffix = "         (current)" if is_curr else ""
-            lines.append((style, f"{prefix}{m['name']}{suffix}\n"))
-
-        lines.append(("", "\nKeyboard: ↑/↓ Navigate  enter Select  esc Go Back\n"))
-        return lines
-
-    layout = Layout(Window(content=FormattedTextControl(text=get_text)))
-    app: Application = Application(layout=layout, key_bindings=kb, erase_when_done=True)
-
-    try:
-        selection_id = app.run()
-    except Exception:
-        selection_id = None
-
-    if selection_id is None:
-        typer.secho("\nModel selection cancelled.", fg=typer.colors.YELLOW)
-        return
-
-    selected_model = None
-    for m in model_list:
-        if m["id"] == selection_id:
-            selected_model = m
-            break
-
-    if selected_model:
-        old_model = config.fast_model
-        new_model_id = selected_model["id"]
-        save_last_used_model(config, new_model_id, workspace_root)
-        try:
-            from nimcode.config_models import apply_model_context
-
-            changed, ctx_msg = apply_model_context(config, new_model_id, force=True)
-            if changed:
-                console.print(f"[cyan]Note: {ctx_msg}[/cyan]")
-        except Exception:
-            pass
-
-        # If there is prior user prompt history and we have an active client, generate or reuse summary.md
-        if (
-            client is not None
-            and messages is not None
-            and len([m for m in messages if m.get("role") == "user"]) >= 1
-        ):
-            try:
-                from nimcode.core.agent import call_nim_with_retry, log_turn
-                from nimcode.core.prompts import strip_reasoning_spans
-
-                summary_file = (
-                    get_project_nimcode_dir(workspace_root) / "summary.md"
-                    if workspace_root
-                    else None
-                )
-                last_user_msg = next(
-                    (m for m in reversed(messages) if m.get("role") == "user"), None
-                )
-
-                # Do not regenerate if the user hasn't prompted again since the last model switch
-                should_regenerate = True
-                if (
-                    summary_file
-                    and summary_file.exists()
-                    and last_user_msg
-                    and "<model_handoff_context>"
-                    in str(last_user_msg.get("content", ""))
-                ):
-                    should_regenerate = False
-
-                if should_regenerate:
-                    console.print(
-                        f"\n[bold cyan]⚡ Prior prompt detected. Asking previous model ({old_model}) to generate summary.md for context handoff to {selected_model['name']}...[/bold cyan]"
-                    )
-                    summary_prompt = [
-                        {
-                            "role": "user",
-                            "content": "Please generate a high-quality, accurate summary of our conversation, progress, current state of the workspace, and any key decisions made so far. Format the output clearly in markdown suitable for a summary.md handoff document to a new AI model taking over the task.",
-                        }
-                    ]
-                    summary_req_messages = list(messages) + summary_prompt
-
-                    summary_res = call_nim_with_retry(
-                        client,
-                        summary_req_messages,
-                        None,
-                        old_model,
-                        config,
-                        timeout=300.0,
-                    )
-                    summary_text = strip_reasoning_spans(
-                        summary_res.choices[0].message.content or ""
-                    ).strip()
-
-                    if not summary_text:
-                        summary_text = "# Summary\nPrevious session context handoff."
-
-                    if summary_file:
-                        summary_file.parent.mkdir(parents=True, exist_ok=True)
-                        summary_file.write_text(summary_text, encoding="utf-8")
-                        console.print(
-                            f"[bold green]✅ summary.md generated and saved to {summary_file} ({len(summary_text)} chars).[/bold green]"
-                        )
-                    else:
-                        console.print(
-                            f"[bold green]✅ summary.md generated ({len(summary_text)} chars).[/bold green]"
-                        )
-                else:
-                    console.print(
-                        f"\n[bold cyan]⚡ Reusing existing summary.md for context handoff to {selected_model['name']}...[/bold cyan]"
-                    )
-                    summary_text = (
-                        summary_file.read_text(encoding="utf-8") if summary_file else ""
-                    )
-
-                # Update config models to the new model
-                config.plan_model = new_model_id
-                config.fast_model = new_model_id
-                console.print(
-                    f"[bold green]✅ Model switched to: {selected_model['name']} ({new_model_id}) for Plan, Build & YOLO modes.[/bold green]\n"
-                )
-
-                # Now feed summary.md into newly selected model for injecting context
-                console.print(
-                    f"[bold cyan]🤖 Feeding summary.md into {selected_model['name']} for context injection...[/bold cyan]"
-                )
-
-                if messages and messages[-1].get("role") == "tool":
-                    dummy_ack = {
-                        "role": "assistant",
-                        "content": "Tool execution completed.",
-                    }
-                    messages.append(dummy_ack)
-                    if session_path:
-                        log_turn(dummy_ack, session_path)
-
-                handoff_msg = {
-                    "role": "user",
-                    "content": f"<model_handoff_context>\nAI Model has been switched from {old_model} to {new_model_id}.\nTo ensure proper context continuity, here is the accurate summary (`summary.md`) generated by the previous model:\n\n{summary_text}\n</model_handoff_context>\n\nPlease review this context and give a concise acknowledgment indicating you are ready to continue the task.",
-                }
-                messages.append(handoff_msg)
-                if session_path:
-                    log_turn(handoff_msg, session_path)
-
-                try:
-                    ack_res = call_nim_with_retry(
-                        client, messages, None, new_model_id, config
-                    )
-                    ack_text = strip_reasoning_spans(
-                        ack_res.choices[0].message.content or ""
-                    ).strip()
-                    if ack_text:
-                        console.print(
-                            f"\n[bold green]🤖 {selected_model['name']}:[/bold green] {ack_text}\n"
-                        )
-                        ack_msg = {"role": "assistant", "content": ack_text}
-                        messages.append(ack_msg)
-                        if session_path:
-                            log_turn(ack_msg, session_path)
-                except Exception as ex:
-                    console.print(
-                        f"[yellow]Note: Could not get immediate confirmation from new model ({ex}), but context was successfully injected.[/yellow]\n"
-                    )
-
-            except Exception as e:
-                console.print(
-                    f"[yellow]⚠️ Could not generate summary.md ({e}). Proceeding with direct model switch.[/yellow]\n"
-                )
-                config.plan_model = new_model_id
-                config.fast_model = new_model_id
-                console.print(
-                    f"[bold green]✅ Model switched to: {selected_model['name']} ({new_model_id}) for Plan, Build & YOLO modes.[/bold green]\n"
-                )
-        else:
-            config.plan_model = new_model_id
-            config.fast_model = new_model_id
-            console.print(
-                f"[bold green]✅ Model switched to: {selected_model['name']} ({new_model_id}) for Plan, Build & YOLO modes.[/bold green]\n"
-            )
-    else:
-        console.print(
-            "[bold red]Invalid model selection. Keeping current models.[/bold red]\n"
-        )
-
-
-def generate_summary_with_progress(
-    client, messages, current_model, config, workspace_root
-):
-    from rich.console import Console
-    from nimcode.core.prompts import strip_reasoning_spans
-    from nimcode.core.agent import call_nim_with_retry
-    from pathlib import Path
-
-    console = Console()
-    summary_file = (
-        get_project_nimcode_dir(workspace_root if workspace_root else Path.cwd())
-        / "summary.md"
-    )
-    summary_prompt = [
-        {
-            "role": "user",
-            "content": "Please generate a high-quality, accurate summary of our conversation, progress, current state of the workspace, and any key decisions made so far. Format the output clearly in markdown suitable for a summary.md handoff document to a new AI model taking over the task.",
-        }
-    ]
-    summary_req_messages = list(messages) + summary_prompt
-    try:
-        summary_res = call_nim_with_retry(
-            client, summary_req_messages, None, current_model, config, timeout=300.0
-        )
-        summary_text = strip_reasoning_spans(
-            summary_res.choices[0].message.content or ""
-        ).strip()
-        if not summary_text:
-            summary_text = "# Summary\nPrevious session context handoff."
-        summary_file.parent.mkdir(parents=True, exist_ok=True)
-        summary_file.write_text(summary_text, encoding="utf-8")
-        console.print(
-            f"[bold green]✅ summary.md generated and saved to {summary_file} ({len(summary_text)} chars).[/bold green]"
-        )
-        return True
-    except Exception as e:
-        console.print(f"[yellow]⚠️ Could not generate summary.md ({e}).[/yellow]\n")
-        return False
-
-
 def select_interactive_session(config, workspace_root):
     from rich.console import Console
     from prompt_toolkit.application import Application
@@ -1107,24 +565,14 @@ def select_interactive_session(config, workspace_root):
     from prompt_toolkit.layout.containers import Window
     from prompt_toolkit.layout.controls import FormattedTextControl
     from prompt_toolkit.layout.layout import Layout
-    import glob
-    from pathlib import Path
+    from nimcode.core.agent import list_sessions
 
     console = Console()
     session_dir = (
         get_project_nimcode_dir(workspace_root if workspace_root else Path.cwd())
         / "sessions"
     )
-    if not session_dir.exists():
-        console.print(
-            "[yellow]No saved sessions found in central project sessions directory[/yellow]\n"
-        )
-        return None
-    sessions = sorted(
-        [Path(p) for p in glob.glob(str(session_dir / "session_*.json"))],
-        key=os.path.getmtime,
-        reverse=True,
-    )
+    sessions = list_sessions(session_dir)
     if not sessions:
         console.print(
             "[yellow]No saved sessions found in central project sessions directory[/yellow]\n"

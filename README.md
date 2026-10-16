@@ -117,8 +117,8 @@ User Prompt
                           ▼
               ┌────────────────────────┐
               │  ~/.nimcode/<project>/ │
-              │  sessions/*.json       │
-              │  backups/*             │
+              │  sessions/*.jsonl      │
+              │  backups/* + manifest  │
               │  model.json            │
               │  summary.md            │
               │  process_logs/*.log    │
@@ -135,57 +135,45 @@ User Prompt
 nimcode/
 ├── .github/
 │   └── workflows/
-│       └── ci.yml                    # Ruff + pytest matrix (py 3.10–3.12)
+│       ├── ci.yml                  # ruff + pytest (ubuntu+windows × py3.10–3.12), rust (fmt/clippy/test), wheel-contents check
+│       └── release.yml             # v* tags → per-platform wheels (win/linux-musl/macOS arm64+x86_64) + sdist → GitHub Release
 ├── src/
 │   └── nimcode/
-│       ├── __init__.py               # __version__ = "0.6.0"
-│       ├── __main__.py               # python -m nimcode shim → cli.app
-│       ├── cli.py                    # Typer CLI: run / start / status / refresh-models / resume / init / stats (447 lines)
-│       ├── config.py                 # Config dataclass, load/save/validate, AVAILABLE_MODELS[10], interactive selectors, model.json persistence (1129 lines)
-│       ├── config_models.py          # Live NIM model catalog (fetch/cache/filter), MODEL_CONTEXT_TOKENS, apply_model_context (342 lines)
-│       ├── context.py                # is_ignored(), load_gitignore_rules(), AST import hints, generate_workspace_map() (261 lines)
-│       ├── skills.py                 # install_skill() / list_skills() / get_skill_content() → ~/.nimcode/skills/ (231 lines)
+│       ├── __init__.py             # __version__ (single source; pyproject reads it dynamically)
+│       ├── __main__.py             # python -m nimcode → cli.app
+│       ├── cli.py                  # Typer CLI: run / start / status / refresh-models / resume / init / stats
+│       ├── config.py               # Config dataclass, load/save/validate, AVAILABLE_MODELS, model.json persistence, show_changes(), select_interactive_session()
+│       ├── config_models.py        # Live NIM model catalog (fetch/cache/filter), MODEL_CONTEXT_TOKENS, apply_model_context(), effective_budget()
+│       ├── context.py              # is_ignored(), load_gitignore_rules(), generate_workspace_map()
+│       ├── skills.py               # fetch_skill() → preview → commit_skill() / discard_skill(); install_skill(), list_skills(), get_skill_content() → ~/.nimcode/skills/
+│       ├── bin/                    # nim-tui sidecar binary — gitignored, built per-platform by release.yml
 │       ├── core/
-│       │   ├── __init__.py
-│       │   ├── agent.py              # call_nim_with_retry, prune_history, normalize_messages, log_turn, run_init_command, legacy run_agent_loop + stats (2453 lines)
-│       │   ├── agent_tui.py          # run_agent_loop_tui — async TUI loop (1185 lines), handle_command(), model handoff
-│       │   ├── prompts.py            # SYSTEM_PROMPT_TEMPLATE, build_system_prompt(), strip_reasoning_spans(), extract_plan_block() (175 lines)
-│       │   └── state.py              # AgentState / AgentMode enums (AWAITING_PLAN_APPROVAL, EXECUTING, YOLO)
-│       ├── tools/
-│       │   ├── __init__.py           # Imports fs/cmd/patch/swarm/browser/web (triggers registration); re-exports shared symbols
-│       │   ├── registry.py           # @register_tool, TOOL_REGISTRY, AVAILABLE_TOOLS_SPEC, execute_local_tool()
-│       │   ├── base.py               # resolve_and_validate_path, is_docker_available, is_valid_tool_call, scrub_text/env, backup_file, coerce_output_cap, truncate_output, render_preview (484 lines)
-│       │   ├── fs.py                 # read_file, write_file, list_files, glob_files, patch_file_blocks, search_grep, search_symbols (678 lines)
-│       │   ├── cmd.py                # execute_command, run_tests, execute_test_runner(), start_background_process, get_process_output, stop_process, Docker/host dispatch, BACKGROUND_PROCESSES (1124 lines)
-│       │   ├── patch.py              # patch_file_ast — AST-aware symbol replacement (182 lines)
-│       │   ├── swarm.py              # spawn_agent, send_message_to_agent, kill_agent, list_agents, ACTIVE_SUBAGENTS, resume_subagent_thread() (437 lines)
-│       │   ├── browser.py            # screenshot_page via Playwright, _is_url_allowed SSRF guard (215 lines)
-│       │   └── web.py                # web_search via DuckDuckGo HTML parser (189 lines)
+│       │   ├── agent.py            # call_nim_with_retry(), prune_history(), normalize_messages(), log_turn(), load_session(), list_sessions(), open_session_path(), migrate_legacy_session(), run_init_command(), session stats
+│       │   ├── agent_tui.py        # run_agent_loop_tui() — the only agent loop; handle_command() incl. /install-skill + /<skill>, model handoff
+│       │   ├── prompts.py          # SYSTEM_PROMPT_TEMPLATE, build_system_prompt(), strip_reasoning_spans(), extract_plan_block()
+│       │   └── state.py            # AgentState (AWAITING_PLAN_APPROVAL / EXECUTING / YOLO) + AgentMode
+│       ├── tools/                  # 19 tools in AVAILABLE_TOOLS_SPEC
+│       │   ├── __init__.py         # Imports fs/cmd/patch/swarm/browser/web (triggers registration); re-exports shared symbols
+│       │   ├── registry.py         # @register_tool, TOOL_REGISTRY, AVAILABLE_TOOLS_SPEC, execute_local_tool() + spawn caps
+│       │   ├── base.py             # resolve_and_validate_path(), is_valid_tool_call(), render_preview(), scrub_text/env(), backup_file() + list_backups(), coerce_output_cap(), truncate_output(), _check_url()/_is_url_allowed() SSRF guard
+│       │   ├── fs.py               # read_file, write_file, list_files, glob_files, patch_file_blocks, search_grep, search_symbols, atomic_write_text()
+│       │   ├── cmd.py              # execute_command, run_tests, execute_test_runner(), tests_passed(), background processes, Docker/host dispatch
+│       │   ├── patch.py            # patch_file_ast — AST-aware symbol replacement (supports Class.method)
+│       │   ├── swarm.py            # spawn_agent, send_message_to_agent, kill_agent, list_agents, ACTIVE_SUBAGENTS, resume_subagent_thread()
+│       │   ├── browser.py          # screenshot_page via Playwright + per-request SSRF route guard
+│       │   └── web.py              # web_search via DuckDuckGo HTML parser
 │       └── ui/
-│           ├── __init__.py           # package marker
-│           ├── console.py            # show_help() (TUI markdown vs CLI Rich table) + print_welcome() banner (111 lines)
-│           ├── output.py             # Console singleton, symbol(), unicode/color detection, TUI_INSTANCE routing, safe_text() (164 lines)
-│           └── rust_bridge.py        # RustTUI — loopback-socket bridge to the nim-tui sidecar (sole TUI) (566 lines)
-├── tui-rs/                       # Rust sidecar source (ratatui/crossterm); binary bundled at src/nimcode/bin/nim-tui.exe
-├── tests/                        # 61 tests, all green (see §23)
-│   ├── test_cmd.py                   # execute_command host/timeout/truncate/blocklist
-│   ├── test_config_persist.py        # Config persistence, validation & migration
-│   ├── test_empty_turn.py            # Empty model-turn retry behavior
-│   ├── test_missing_tools.py         # Sandbox & symbol search boundaries
-│   ├── test_model_catalog.py         # Model catalog filtering & context windows
-│   ├── test_normalize_messages.py    # Message normalization, system consolidation, role alternation
-│   ├── test_preview.py               # Diff rendering & tool preview assertions
-│   ├── test_retry_fallbacks.py       # API retry, XML fallback & context-overflow paths
-│   ├── test_run_tests.py             # Test runner integration
-│   ├── test_slash_commands.py        # SLASH_COMMANDS catalog vs handler coverage
-│   ├── test_swarm_extra.py           # Subagent lifecycle & schema validation
-│   └── test_web_search.py            # Web search schema + parser mocks
-├── pyproject.toml                    # PEP 517 build metadata (typer, openai, rich, prompt_toolkit, playwright)
-├── setup.py                          # Legacy editable install shim
-├── requirements.txt                  # Pinned runtime deps
-├── uv.lock                           # uv lockfile
-├── AGENTS.md                         # Live-injected agent rules (authoritative)
-└── README.md                         # This file
+│           ├── console.py          # show_help() + print_welcome() banner
+│           ├── output.py           # Console singleton, symbol(), unicode/color detection, TUI_INSTANCE routing, safe_text()
+│           └── rust_bridge.py      # RustTUI — loopback-socket NDJSON bridge to the nim-tui sidecar (sole TUI); find_rust_binary(), poll_events()
+├── tui-rs/                         # Rust sidecar source (ratatui/crossterm)
+├── tests/                          # pytest suite (~145 tests); protocol_samples.json + fake_sidecar.py pin the Python↔Rust wire format
+├── pyproject.toml                  # PEP 517 metadata; [dev] extra pins ruff/pytest
+├── setup.py                        # Bare setup() shim
+├── requirements.txt                # Runtime deps mirror
+├── uv.lock                         # uv lockfile
+├── AGENTS.md                       # This file — live-injected into the agent prompt
+└── README.md                       # User-facing documentation
 ```
 
 > **Note on legacy paths:** Local `.nimcode/` or `.nimcode_sessions/` directories inside a workspace are automatically migrated to the centralized `~/.nimcode/<project>_<hash>/` location on first run (`src/nimcode/config.py:14`).
@@ -219,6 +207,8 @@ source .venv/bin/activate
 
 # 3. Install in editable mode (reads pyproject.toml / setup.py)
 pip install -e .
+#    Build the TUI sidecar (source installs only; release wheels bundle it):
+cargo build --release --manifest-path tui-rs/Cargo.toml
 
 # 4. (Optional) Visual verification support
 playwright install chromium
@@ -238,6 +228,8 @@ echo 'NVIDIA_API_KEY=nvapi-...' > ~/.nimcode/.env
 # 6. Verify
 nimcode status
 ```
+
+**Prebuilt wheels:** each `v*` release on GitHub ships a wheel per platform (Windows x64, Linux x64, macOS arm64/x86_64) with the `nim-tui` sidecar bundled, so `pip install <wheel>` needs no Rust toolchain. A source install finds the sidecar in `tui-rs/target/release/`, or set `NIM_TUI_BIN`.
 
 `requirements.txt` vs `pyproject.toml`:
 - `pyproject.toml:11` declares: `typer`, `openai`, `python-dotenv`, `tomli`, `rich`, `prompt_toolkit`, `playwright`, plus `colorama` on Windows.
@@ -271,13 +263,17 @@ Place an optional `nimcode.toml` in your **workspace root** (the directory you r
 | `max_loop_iterations` | `int` | `20` | Consecutive agent steps before pausing for human input (YOLO overrides to **50**) |
 | `timeout` | `int` | `60` | Subprocess hard timeout (seconds, capped at 600) |
 | `output_cap` | `int` | `100000` | Max characters from any single tool output (`src/nimcode/tools/base.py:240`) |
-| `context_budget_tokens` | `int` | `128000` | Context window budget for `prune_history` |
+| `context_budget_tokens` | `int` | `128000` | Upper bound for history; the effective budget is `min(this, model window) − max_tokens − 1024` (`effective_budget()`) |
 | `max_tokens` | `int` | `4096` | `max_tokens` sent to the model (required for MiniMax-M3 / GLM to avoid `choices=[]`) |
 | `auto_backup` | `bool` | `true` | Snapshot files before overwriting to `backups/` |
-| `disable_docker` | `bool` | `false` | Force host execution even if Docker is available |
+| `disable_docker` | `bool` | `false` | Force host execution even if Docker is available (subagents then cannot run commands) |
 | `docker_image` | `str` | `python:3.11-slim` | Image for sandboxed commands (`src/nimcode/tools/cmd.py:129`) |
 | `docker_expose_ports` | `list[int]` | `[]` | Ports to `-p` expose in Docker (validated 1–65535) |
-| `docker_extra_args` | `list[str]` | `[]` | Extra `docker run` args (host-escape flags denied) |
+| `docker_extra_args` | `list[str]` | `[]` | Extra `docker run` args (privileged/mount/device/namespace/seccomp flags dropped) |
+| `docker_memory` | `str` | `"2g"` | `--memory` limit (`""` disables) |
+| `docker_pids_limit` | `int` | `512` | `--pids-limit` (`0` disables) |
+| `docker_cpus` | `str` | `"2"` | `--cpus` limit (`""` disables) |
+| `docker_network` | `str` | `"bridge"` | `bridge` or `none` (`host` rejected) |
 | `disable_native_tools` | `bool` | `false` | Force prompt-based XML `<tool_call>` mode (auto-set if server rejects `auto` tool choice) |
 | `api_base_url` | `str \| null` | `null` | Override OpenAI base URL (defaults to `https://integrate.api.nvidia.com/v1`) |
 | `denylist` | `list[str]` | `[]` | Reserved for future denylist enforcement |
@@ -299,7 +295,7 @@ docker_image = "python:3.11-slim"
 docker_expose_ports = [3000, 8000]
 ```
 
-Edit at runtime with `/config` inside the TUI (`src/nimcode/config.py:590`) or `configure_interactive` — changes persist via `save_config()` → `save_last_used_model()` (`src/nimcode/config.py:133`). `save_config()` writes the full scalar set (mode, models, loop cap, timeouts, caps, both temperatures, backups, docker settings, denylist) so nothing edited in-session is lost on restart.
+Edit at runtime with `/config` inside the TUI — changes persist via `save_config()` → `save_last_used_model()` (`src/nimcode/config.py:133`). `save_config()` writes the full scalar set (mode, models, loop cap, timeouts, caps, both temperatures, backups, docker settings, denylist) so nothing edited in-session is lost on restart.
 
 ### 7.3 Runtime `~/.nimcode/<project>/model.json`
 
@@ -315,7 +311,11 @@ Persisted per-workspace by `save_last_used_model()` (`src/nimcode/config.py:87`)
   "docker_image": "python:3.11-slim",
   "docker_expose_ports": [],
   "docker_extra_args": [],
-  "disable_docker": false
+  "disable_docker": false,
+  "docker_memory": "2g",
+  "docker_pids_limit": 512,
+  "docker_cpus": "2",
+  "docker_network": "bridge"
 }
 ```
 
@@ -366,9 +366,9 @@ Prints:
 Resumes a persisted session from `~/.nimcode/<project>_<hash>/sessions/`:
 
 - Without flags → interactive `select_interactive_session()` picker (`src/nimcode/config.py:1056`).
-- `--latest` / `-l` → auto-load newest `session_*.json`.
+- `--latest` / `-l` → auto-load the newest session (`session_*.jsonl`, or a legacy `session_*.json`, which is copied into a fresh `.jsonl` on resume).
 
-Migrates legacy `<workspace>/.nimcode_session.json` automatically (`src/nimcode/cli.py:317`).
+Migrates legacy `<workspace>/.nimcode_session.json` automatically (`migrate_legacy_session()`).
 
 ### `nimcode init`
 
@@ -396,7 +396,7 @@ Shim via `src/nimcode/__main__.py:1` — identical to `nimcode`.
 
 ## 9. TUI & Slash Commands
 
-The TUI is the Rust sidecar `nim-tui` (`tui-rs/`, bundled at `src/nimcode/bin/nim-tui.exe`, override via `NIM_TUI_BIN`), driven by `run_agent_loop_tui()` (`src/nimcode/core/agent_tui.py:78`) through the `RustTUI` bridge (`src/nimcode/ui/rust_bridge.py`). Python speaks NDJSON to the sidecar over a loopback socket; the sidecar owns the terminal (raw mode + alternate screen), so keystrokes are handled exactly once. If the binary is missing, `nimcode` exits with rebuild instructions instead of starting a degraded UI.
+The TUI is the Rust sidecar `nim-tui` (`tui-rs/`, bundled in release wheels, override via `NIM_TUI_BIN`), driven by `run_agent_loop_tui()` (`src/nimcode/core/agent_tui.py:78`) through the `RustTUI` bridge (`src/nimcode/ui/rust_bridge.py`). Python speaks NDJSON to the sidecar over a loopback socket; the sidecar owns the terminal (raw mode + alternate screen), so keystrokes are handled exactly once. If the binary is missing, `nimcode` exits with rebuild instructions instead of starting a degraded UI.
 
 #### In-TUI Slash Commands
 
@@ -412,7 +412,7 @@ All commands are dispatched by `handle_command()` (`src/nimcode/core/agent_tui.p
 | `/models-refresh` | — | Blocking catalog refresh + retired-model reconcile + context re-apply | `src/nimcode/core/agent_tui.py:263` |
 | `/config` | — | Inline table + prompt to edit `output_cap`, `timeout`, `auto_backup`, etc. | `src/nimcode/ui/rust_bridge.py:545` |
 | `/changes` | `/diff` | `git status -s` + recent backups | `src/nimcode/config.py:391` |
-| `/restore` | — | Inline backup picker → restore to workspace | `src/nimcode/ui/rust_bridge.py:493` |
+| `/restore` | — | Inline backup picker → restore to the original path recorded in `backups/manifest.jsonl` | `restore_backup()` in `src/nimcode/ui/rust_bridge.py` |
 | `/test [cmd]` | — | `execute_test_runner()` auto-detects `pytest`/`npm test`/`cargo test`/`go test` | `src/nimcode/tools/cmd.py:653` |
 | `/team` | — | List `ACTIVE_SUBAGENTS` (id/role/status, lock-safe snapshot) | `src/nimcode/core/agent_tui.py:309` + `swarm.py:12` |
 | `/kill` | — | `cleanup_background_processes()` — stops all bg procs | `src/nimcode/tools/cmd.py:76` |
@@ -420,7 +420,7 @@ All commands are dispatched by `handle_command()` (`src/nimcode/core/agent_tui.p
 | `/stats` | — | `aggregate_session_stats()` + `render_stats_rich()` | `src/nimcode/core/agent.py:803` |
 | `/recap` | — | Not yet implemented in TUI mode | `src/nimcode/core/agent_tui.py:359` |
 | `/skills` | — | `skills.list_skills()` | `src/nimcode/skills.py:178` |
-| `/install-skill <url>` | — | Install skill from raw `.md` / `.zip` / git repo (runs off-thread) | `src/nimcode/skills.py:71` |
+| `/install-skill <url>` | — | Download raw `.md` / `.zip` / git repo to staging, show a preview (files, size, sha256, first 40 lines), install only on confirmation | `fetch_skill()` / `commit_skill()` in `src/nimcode/skills.py` |
 | `/init` | — | `run_init_command()` — (re)generate `AGENTS.md` | `src/nimcode/core/agent.py:935` |
 | `/resume` | — | Inline session picker (`select_session()`), then restart with `nimcode resume` to load | `src/nimcode/ui/rust_bridge.py:364` |
 | `/<skill> [args]` | — | Inject installed skill content as `<skill_context>` and continue the turn | `src/nimcode/skills.py:193` |
@@ -538,7 +538,7 @@ prune_history(messages, budget)
 - **Normalization** (`normalize_messages`, `src/nimcode/core/agent.py:109`): when `disable_native_tools` is true, converts `tool_calls` → `<tool_call name="…">JSON</tool_call>` strings and `tool` → `user [Tool Response]`; merges interleaved `system` messages into one at index 0; collapses consecutive same-role `user`/`assistant` messages (never splitting assistant+tool/results pairs); bridges `assistant`-first sequences with a dummy user message; guarantees the payload is never system-only.
 - **Cancellation:** A daemon thread runs the blocking `client.chat.completions.create()` call. The main loop polls `TUI_INSTANCE._interrupted` or `msvcrt.kbhit()` (Win32) every 50ms and raises `KeyboardInterrupt("ESC_CANCELLED")` for instant cancellation (`src/nimcode/core/agent.py:459`).
 - **XML fallback:** When native `tools` are disabled (or endpoint rejects `auto`), the agent uses `parse_xml_tool_calls()` (`src/nimcode/core/agent.py:68`) to extract `<tool_call name="…">JSON</tool_call>` from raw content into `MockToolCall` objects with `_clean_json_args()` fence stripping.
-- **Resilience:** empty-`choices` responses raise a descriptive error (`:478`); rate-limit/overload hints suggest waiting or switching models; context overflow halves the budget and retries (`:578`). Empty model turns are re-driven (max 2) instead of going silent.
+- **Resilience:** errors are classified by HTTP status / openai exception type (retry 429/5xx/connection/timeout, fail fast on 400/401/403/404/422); empty-`choices` responses raise a descriptive error; context overflow halves the budget per retry and gives up below 1000 tokens. Empty model turns are re-driven (max 2) instead of going silent.
 
 ### `run_agent_loop_tui()` — `src/nimcode/core/agent_tui.py:78`
 
@@ -546,19 +546,20 @@ Async wrapper that:
 
 1. Starts `RustTUI.start_async()` (spawns the `nim-tui` sidecar) as a concurrent task.
 2. Calls `_run_agent_loop_tui_internal()` which manages:
-   - Legacy session migration (`session_dir / "legacy_session.json"`).
-   - `log_turn()` persistence after every message (`src/nimcode/core/agent.py:648`).
+   - Legacy session migration (`migrate_legacy_session()`) and `.jsonl` session setup (`open_session_path()`).
+   - `log_turn()` persistence after every message (append-only JSONL).
+   - Blocking work (tools, tests, NIM calls) via `asyncio.to_thread`; `poll_events()` between tool calls applies Shift+Tab / Ctrl+C mid-batch.
    - `handle_command()` dispatch for all slash commands (`:179`), including `/install-skill` and `/<skill>` injection (which returns `"resume"` to continue straight to the API call).
    - `initial_state` sync (`YOLO`/`AWAITING_PLAN_APPROVAL`/`EXECUTING`).
    - Model-dependent `tools_arg` selection (`:626`).
    - `pending_summary_injection` handoff (`<model_handoff_context>`).
    - Loop-limit guard (20 Build / 50 YOLO) with user prompt to resume/redirect/cancel.
 
-Legacy ANSI loop `run_agent_loop()` (`src/nimcode/core/agent.py:1194`) is preserved for non-TUI contexts and exports `enable_persistent_prompt()` / `disable_persistent_prompt()` ANSI scroll-region helpers plus `print_session_history()` (`:1160`).
+`run_agent_loop_tui()` is the only agent loop (the legacy ANSI loop was removed).
 
-### `generate_summary_with_progress()` & model handoff
+### Model handoff
 
-`src/nimcode/config.py` and `src/nimcode/ui/rust_bridge.py` implement the **model-switch handshake**:
+`select_model()` in `src/nimcode/ui/rust_bridge.py` implements the **model-switch handshake**:
 
 1. Ask the **old** model to summarize the session into `summary.md`.
 2. Persist the new `model.json`.
@@ -574,13 +575,16 @@ Legacy ANSI loop `run_agent_loop()` (`src/nimcode/core/agent.py:1194`) is preser
 | **Backup isolation** | `backup_file()` sanitizes `safe_rel_name` via `replace(os.sep, "_")` to avoid directory creation attacks | `src/nimcode/tools/base.py:206` |
 | **Zip Slip guard** | `ZipFile` members are checked with `relative_to(target_path)` before extraction | `src/nimcode/skills.py:113` |
 | **Skill name sanitization** | URL basename regex-sanitized; skill names must `fullmatch(r"[a-zA-Z0-9_\-\.]+")` | `src/nimcode/skills.py:48` / `:205` |
+| **Subagent confinement** | Subagents may only run commands inside Docker; without Docker they get `SUBAGENT_HOST_REFUSAL` | `src/nimcode/tools/cmd.py` |
+| **Docker resource limits** | `--memory 2g --pids-limit 512 --cpus 2 --network bridge` by default (configurable) | `_docker_run_argv()` in `src/nimcode/tools/cmd.py` |
 | **Docker command validation** | `_validate_command_safety()` warns on `--privileged`, docker socket mounts, `--cap-add`, host namespaces, shell injection patterns; `docker_extra_args` dangerous flags are dropped | `src/nimcode/tools/cmd.py:343` |
 | **Env scrubbing** | `SENSITIVE_ENV_REGEX` (covers `API_KEY`, `TOKEN`, `_PW`, `AWS_SECRET`, DB URLs, etc.) + `scrub_env()` before every `Popen` | `src/nimcode/tools/base.py:457` |
 | **Inline secret scrubbing** | `scrub_text()` masks `Bearer`, `Authorization: Basic`, `--password`/`--token`, `x-api-key`, `KEY=value` lines, `AKIA*`/`nvapi-`/`sk-`/`ghp_` keys, JWT, `scheme://user:pass@`, 32+ char keys | `src/nimcode/tools/base.py:162` |
 | **Output truncation** | `truncate_output()` keeps head + tail, drops middle (`dropped N chars`) | `src/nimcode/tools/base.py:240` |
-| **SSRF guard** | `_is_url_allowed()` DNS-resolves screenshot targets and rejects any private/loopback/link-local/reserved IP (localhost excepted for the dev-server loop) | `src/nimcode/tools/browser.py:14` |
+| **SSRF guard** | `_is_url_allowed()` DNS-resolves targets and rejects any non-global IP (localhost excepted for the dev-server loop); applied to every screenshot request and every skill-download redirect | `src/nimcode/tools/base.py` |
+| **Skill install review** | Staged download + preview + confirmation; `.source.json` records url + sha256 | `src/nimcode/skills.py` |
 | **Human gate** | All mutations require `y/n` (Build) or `yolo` (Plan); YOLO still shows preview | `src/nimcode/core/agent_tui.py:1018` |
-| **Subagent caveat** | Swarm threads **bypass** the human gate — they execute tools directly | `src/nimcode/tools/swarm.py:334` |
+| **Subagent caveat** | Swarm threads **bypass** the human gate — they execute tools directly (Docker-only for commands) | `src/nimcode/tools/swarm.py` |
 
 ---
 
@@ -600,15 +604,15 @@ project_dir = Path.home() / ".nimcode" / f"{resolved.name}_{hash}"
 
 ### Sessions
 
-- **Naming:** `session_<YYYYMMDD_HHMMSS>.json` (`src/nimcode/core/agent_tui.py:161`).
-- **Logging:** `log_turn()` (`src/nimcode/core/agent.py:648`) appends JSON-serialized messages (including `tool_calls` arrays) to the active session file. Writes are atomic (temp + `os.replace`) with `default=str` fallback, so a crash or non-serializable arg can never corrupt the session.
-- **Resume:** `nimcode resume` lists files sorted by `st_mtime` descending; renders history in the TUI before waiting for user input (`src/nimcode/core/agent_tui.py:445`). In the legacy ANSI path, `print_session_history()` pretty-prints `user`/`assistant`/`tool` turns (`src/nimcode/core/agent.py:1160`).
+- **Naming:** `session_<YYYYMMDD_HHMMSS>.jsonl`.
+- **Logging:** `log_turn()` appends one JSON line per message (including `tool_calls` arrays, `default=str` fallback). Nothing is rewritten, so a crash loses at most the last line, which `load_session()` skips.
+- **Resume:** `nimcode resume` uses `list_sessions()` (newest first; `.jsonl` plus legacy `.json`). Legacy `.json` sessions are copied into a new `.jsonl` and the original is left untouched. History is rendered in the TUI before waiting for input.
 
 ### Backups
 
-- Every `write_file` / `patch_file_*` with `auto_backup=true` snapshots the previous file via `backup_file()` to `backups/<microseconds>_<pid>_[blocks_|ast_]<safe_rel>` (`src/nimcode/tools/base.py:206`).
-- **View:** `/changes` shows `git status -s` + 15 most recent backups as a table/markdown (`src/nimcode/config.py:391`). Timestamps accept both second and microsecond formats and never crash the view (`_format_backup_time()`, `:375`).
-- **Restore:** `/restore` (`src/nimcode/ui/rust_bridge.py:493`) shows an inline backup picker (↑/↓, Enter), guesses the original path by matching `safe_name`, prompts for target override, validates the target stays inside the workspace root via `is_relative_to`, then `shutil.copy2`.
+- Every `write_file` / `patch_file_*` with `auto_backup=true` snapshots the previous file via `backup_file()` to `backups/<microseconds>_<pid>_[blocks_|ast_]<safe_rel>` and appends `{backup, original, tag, ts}` to `backups/manifest.jsonl`.
+- **View:** `/changes` shows `git status -s` + the 15 most recent backups from `list_backups()` (sorted by backup time).
+- **Restore:** `/restore` shows an inline backup picker (↑/↓, Enter) and restores straight to the recorded original path. Only legacy backups without a manifest entry prompt for the target. The target must stay inside the workspace root.
 
 ### Process Logs
 
@@ -641,8 +645,6 @@ Static seed `AVAILABLE_MODELS` (`src/nimcode/config.py:750`, 10 entries) is only
 | 10 | Nemotron 3 Ultra 550B | `nvidia/nemotron-3-ultra-550b-a55b` *(default)* | 1M |
 
 - **TUI selector** (`select_model()`, `src/nimcode/ui/rust_bridge.py:390`) shows a sidecar list (↑/↓, `Enter`) with `[Nk ctx]` badges, highlights the current model with ` (current)`, and handles the full handshake (summary generation + handoff injection).
-- **Legacy picker** (`select_interactive_model()`, `src/nimcode/config.py:770`) uses `prompt_toolkit.Application` similarly for non-TUI contexts.
-
 ---
 
 ## 16. Skills System
@@ -651,12 +653,14 @@ Static seed `AVAILABLE_MODELS` (`src/nimcode/config.py:750`, 10 entries) is only
 
 | Function | Description |
 |---|---|
-| `install_skill(url)` (`:71`) | `https/http` only (file/ssh/ext transports refused). `.zip` (20MB cap, symlink + Zip-Slip rejected, per-file 5MB cap, manual extract), `.git`/`github.com` (`git clone`, 60s timeout, refuses to overwrite), raw `.md` (2MB cap, refuses to overwrite). Returns a human-readable status string. |
+| `fetch_skill(url)` | `https/http` only, SSRF-checked including every redirect. Downloads into `SKILLS_DIR/.staging/`: `.zip` (20MB download / 50MB extracted / 2000 entries, symlink + Zip-Slip rejected), `.git`/`github.com` (`git clone --depth 1`, no redirects, 60s timeout), raw `.md` (2MB, installed as `<name>/SKILL.md`). Returns `(staging_dir, preview, sha256)`; raises `ValueError` on failure. |
+| `commit_skill(staging, name, url, sha256)` / `discard_skill(staging)` | Move the staged skill into place (refusing to overwrite) and write `.source.json`, or delete it |
+| `install_skill(url)` | `fetch_skill` + `commit_skill` without the confirmation step |
 | `list_skills()` (`:178`) | Lists directories + `.md` stems under `SKILLS_DIR` (empty list if missing) |
-| `get_skill_content(name)` (`:193`) | Strict name allowlist (`fullmatch(r"[a-zA-Z0-9_\-\.]+")`); 200KB cap; reads `SKILL.md` → `README.md` → `instructions.md`, or the raw `.md` file; explicit `Error: skill '…' not found` |
+| `get_skill_content(name)` (`:193`) | Strict name allowlist (`fullmatch(r"[a-zA-Z0-9_\-\.]+")`); 200KB cap; reads `SKILL.md` → `README.md` → `instructions.md`, or the raw `.md` file; returns `None` on any error |
 | `init_skills_dir()` (`:35`) | Ensures `SKILLS_DIR` exists |
 
-In the TUI, `/skills` lists `/{skill}` entries; typing `/<skill> [args]` injects its content as `<skill_context>` and continues the turn, and `/install-skill <url>` installs without leaving the session.
+In the TUI, `/skills` lists `/{skill}` entries; typing `/<skill> [args]` injects its content as `<skill_context>` and continues the turn, and `/install-skill <url>` previews the skill and installs it after confirmation.
 
 ---
 
@@ -703,7 +707,7 @@ CRITICAL: You MUST strictly obey …
 
 The fullscreen TUI is a Rust `ratatui`/`crossterm` sidecar, not Python:
 
-- **Transport:** Python spawns `nim-tui` (bundled at `src/nimcode/bin/nim-tui.exe`, override via `NIM_TUI_BIN`) with `NIM_TUI_PORT`; the sidecar connects back over a loopback socket and speaks NDJSON (`add_message`, `update` sidebar, `set_working`, `prompt_select`, `input`/`select_result`/`interrupt`/`eof`/`mode_cycle` events).
+- **Transport:** Python spawns `nim-tui` (found via `find_rust_binary()`: `NIM_TUI_BIN`, bundled `nimcode/bin/`, `tui-rs/target/release/`, then `PATH`) with `NIM_TUI_PORT`; the sidecar connects back over a loopback socket and speaks UTF-8 NDJSON (`add_message`, `update` sidebar, `set_working`, `prompt_select`, `input`/`select_result`/`interrupt`/`eof`/`mode_cycle` events). Every message type is pinned in `tests/protocol_samples.json`, checked by both `cargo test` and `tests/test_bridge_protocol.py`.
 - **Terminal ownership:** the sidecar enables raw mode + alternate screen and is the sole stdin reader, so each keystroke is handled exactly once (key-release events are ignored — Windows reports press *and* release).
 - **Layout:** message list + sidebar (mode, model, token bar, cwd, todos, subagents, background procs) + single-line input with inline selectors (↑/↓, Enter, Esc) for model/session/backup/config.
 - **Cancel/exit:** `Ctrl+C` with text clears the line, with an empty line sends `interrupt` (`_interrupted`, cancels API calls and remaining tools); `Ctrl+D` sends `eof` (sticky `_eof_requested`, clean exit even mid-turn). `Python` side never kills the app out from under a live turn.
@@ -718,7 +722,7 @@ The fullscreen TUI is a Rust `ratatui`/`crossterm` sidecar, not Python:
 
 ## 19. Docker Sandbox Details
 
-`_build_docker_command()` (`src/nimcode/tools/cmd.py:129`):
+`_docker_run_argv()` (`src/nimcode/tools/cmd.py`), shared by foreground and background runs:
 
 ```bash
 docker run --rm --init \
@@ -726,15 +730,16 @@ docker run --rm --init \
   --security-opt no-new-privileges:true \
   -v <workspace>:/workspace \
   -w /workspace \
+  --memory 2g --pids-limit 512 --cpus 2 --network bridge \
   [-p 3000:3000 ...] \
   [extra_args...] \
   python:3.11-slim \
   sh -c "<command>"
 ```
 
-- **Background containers** use `docker run -d --name nimcode_bg_<uuid>` (`src/nimcode/tools/cmd.py:866`).
+- **Background containers** use `docker run -d --name nimcode_bg_<uuid>` (no `--rm`, so crash logs stay readable; removed by `stop_process`).
 - Detection: `is_docker_available()` runs `docker info` with 5s timeout, cached 30 s (`src/nimcode/tools/base.py:43`).
-- **Fallback** is automatic if Docker is absent or `disable_docker=true`; the output is annotated `[Note: Docker unavailable, fell back to host execution]`.
+- **Fallback** (main agent only) is automatic if Docker is absent; a real fallback is annotated `[Note: Docker unavailable, fell back to host execution]`. Subagents never fall back to the host.
 - **Host cleanup** uses `taskkill /F /T` on Windows and process-group `SIGTERM→SIGKILL` on POSIX (no orphaned grandchildren) (`src/nimcode/tools/cmd.py:43`).
 - **Validation:** `_validate_command_safety()` warns on socket mounts, `--privileged`, `--cap-add`, host namespaces, and shell-injection patterns; dangerous `docker_extra_args` are dropped by `_safe_docker_extra_args()`.
 
@@ -805,13 +810,13 @@ Also supports `screenshot_page({"html_file": "dist/index.html"})` → resolves t
 ### Running Tests Locally
 
 ```bash
-pip install pytest
+uv sync --extra dev        # or: pip install -e .[dev]  (pins ruff + pytest)
 pytest -v
 pytest tests/test_cmd.py -v
 pytest --collect-only
 ```
 
-Expected suite (`tests/`, 61 tests):
+Suite (`tests/`, ~145 tests). Main files:
 
 | File | What it covers |
 |---|---|
@@ -827,29 +832,28 @@ Expected suite (`tests/`, 61 tests):
 | `test_slash_commands.py` | `SLASH_COMMANDS` catalog vs handler coverage |
 | `test_swarm_extra.py` | `ACTIVE_SUBAGENTS` lifecycle, tool schema validation |
 | `test_web_search.py` | `web_search` schema + parser mocks |
+| `test_arch_*.py` | JSONL sessions, backup manifest/restore, TUI loop (mid-batch mode switch, off-thread tools, skill install) |
+| `test_sec_track_b.py` | Subagent host refusal, Docker limits argv, skill SSRF/redirects/staging |
+| `test_bridge_protocol.py` | Real `RustTUI` socket round-trip against `fake_sidecar.py` + `protocol_samples.json` |
+| `test_ci_windows_kill.py` | Windows-only process-tree kill on timeout |
+| `test_*_review_*.py` | Regression tests for the full-project review fixes |
 
 ### Continuous Integration (`.github/workflows/ci.yml`)
 
 Workflow `CI` on `push`/`pull_request` to `main`/`master`:
 
-```yaml
-strategy.matrix.python-version: ["3.10", "3.11", "3.12"]
-steps:
-  - checkout@v4
-  - setup-python@v5
-  - pip install ruff pytest + pip install -e .
-  - ruff check .
-  - ruff format --check .
-  - python -c "import nimcode.cli, nimcode.config, …"  # smoke import (incl. agent_tui, rust_bridge, output)
-  - nimcode status  (NVIDIA_API_KEY=dummy-key-for-ci)
-  - python -c "is_docker_available() → warn-only, host fallback"
-  - pytest  (NVIDIA_API_KEY=dummy-key-for-ci)
-```
+- **python**: `ubuntu-latest` + `windows-latest` × py 3.10/3.11/3.12: `pip install -e .[dev]` → `ruff check` → `ruff format --check` → import smoke → `nimcode status` (dummy key) → `pytest`.
+- **rust**: ubuntu + windows: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (includes the shared protocol-sample test).
+- **wheel**: builds the sidecar and a wheel, asserts `nimcode/bin/nim-tui` is inside.
+
+### Releases (`.github/workflows/release.yml`)
+
+Push a `v*` tag → builds the sidecar for `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-musl`, `aarch64-apple-darwin` and `x86_64-apple-darwin`, packages a platform-tagged wheel for each (smoke-tested in a fresh venv), plus an sdist, and attaches them to a GitHub Release.
 
 ### Deploy checklist
 
 1. `pip install -e .` (or `pip install -r requirements.txt` + `pip install -e .`) — both carry the full runtime set.
-2. `ruff check . && ruff format --check . && pytest -q` — must be green (61 tests).
+2. `ruff check . && ruff format --check . && pytest -q` — must be green.
 3. `nimcode status` with `NVIDIA_API_KEY` set — verifies config, workspace map, session dir, live model catalog.
 4. `playwright install chromium` — only needed for `screenshot_page` visual verification.
 5. Docker is optional: without a daemon, commands run on the host with a `[Note: Docker unavailable …]` annotation; set `disable_docker = true` to silence.
@@ -859,9 +863,10 @@ steps:
 ## 24. Development Guide
 
 ```bash
-# Editable install + dev deps
-pip install -e .
-pip install ruff pytest playwright tiktoken
+# Editable install + dev deps (pinned ruff/pytest)
+uv sync --extra dev        # or: pip install -e .[dev]
+pip install tiktoken       # optional, exact token counts
+cargo build --release --manifest-path tui-rs/Cargo.toml   # TUI sidecar
 
 # Lint & format (Ruff)
 ruff check .

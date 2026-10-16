@@ -8,10 +8,15 @@ on:
 
 jobs:
   lint-and-test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.10", "3.11", "3.12"]
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - uses: actions/checkout@v4
@@ -24,8 +29,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ruff pytest
-          pip install -e .
+          pip install -e ".[dev]"
 
       - name: Lint with ruff
         run: ruff check .
@@ -71,3 +75,48 @@ jobs:
         run: pytest -v
         env:
           NVIDIA_API_KEY: "dummy-key-for-ci"
+
+  rust:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: tui-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # reads ../tests/protocol_samples.json (shared with test_bridge_protocol.py)
+      - run: cargo test
+
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sidecar and bundle it
+        run: |
+          cargo build --release --manifest-path tui-rs/Cargo.toml
+          cp tui-rs/target/release/nim-tui src/nimcode/bin/
+      - name: Build wheel
+        run: |
+          pip install build
+          python -m build --wheel --outdir dist
+      - name: Check wheel bundles the sidecar
+        run: |
+          python -c "
+          import glob, zipfile
+          whl = glob.glob('dist/*.whl')[0]
+          names = zipfile.ZipFile(whl).namelist()
+          assert 'nimcode/bin/nim-tui' in names, names
+          print(whl, 'contains nimcode/bin/nim-tui')
+          "

@@ -19,6 +19,9 @@ dependencies = [
     'colorama>=0.4.6; sys_platform == "win32"',
 ]
 
+[project.optional-dependencies]
+dev = ["ruff==0.15.15", "pytest==8.4.2", "build", "wheel"]
+
 [project.scripts]
 nimcode = "nimcode.cli:app"
 

@@ -216,6 +216,20 @@ def _docker_run_argv(
         "/workspace",
     ]
 
+    # Resource limits (Config defaults when unset; "" / 0 disables one).
+    for flag, key, default in (
+        ("--memory", "docker_memory", "2g"),
+        ("--pids-limit", "docker_pids_limit", 512),
+        ("--cpus", "docker_cpus", "2"),
+        ("--network", "docker_network", "bridge"),
+    ):
+        value = str(getattr(config, key, default) or "").strip()
+        if not value or value == "0" or value.startswith("-"):
+            continue
+        if flag == "--network" and _is_host_ns(value):
+            value = "bridge"  # never share the host's network namespace
+        docker_cmd.extend([flag, value])
+
     # Add port exposures if configured (validated ints only)
     for port in getattr(config, "docker_expose_ports", None) or []:
         try:
@@ -246,6 +260,11 @@ def _subagent_depth(config: Any) -> int:
         return int(getattr(config, "_subagent_depth", 0) or 0)
     except Exception:
         return 0
+
+
+SUBAGENT_HOST_REFUSAL = (
+    "Error: subagents require Docker; host execution is disabled for subagents."
+)
 
 
 def _resolve_use_docker(raw: Any, config: Any) -> bool:
@@ -452,7 +471,11 @@ def _execute_command(
     """
     Execute a command, using Docker if available and not disabled, otherwise falling back to host.
     """
+    # Only a real fallback gets the note: not when the user chose the host.
+    host_requested = use_docker is False or getattr(config, "disable_docker", False)
     use_docker = _resolve_use_docker(use_docker, config)
+    if not use_docker and _subagent_depth(config) > 0:
+        return {"refused": SUBAGENT_HOST_REFUSAL}
 
     # Validate command safety for Docker execution (advisory only).
     is_safe, warning = _validate_command_safety(command)
@@ -471,7 +494,7 @@ def _execute_command(
         return result
     else:
         result = _execute_on_host(command, workspace_root, config, timeout, extra_env)
-        result["fallback"] = True
+        result["fallback"] = not host_requested
         return result
 
 
@@ -485,6 +508,8 @@ def _run_and_format(
 ) -> str:
     """Run via _execute_command and render the tool result string."""
     result = _execute_command(command, workspace_root, config, timeout, use_docker)
+    if result.get("refused"):
+        return result["refused"]
     if result["timed_out"]:
         parts = [f"Error: {label} timed out after {timeout}s and was killed"]
     elif result.get("fallback"):
@@ -760,6 +785,10 @@ def start_background_process_tool(
     except ToolSandboxError as e:
         return f"Error: {e}"
 
+    use_docker = _resolve_use_docker(None, config)
+    if not use_docker and _subagent_depth(config) > 0:
+        return SUBAGENT_HOST_REFUSAL
+
     global _process_counter
     with _BG_LOCK:
         if len(BACKGROUND_PROCESSES) >= MAX_BG_PROCESSES:
@@ -769,8 +798,6 @@ def start_background_process_tool(
             )
         _process_counter += 1
         process_id = f"bg_{_process_counter}"
-
-    use_docker = _resolve_use_docker(None, config)
 
     if use_docker:
         container_name = f"nimcode_bg_{uuid.uuid4().hex[:12]}"

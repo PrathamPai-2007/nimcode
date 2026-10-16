@@ -7,7 +7,6 @@ import nimcode.config_models as cm
 import nimcode.skills as skills
 from nimcode.config import (
     Config,
-    _format_backup_time,
     get_project_nimcode_dir,
     load_config,
     save_config,
@@ -107,9 +106,11 @@ def test_migration_never_overwrites_newer_state(fake_home):
 
 
 def test_backup_name_strips_pid():
-    disp, orig = _format_backup_time("1700000000123456_4242_blocks_src_a.py")
-    assert orig == "blocks_src_a.py"
-    assert disp != "Unknown Time"
+    from nimcode.tools.base import _parse_backup_name
+
+    ts, hint, tag = _parse_backup_name("1700000000123456_4242_blocks_src_a.py")
+    assert (hint, tag) == ("src_a.py", "blocks")
+    assert ts == 1700000000.123456
 
 
 def test_reconcile_ignores_static_fallback(monkeypatch):
@@ -126,7 +127,7 @@ def test_failed_download_leaves_no_partial_file(monkeypatch, tmp_path):
     def boom(*a, **k):
         raise OSError("network down")
 
-    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", boom)
     dest = tmp_path / "x.md"
     with pytest.raises(OSError):
         skills._download_with_limits("https://example.com/x.md", dest, 100)

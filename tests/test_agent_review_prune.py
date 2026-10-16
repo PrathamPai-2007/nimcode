@@ -73,3 +73,38 @@ def test_context_overflow_terminates():
         call_nim_with_retry(client, msgs, None, cfg.fast_model, cfg)
     # 16000 -> 8000 -> 4000 -> 2000 -> 1000 then stop
     assert client.chat.completions.calls <= 6
+
+
+def test_effective_budget_caps_to_model_window():
+    from nimcode.config_models import MODEL_CONTEXT_TOKENS, effective_budget
+
+    model, window = next(iter(MODEL_CONTEXT_TOKENS.items()))
+    cfg = Config()
+    cfg.context_budget_tokens = window * 10
+    cfg.max_tokens = 4096
+    assert effective_budget(cfg, model) == window - 4096 - 1024
+    # Unknown model: config budget only; tiny budgets floor at 2000.
+    assert effective_budget(cfg, "no/such-model") == window * 10 - 5120
+    cfg.context_budget_tokens = 3000
+    assert effective_budget(cfg, "no/such-model") == 2000
+
+
+def test_prune_trims_single_oversized_newest_unit():
+    huge = "HEAD" + "x" * 200_000 + "TAIL"
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "first"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c1", "type": "function", "function": {}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": huge},
+    ]
+    res = prune_history(msgs, context_budget_tokens=5000)
+    assert count_message_tokens(res) <= 5000
+    tool = res[-1]
+    assert tool["role"] == "tool" and tool["tool_call_id"] == "c1"
+    assert tool["content"].startswith("HEAD") and tool["content"].endswith("TAIL")
+    assert res[-2]["tool_calls"] == msgs[2]["tool_calls"]  # pairing intact
+    assert msgs[3]["content"] == huge  # input not mutated
