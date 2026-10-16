@@ -60,6 +60,9 @@ def _get_client_and_setup() -> tuple[OpenAI, Any, Path, str]:
     load_dotenv()
 
     config = load_config()
+    # Env override for any OpenAI-compatible endpoint (benchmarks, CI, proxies).
+    if os.environ.get("NIMCODE_API_BASE_URL"):
+        config.api_base_url = os.environ["NIMCODE_API_BASE_URL"]
 
     # Global fallback for API key if not in local .env
     global_env = Path.home() / ".nimcode" / ".env"

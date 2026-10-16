@@ -36,3 +36,7 @@ Thumbs.db
 # Rust sidecar build output (bundled binary is built per-platform in CI)
 tui-rs/target/
 src/nimcode/bin/nim-tui*
+
+# Benchmark wheel + Harbor run output
+bench/dist/
+jobs/
