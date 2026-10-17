@@ -47,7 +47,7 @@
 
 ## 1. Introduction
 
-**Nimcode** (`src/nimcode/__init__.py:1`) is a **terminal-first AI coding agent** driven by **NVIDIA NIM** (default: `nvidia/nemotron-3-ultra-550b-a55b`). It is installed globally via `pip` and can be invoked from **any directory** on your machine. On every turn it:
+**Nimcode** (`src/nimcode/__init__.py:1`) is a **terminal-first AI coding agent** driven by **NVIDIA NIM** (default: `nvidia/nemotron-3-super-120b-a12b`). It is installed globally via `pip` and can be invoked from **any directory** on your machine. On every turn it:
 
 1. Harvests a live **workspace map** of your project (`src/nimcode/context.py:185`).
 2. Injects that map + `AGENTS.md` rules into a **system prompt** (`src/nimcode/core/prompts.py:46`).
@@ -271,8 +271,8 @@ Place an optional `nimcode.toml` in your **workspace root** (the directory you r
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `fast_model` | `str` | `nvidia/nemotron-3-ultra-550b-a55b` | Model for **Build & YOLO** execution |
-| `plan_model` | `str` | `nvidia/nemotron-3-ultra-550b-a55b` | Model for **Plan** mode reasoning |
+| `fast_model` | `str` | `nvidia/nemotron-3-super-120b-a12b` | Model for **Build & YOLO** execution |
+| `plan_model` | `str` | `nvidia/nemotron-3-super-120b-a12b` | Model for **Plan** mode reasoning |
 | `mode` | `str` | `build` | Startup mode: `plan` / `build` / `yolo` |
 | `temperature_fast` | `float` | `0.2` | Sampling temperature for Build/YOLO (low = deterministic code) |
 | `temperature_plan` | `float` | `0.2` | Sampling temperature for Plan |
@@ -304,7 +304,7 @@ Place an optional `nimcode.toml` in your **workspace root** (the directory you r
 ```toml
 # nimcode.toml
 fast_model = "deepseek-ai/deepseek-v4-flash"
-plan_model = "nvidia/nemotron-3-ultra-550b-a55b"
+plan_model = "nvidia/nemotron-3-super-120b-a12b"
 mode = "plan"
 timeout = 90
 max_loop_iterations = 15
@@ -322,8 +322,8 @@ Persisted per-workspace by `save_last_used_model()` (`src/nimcode/config.py:87`)
 
 ```json
 {
-  "model": "nvidia/nemotron-3-ultra-550b-a55b",
-  "fast_model": "nvidia/nemotron-3-ultra-550b-a55b",
+  "model": "nvidia/nemotron-3-super-120b-a12b",
+  "fast_model": "nvidia/nemotron-3-super-120b-a12b",
   "plan_model": "nvidia/nemotron-3-ultra-550b-a55b",
   "updated_at": 1714680000.0,
   "timestamp": 1714680000.0,
@@ -701,7 +701,7 @@ Static seed `AVAILABLE_MODELS` (`src/nimcode/config.py:750`, 10 entries) is only
 | # | Name | Model ID | Native window |
 |---|---|---|---|
 | 1 | Nemotron 3 Nano 30B | `nvidia/nemotron-3-nano-30b-a3b` | 1M |
-| 2 | DeepSeek V4 Flash | `deepseek-ai/deepseek-v4-flash` | 1M |
+| 2 | GPT-OSS 20B | `openai/gpt-oss-20b` | unknown |
 | 3 | Mixtral 8x7B Instruct | `mistralai/mixtral-8x7b-instruct-v0.1` | 32k |
 | 4 | Mistral Small | `mistralai/mistral-small-4-119b-2603` | unknown |
 | 5 | Nemotron 3 Super 120B | `nvidia/nemotron-3-super-120b-a12b` | 1M |
@@ -709,7 +709,7 @@ Static seed `AVAILABLE_MODELS` (`src/nimcode/config.py:750`, 10 entries) is only
 | 7 | MiniMax M3 | `minimaxai/minimax-m3` | unknown |
 | 8 | Mistral Large | `mistralai/mistral-large-3-675b-instruct-2512` | unknown |
 | 9 | DeepSeek V4 Pro | `deepseek-ai/deepseek-v4-pro` | 1M |
-| 10 | Nemotron 3 Ultra 550B | `nvidia/nemotron-3-ultra-550b-a55b` *(default)* | 1M |
+| 10 | Nemotron 3 Ultra 550B | `nvidia/nemotron-3-ultra-550b-a55b` | 1M |
 
 - **TUI selector** (`select_model()`, `src/nimcode/ui/rust_bridge.py:390`) shows a sidecar list (↑/↓, `Enter`) with `[Nk ctx]` badges, highlights the current model with ` (current)`, and handles the full handshake (summary generation + handoff injection).
 ---

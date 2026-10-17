@@ -367,7 +367,7 @@ def resume_subagent_thread(agent_id: str, workspace_root: Path, config: Any):
                 messages = prune_history(messages, budget)
                 tools_arg = None if disable_native else AVAILABLE_TOOLS_SPEC
                 model_to_use = getattr(
-                    config, "fast_model", "deepseek-ai/deepseek-v4-flash"
+                    config, "fast_model", "nvidia/nemotron-3-super-120b-a12b"
                 )
                 normalized_messages = normalize_messages(
                     messages, disable_native_tools=disable_native

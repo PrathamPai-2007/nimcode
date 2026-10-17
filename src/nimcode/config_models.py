@@ -45,7 +45,7 @@ MODEL_CONTEXT_TOKENS: Dict[str, int] = {
 DEFAULT_BUDGET = 128000
 
 # Fallback default model (mirrors Config.fast_model default).
-DEFAULT_MODEL_ID = "nvidia/nemotron-3-ultra-550b-a55b"
+DEFAULT_MODEL_ID = "nvidia/nemotron-3-super-120b-a12b"
 
 MODELS_CACHE_TTL_SECONDS = 24 * 3600
 MAX_CATALOG_MODELS = 200

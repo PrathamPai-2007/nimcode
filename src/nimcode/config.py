@@ -82,8 +82,8 @@ def _migrate_dir(src: Path, dst: Path) -> None:
 
 @dataclass
 class Config:
-    fast_model: str = "nvidia/nemotron-3-ultra-550b-a55b"
-    plan_model: str = "nvidia/nemotron-3-ultra-550b-a55b"
+    fast_model: str = "nvidia/nemotron-3-super-120b-a12b"
+    plan_model: str = "nvidia/nemotron-3-super-120b-a12b"
     mode: str = "build"
     temperature_fast: float = 0.2
     temperature_plan: float = 0.2
@@ -584,7 +584,7 @@ def show_changes(workspace_root: Path, tui: Optional[Any] = None):
 
 AVAILABLE_MODELS = {
     "1": {"name": "Nemotron 3 Nano 30B", "id": "nvidia/nemotron-3-nano-30b-a3b"},
-    "2": {"name": "DeepSeek V4-Flash", "id": "deepseek-ai/deepseek-v4-flash"},
+    "2": {"name": "GPT-OSS 20B", "id": "openai/gpt-oss-20b"},
     "3": {
         "name": "Mixtral 8x7B Instruct",
         "id": "mistralai/mixtral-8x7b-instruct-v0.1",
