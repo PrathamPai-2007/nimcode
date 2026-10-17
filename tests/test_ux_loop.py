@@ -168,9 +168,12 @@ def test_help_covers_every_command_and_key_list():
     assert "/models-refresh" in T.out[0] and "Ctrl+O" in T.out[0]
 
 
-def test_welcome_is_one_line():
+def test_welcome_is_one_line(monkeypatch, tmp_path):
     from nimcode.ui.rust_bridge import RustTUI
 
+    fake_bin = tmp_path / "nim-tui"
+    fake_bin.write_text("")
+    monkeypatch.setenv("NIM_TUI_BIN", str(fake_bin))
     tui = RustTUI(Config())
     tui.show_welcome("C:/ws")
     (msg,) = tui._pending

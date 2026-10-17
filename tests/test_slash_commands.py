@@ -35,10 +35,12 @@ def test_slash_catalog_sane():
         assert required in SLASH_COMMANDS, required
 
 
-def test_push_completions_payload(monkeypatch):
-    from nimcode.ui.rust_bridge import RustTUI, find_rust_binary
+def test_push_completions_payload(monkeypatch, tmp_path):
+    from nimcode.ui.rust_bridge import RustTUI
 
-    assert find_rust_binary() is not None, "bundled nim-tui binary missing"
+    fake_bin = tmp_path / "nim-tui"
+    fake_bin.write_text("")
+    monkeypatch.setenv("NIM_TUI_BIN", str(fake_bin))
     tui = RustTUI(Config())
     assert tui._pending == []
 

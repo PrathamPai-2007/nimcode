@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["ruff==0.15.15", "pytest==8.4.2", "build", "wheel"]
+dev = ["ruff==0.15.15", "pytest==8.4.2", "httpx", "build", "wheel"]
 
 [project.scripts]
 nimcode = "nimcode.cli:app"

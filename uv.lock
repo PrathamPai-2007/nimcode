@@ -379,6 +379,7 @@ dependencies = [
 [package.optional-dependencies]
 dev = [
     { name = "build" },
+    { name = "httpx" },
     { name = "pytest" },
     { name = "ruff" },
     { name = "wheel" },
@@ -388,6 +389,7 @@ dev = [
 requires-dist = [
     { name = "build", marker = "extra == 'dev'" },
     { name = "colorama", marker = "sys_platform == 'win32'", specifier = ">=0.4.6" },
+    { name = "httpx", marker = "extra == 'dev'" },
     { name = "openai", specifier = ">=1.0.0" },
     { name = "playwright", specifier = ">=1.40.0" },
     { name = "prompt-toolkit", specifier = ">=3.0.0" },
