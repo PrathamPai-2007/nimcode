@@ -699,7 +699,7 @@ fn hint_line(app: &App) -> Line<'static> {
         // the mode cycle, current mode lit in its colour
         let cur = mode_word(&app.sidebar.mode);
         let mut spans = vec![q("shift+tab  ".into())];
-        for (i, m) in ["Plan", "Build", "YOLO"].iter().enumerate() {
+        for (i, m) in ["Plan", "Build"].iter().enumerate() {
             if i > 0 {
                 spans.push(q(format!(" {sep} ")));
             }

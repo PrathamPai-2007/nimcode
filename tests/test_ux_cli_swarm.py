@@ -108,7 +108,7 @@ def test_subagent_times_out_and_writes_transcript(ws, monkeypatch):
     monkeypatch.setattr(openai, "OpenAI", _SlowClient)
     cfg = Config()
     cfg.subagent_timeout_s = 1
-    cfg.mode = "yolo"
+    cfg.mode = "build"
     res = swarm.spawn_agent_logic("Tester", "do the thing", ws, cfg)
     agent_id = res.split("ID: ")[1].split(".")[0]
     try:

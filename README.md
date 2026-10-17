@@ -22,17 +22,16 @@ The script installs [uv](https://docs.astral.sh/uv/) if needed, then the build f
 
 | Mode (Shift+Tab) | What happens |
 |---|---|
-| **Plan** | The model writes a plan; nothing runs. |
-| **Build** (default) | Every file edit or command shows a preview and waits for `y`/`n`. |
-| **YOLO** | Auto-approves and runs tests after edits. |
+| **Plan** | Reads your code freely, then proposes a plan. Never changes anything. |
+| **Build** (default) | Edits files and runs commands on its own, runs tests after edits, and asks only for sensitive files (`.env`, keys, `.git`) and risky commands (`rm -r`, `git push`, `curl`, installs). |
 
 Handy: `/model` switch model (`[free]` marks free endpoints that currently respond), `/help` all commands, `/restore` undo file changes, `/compact` shrink history, `nimcode resume --latest` continue a session.
 
-Scripts and CI: `nimcode run --headless --yolo --model <id> "<task>"`.
+Scripts and CI: `nimcode run --headless --model <id> "<task>"`.
 
 ## Good to know
 
-- Commands run in Docker when it's available, otherwise on your machine (after your approval).
+- Commands run in Docker when it's available, otherwise on your machine (risky ones ask first).
 - Your project stays clean: sessions, backups and logs live in `~/.nimcode/`.
 - Secrets are redacted from previews and tool output.
 

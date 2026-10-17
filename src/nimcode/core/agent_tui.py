@@ -22,6 +22,7 @@ from nimcode.tools import (
     execute_local_tool,
 )
 from nimcode.core.state import AgentState
+from nimcode.tools.policy import READ_ONLY_TOOLS, ask_reason, classify
 from nimcode.core.agent import (
     call_nim_with_retry,
     prune_history,
@@ -51,7 +52,6 @@ SLASH_COMMANDS: List[str] = [
     "/help",
     "/plan",
     "/build",
-    "/yolo",
     "/model",
     "/models-refresh",
     "/config",
@@ -281,13 +281,10 @@ async def _run_agent_loop_tui_internal(
     messages: list[dict[str, Any]] = []
     # No explicit state (e.g. `nimcode resume`): honour the configured mode
     # instead of silently forcing Plan mode.
-    state = initial_state or {
-        "yolo": "YOLO",
-        "plan": "AWAITING_PLAN_APPROVAL",
-    }.get(getattr(config, "mode", ""), "EXECUTING")
-    if state == "YOLO":
-        config.mode = "yolo"
-    elif state == "AWAITING_PLAN_APPROVAL":
+    state = initial_state or {"plan": "AWAITING_PLAN_APPROVAL"}.get(
+        getattr(config, "mode", ""), "EXECUTING"
+    )
+    if state == "AWAITING_PLAN_APPROVAL":
         config.mode = "plan"
     else:
         config.mode = "build"
@@ -324,13 +321,13 @@ async def _run_agent_loop_tui_internal(
             return "none"
 
         # Handle specific commands
-        if cmd_lower in ["/plan", "/build", "/yolo"]:
+        if cmd_lower in ["/plan", "/build"]:
             if cmd_lower == "/plan":
                 state = AgentState.AWAITING_PLAN_APPROVAL
                 config.mode = "plan"
                 tui.add_message(
                     "system",
-                    "\nSwitched to Plan Mode (AWAITING_PLAN_APPROVAL). Tools disabled until plan is approved.\n",
+                    "\nSwitched to Plan Mode (AWAITING_PLAN_APPROVAL). Read-only tools; no changes until a plan is approved.\n",
                 )
                 tui.update_mode("Plan Mode")
             elif cmd_lower == "/build":
@@ -338,17 +335,9 @@ async def _run_agent_loop_tui_internal(
                 config.mode = "build"
                 tui.add_message(
                     "system",
-                    "\nSwitched to Build Mode (EXECUTING with human-in-the-loop approval).\n",
+                    "\nSwitched to Build Mode (EXECUTING; asks only for sensitive or risky actions).\n",
                 )
                 tui.update_mode("Build Mode")
-            elif cmd_lower == "/yolo":
-                state = AgentState.YOLO
-                config.mode = "yolo"
-                tui.add_message(
-                    "system",
-                    "\nSwitched to YOLO Mode (EXECUTING with auto-approval of edits and commands).\n",
-                )
-                tui.update_mode("YOLO Mode")
             loop_count = 0
             return "command"
 
@@ -690,9 +679,7 @@ async def _run_agent_loop_tui_internal(
     consecutive_empty = 0
     # Label from the (just normalised) config.mode: tui.mode was computed at
     # construction and pushing it back would revert initial_state.
-    tui.update_mode(
-        {"yolo": "YOLO Mode", "plan": "Plan Mode"}.get(config.mode, "Build Mode")
-    )
+    tui.update_mode({"plan": "Plan Mode"}.get(config.mode, "Build Mode"))
     tui.update_tokens(0, config.context_budget_tokens)
 
     async def get_user_turn() -> Optional[str]:
@@ -717,9 +704,7 @@ async def _run_agent_loop_tui_internal(
 
     def _sync_state() -> None:
         nonlocal state
-        if config.mode == "yolo":
-            state = AgentState.YOLO
-        elif config.mode == "plan":
+        if config.mode == "plan":
             state = AgentState.AWAITING_PLAN_APPROVAL
         elif config.mode == "build":
             state = AgentState.EXECUTING
@@ -825,15 +810,17 @@ async def _run_agent_loop_tui_internal(
                 if state == AgentState.AWAITING_PLAN_APPROVAL
                 else config.fast_model
             )
-            # During AWAITING_PLAN_APPROVAL or when native tools are disabled, do not pass tools
-            tools_arg = (
-                None
-                if (
-                    state == AgentState.AWAITING_PLAN_APPROVAL
-                    or config.disable_native_tools
-                )
-                else AVAILABLE_TOOLS_SPEC
-            )
+            # Plan mode gets the read-only tools; XML fallback passes none.
+            if config.disable_native_tools:
+                tools_arg = None
+            elif state == AgentState.AWAITING_PLAN_APPROVAL:
+                tools_arg = [
+                    t
+                    for t in AVAILABLE_TOOLS_SPEC
+                    if t["function"]["name"] in READ_ONLY_TOOLS
+                ]
+            else:
+                tools_arg = AVAILABLE_TOOLS_SPEC
 
             if config.pending_summary_injection:
                 summary_file = (
@@ -972,21 +959,26 @@ async def _run_agent_loop_tui_internal(
                 tui.add_message("assistant", cleaned_content, markdown=True)
 
             # State 1: AWAITING_PLAN_APPROVAL
-            if state == AgentState.AWAITING_PLAN_APPROVAL:
-                plan_text = extract_plan_block(cleaned_content)
-                if plan_text:
-                    tui.add_message(
-                        "system", "--- Proposed Architectural Plan (<plan>) ---"
-                    )
-                    tui.add_message("assistant", plan_text, markdown=True)
-                    tui.add_message(
-                        "system", "--------------------------------------------"
-                    )
+            # Plan mode may read freely: tool calls go to the tool loop below,
+            # and a reply without a <plan> is just an answer, not a proposal.
+            plan_text = extract_plan_block(cleaned_content)
+            if (
+                state == AgentState.AWAITING_PLAN_APPROVAL
+                and plan_text
+                and not raw_message.tool_calls
+            ):
+                tui.add_message(
+                    "system", "--- Proposed Architectural Plan (<plan>) ---"
+                )
+                tui.add_message("assistant", plan_text, markdown=True)
+                tui.add_message(
+                    "system", "--------------------------------------------"
+                )
 
                 approval = (
                     (
                         await tui.get_user_confirmation(
-                            "Approve this plan to begin execution? (y/n/yolo for yolo mode)"
+                            "Approve this plan to begin execution? (y/n)"
                         )
                         or ""
                     )
@@ -994,13 +986,6 @@ async def _run_agent_loop_tui_internal(
                     .lower()
                 )
 
-                is_yolo_target = approval == "yolo" or (
-                    approval == "y"
-                    and (
-                        state == AgentState.YOLO
-                        or getattr(config, "mode", "") == "yolo"
-                    )
-                )
                 if approval in ("q", "n", ""):
                     tui.add_message(
                         "system",
@@ -1015,22 +1000,6 @@ async def _run_agent_loop_tui_internal(
                     loop_count = 0
                     # Wait for the user, don't immediately re-plan.
                     skip_first_api_call = True
-                    continue
-                elif is_yolo_target:
-                    state = AgentState.YOLO
-                    config.mode = "yolo"
-                    current_model = config.fast_model
-                    tui.add_message(
-                        "system",
-                        f"Plan approved! Switching to {state} state (Auto-approval enabled) with fast model: {current_model}",
-                    )
-                    tui.update_mode("YOLO Mode")
-                    trigger_msg = {
-                        "role": "user",
-                        "content": "Plan approved. Please proceed with step 1 using tool calls.",
-                    }
-                    messages.append(trigger_msg)
-                    log_turn(trigger_msg, session_path)
                     continue
                 elif approval != "y":
                     feedback = await tui.get_user_input(
@@ -1097,7 +1066,7 @@ async def _run_agent_loop_tui_internal(
                 continue
 
             # Loop limit check
-            loop_limit = 50 if state == AgentState.YOLO else config.max_loop_iterations
+            loop_limit = config.max_loop_iterations
             if loop_count >= loop_limit:
                 tui.add_message(
                     "system",
@@ -1172,7 +1141,7 @@ async def _run_agent_loop_tui_internal(
             pending_calls = list(raw_message.tool_calls)
             for _call_idx, tool_call in enumerate(pending_calls):
                 # Apply Shift+Tab / Ctrl+C pressed during the previous tool:
-                # leaving YOLO mid-batch restores the approval prompt.
+                # switching to Plan mid-batch refuses the remaining writes.
                 tui.poll_events()
                 _sync_state()
                 if _cancel_requested():
@@ -1212,17 +1181,16 @@ async def _run_agent_loop_tui_internal(
                         preview = f"(preview unavailable: {e})"
                     tui.add_message("tool", f"Preview:\n{preview}", markdown=False)
 
-                    if state == AgentState.YOLO:
-                        tui.add_message(
-                            "system",
-                            f"[YOLO Mode] Auto-approving execution of {tool_name}...",
-                        )
+                    decision = classify(tool_name, args, workspace_root, config.mode)
+                    if decision == "deny":
+                        approval = "deny"
+                    elif decision == "auto":
                         approval = "y"
                     else:
                         approval = (
                             (
                                 await tui.get_user_confirmation(
-                                    f"Approve execution of {tool_name}? (y/n to skip)"
+                                    f"Approve {tool_name} ({ask_reason(tool_name, args)})? (y/n to skip)"
                                 )
                                 or ""
                             )
@@ -1232,6 +1200,12 @@ async def _run_agent_loop_tui_internal(
 
                     if approval == "q":
                         approval = "n"
+                    elif approval == "deny":
+                        result = (
+                            f"Error: Plan mode is read-only; '{tool_name}' was not run. "
+                            "Put the change in your <plan> instead."
+                        )
+                        tui.add_message("system", result)
                     elif approval == "y":
                         tui.add_message("system", f"Executing {tool_name}...")
                         try:
@@ -1255,7 +1229,7 @@ async def _run_agent_loop_tui_internal(
                             markdown=False,
                         )
 
-                        if state == AgentState.YOLO and tool_name in [
+                        if config.auto_test and tool_name in [
                             "write_file",
                             "patch_file_ast",
                             "patch_file_blocks",
@@ -1268,7 +1242,7 @@ async def _run_agent_loop_tui_internal(
 
                             tui.add_message(
                                 "system",
-                                "[YOLO Mode] Code changed. Auto-running test suite for verification...",
+                                "Code changed. Auto-running test suite for verification...",
                             )
                             try:
                                 test_res = await asyncio.to_thread(

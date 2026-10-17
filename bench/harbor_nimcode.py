@@ -8,7 +8,7 @@ Usage (from the repo root, after `python -m build --wheel --outdir bench/dist`):
         -m deepseek-ai/deepseek-v4-flash -l 10
 
 The model id is passed to nimcode verbatim (a NIM model id). nimcode runs
-headless in YOLO mode inside the task container; with no Docker daemon there,
+headless in Build mode inside the task container; with no Docker daemon there,
 commands run directly in the container, which is the sandbox.
 """
 
@@ -95,7 +95,7 @@ class NimcodeAgent(BaseInstalledAgent):
         await self.exec_as_agent(
             environment,
             command=(
-                f"{NIMCODE} run --headless --yolo "
+                f"{NIMCODE} run --headless --mode build "
                 f"--model {shlex.quote(self.model_name)} "
                 f"--max-steps {self.MAX_STEPS} "
                 f"--json-out {logs}/nimcode.json "

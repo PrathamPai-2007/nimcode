@@ -100,9 +100,7 @@ class RustTUI:
         self.config = config
         self.mode = "Build Mode"
         if config:
-            self.mode = {"plan": "Plan Mode", "yolo": "YOLO Mode"}.get(
-                config.mode, "Build Mode"
-            )
+            self.mode = {"plan": "Plan Mode"}.get(config.mode, "Build Mode")
         self._bin = find_rust_binary()
         if not self._bin:
             raise RuntimeError(BINARY_MISSING_MSG)
@@ -357,7 +355,7 @@ class RustTUI:
     def poll_events(self) -> None:
         """Non-blocking: apply queued mode_cycle / interrupt events now.
 
-        Called between tool calls so Shift+Tab out of YOLO takes effect for
+        Called between tool calls so Shift+Tab into Plan takes effect for
         the rest of the batch. Other events (input, eof, ...) stay queued.
         """
         keep = []
@@ -426,7 +424,7 @@ class RustTUI:
         ]
         self._push_sidebar()
 
-    _MODES = {"Plan Mode": "plan", "Build Mode": "build", "YOLO Mode": "yolo"}
+    _MODES = {"Plan Mode": "plan", "Build Mode": "build"}
 
     def update_mode(self, mode: str):
         self.mode = mode

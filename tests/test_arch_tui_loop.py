@@ -76,12 +76,14 @@ def _run(tui, cfg, ws, prompt, state=None):
     )
 
 
-def test_shift_tab_out_of_yolo_mid_batch_restores_approval(ws, monkeypatch):
+def test_shift_tab_into_plan_mid_batch_refuses_remaining_writes(ws, monkeypatch):
     cfg = Config()
     cfg.disable_native_tools = False
     calls = [
         MockToolCall(
-            f"c{i}", "function", MockFunction("read_file", '{"path": "a.txt"}')
+            f"c{i}",
+            "function",
+            MockFunction("write_file", '{"path": "a.txt", "content": "x"}'),
         )
         for i in range(2)
     ]
@@ -99,13 +101,13 @@ def test_shift_tab_out_of_yolo_mid_batch_restores_approval(ws, monkeypatch):
 
     def flip_after_first_tool(t):
         if t.polls == 2:  # user pressed Shift+Tab while tool 1 ran
-            t.config.mode = "build"
+            t.config.mode = "plan"
 
     tui.on_poll = flip_after_first_tool
-    _run(tui, cfg, ws, "do it", state="YOLO")
+    _run(tui, cfg, ws, "do it", state="EXECUTING")
 
-    assert len(ran) == 1  # tool 1 auto-approved in YOLO, tool 2 rejected
-    assert len(tui.confirm_prompts) == 1 and "read_file" in tui.confirm_prompts[0]
+    assert len(ran) == 1  # tool 1 auto-ran in Build, tool 2 refused in Plan
+    assert tui.confirm_prompts == []
     # Tools run off the event loop thread.
     assert ran[0] != "MainThread"
 
@@ -171,7 +173,7 @@ def test_unreadable_skill_shows_error_not_prompt_injection(ws, monkeypatch):
 def test_poll_events_applies_mode_and_interrupt_keeps_input(monkeypatch):
     monkeypatch.setattr(rb, "find_rust_binary", lambda: Path(sys.executable))
     cfg = Config()
-    cfg.mode = "yolo"
+    cfg.mode = "plan"
     tui = rb.RustTUI(cfg)
     for ev in (
         {"type": "mode_cycle", "mode": "Build Mode"},
@@ -212,3 +214,82 @@ def test_find_rust_binary_order_and_error(monkeypatch, tmp_path):
         rb.make_tui()
     msg = str(ei.value)
     assert "NIM_TUI_BIN" in msg and "cargo build --release" in msg and "wheel" in msg
+
+
+def _scripted(monkeypatch, responses):
+    sent = []
+
+    def fake_call(client, messages, tools, *a, **k):
+        sent.append(tools)
+        return responses.pop(0)
+
+    monkeypatch.setattr(at, "call_nim_with_retry", fake_call)
+    ran = []
+
+    def fake_exec(name, args, root, config):
+        ran.append(name)
+        return "ok"
+
+    monkeypatch.setattr(at, "execute_local_tool", fake_exec)
+    return sent, ran
+
+
+def _call(name, args):
+    return MockToolCall("c1", "function", MockFunction(name, args))
+
+
+def test_plan_mode_reads_without_prompt_then_proposes(ws, monkeypatch):
+    cfg = Config()
+    cfg.disable_native_tools = False
+    sent, ran = _scripted(
+        monkeypatch,
+        [
+            _Resp("", [_call("read_file", '{"path": "a.txt"}')]),
+            _Resp("<plan>1. edit a.txt</plan>"),
+        ],
+    )
+    tui = FakeTUI(cfg, inputs=[None], confirms=["n"])
+    _run(tui, cfg, ws, "look around", state="AWAITING_PLAN_APPROVAL")
+
+    assert ran == ["read_file"]
+    names = {t["function"]["name"] for t in sent[0]}
+    assert "read_file" in names and "write_file" not in names
+    assert (
+        len(tui.confirm_prompts) == 1 and "Approve this plan" in tui.confirm_prompts[0]
+    )
+
+
+def test_plan_mode_refuses_a_hallucinated_write(ws, monkeypatch):
+    cfg = Config()
+    cfg.disable_native_tools = False
+    _, ran = _scripted(
+        monkeypatch,
+        [
+            _Resp("", [_call("write_file", '{"path": "x.py", "content": "1"}')]),
+            _Resp("sorry"),
+        ],
+    )
+    tui = FakeTUI(cfg, inputs=[None])
+    _run(tui, cfg, ws, "do it", state="AWAITING_PLAN_APPROVAL")
+
+    assert ran == [] and tui.confirm_prompts == []
+    assert any("Plan mode is read-only" in c for _, c in tui.messages)
+
+
+def test_build_mode_writes_silently_but_asks_for_env(ws, monkeypatch):
+    cfg = Config()
+    cfg.disable_native_tools = False
+    cfg.auto_test = False
+    _, ran = _scripted(
+        monkeypatch,
+        [
+            _Resp("", [_call("write_file", '{"path": "x.py", "content": "1"}')]),
+            _Resp("", [_call("write_file", '{"path": ".env", "content": "K=1"}')]),
+            _Resp("done"),
+        ],
+    )
+    tui = FakeTUI(cfg, inputs=[None], confirms=["y"])
+    _run(tui, cfg, ws, "do it", state="EXECUTING")
+
+    assert ran == ["write_file", "write_file"]
+    assert len(tui.confirm_prompts) == 1 and "sensitive file" in tui.confirm_prompts[0]

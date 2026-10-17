@@ -338,11 +338,7 @@ def resume_subagent_thread(agent_id: str, workspace_root: Path, config: Any):
                         f"{sys_prompt}\n\nYou are a background subagent with the specialized role: {sub['role']}."
                     )
 
-            max_steps = (
-                50
-                if getattr(config, "mode", "") == "yolo"
-                else getattr(config, "max_loop_iterations", 10)
-            )
+            max_steps = getattr(config, "max_loop_iterations", 10)
             try:
                 max_steps = int(max_steps)
             except Exception:

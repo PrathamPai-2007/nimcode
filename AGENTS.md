@@ -30,7 +30,7 @@ nimcode/
 │       │   ├── agent.py            # call_nim_with_retry(), prune_history(), normalize_messages(), log_turn(), load_session(), list_sessions(), open_session_path(), migrate_legacy_session(), run_init_command(), session stats
 │       │   ├── agent_tui.py        # run_agent_loop_tui() — the only agent loop; handle_command() incl. /install-skill + /<skill>, model handoff
 │       │   ├── prompts.py          # SYSTEM_PROMPT_TEMPLATE, build_system_prompt(), strip_reasoning_spans(), extract_plan_block()
-│       │   └── state.py            # AgentState (AWAITING_PLAN_APPROVAL / EXECUTING / YOLO) + AgentMode
+│       │   └── state.py            # AgentState (AWAITING_PLAN_APPROVAL / EXECUTING) + AgentMode
 │       ├── tools/                  # 19 tools in AVAILABLE_TOOLS_SPEC
 │       │   ├── __init__.py         # Imports fs/cmd/patch/swarm/browser/web (triggers registration); re-exports shared symbols
 │       │   ├── registry.py         # @register_tool, TOOL_REGISTRY, AVAILABLE_TOOLS_SPEC, execute_local_tool() + spawn caps
@@ -62,17 +62,16 @@ nimcode/
 
 ## 2. Core Architectural Rules
 
-1. **Never Bypass the Human Gate:** Every mutation tool (`write_file`, `patch_file_*`, `execute_command`, `run_tests`, etc.) must pass through `render_preview()` (`tools/base.py`) and await `y/n` in **Build** mode. YOLO still displays the preview before auto-approving. Stale typed-ahead input is discarded before each approval prompt. Swarm threads are the sole exception (see §4).
+1. **Never Bypass the Approval Policy:** Every tool call shows `render_preview()` (`tools/base.py`) and then goes through `classify()` (`tools/policy.py`): `auto` runs it, `ask` waits for `y/n`, `deny` refuses it (writes and commands in Plan mode). Reads run freely in both modes except sensitive files; Build auto-runs ordinary writes and commands and asks for sensitive paths (`.env`, keys, `.git`, CI workflows) and risky commands (`rm -r`, `sudo`, `git push`, `curl`/`wget`, installs). Unknown tools default to `ask`. Stale typed-ahead input is discarded before each approval prompt. Swarm threads are the sole exception (see §4).
 2. **Strict Sandbox Enforcement:**
    - All file-path arguments **must** flow through `resolve_and_validate_path()` (`tools/base.py`) — it resolves against `workspace_root` and rejects escapes. Backups go through shared `backup_file()`, which also records the original path in `backups/manifest.jsonl` — never re-implement backup logic per tool; read backups via `list_backups()`.
    - Every subprocess inherits `scrub_env()` (which **drops** sensitive variables) and its command preview + output pass `scrub_text()` to mask Bearer/`Authorization: Basic` tokens, `--password`/`--token` flags, `KEY=value` env lines, AWS/NVIDIA/OpenAI/GitHub/Slack/Google keys, JWTs, `scheme://user:pass@` URLs, and 32+ char alphanumeric keys.
    - Any outbound fetch of a user/model-supplied URL must pass `_is_url_allowed()` (`tools/base.py`), including every redirect hop.
 3. **Consolidated Global Config:** All persistent state (chat histories `sessions/`, subagent transcripts `subagents/`, backups `backups/`, `process_logs/`, `model.json`, `summary.md`, optional `AGENTS.md` copy) **must** reside under `get_project_nimcode_dir(workspace_root)` → `~/.nimcode/<name>_<hash>/`. Never write these into the user's repository.
-4. **Three-Mode State Machine** (`core/state.py`):
-   - `AWAITING_PLAN_APPROVAL` (Plan): `tools_arg = None` — model must emit `<plan>...</plan>`; no tool calls are sent or recorded.
-   - `EXECUTING` (Build): full `AVAILABLE_TOOLS_SPEC` with preview gate; cap `max_loop_iterations` (default 20).
-   - `YOLO` (YOLO): same tools, auto-approve, auto-test after file mutations (`tests_passed()` checks the final `[exit code: N]`), cap **50**.
-   - Mode changes (Shift+Tab) are applied between tool calls via `poll_events()`, so leaving YOLO mid-batch restores the gate for the remaining calls.
+4. **Two-Mode State Machine** (`core/state.py`):
+   - `AWAITING_PLAN_APPROVAL` (Plan): read-only tools only (`READ_ONLY_TOOLS`); the model explores, then emits `<plan>...</plan>`. A reply without a `<plan>` is a plain answer. Any non-read call is refused.
+   - `EXECUTING` (Build): full `AVAILABLE_TOOLS_SPEC` with preview gate; cap `max_loop_iterations` (default 40); auto-runs tests after file mutations when `auto_test` is on (`tests_passed()` checks the final `[exit code: N]`).
+   - Mode changes (Shift+Tab) are applied between tool calls via `poll_events()`, so switching to Plan mid-batch refuses the remaining writes.
 5. **Conceal Chain-of-Thought:** Strip `<think>` / `<thought>` / `<reasoning>` spans via `strip_reasoning_spans()` (`core/prompts.py`) before display or logging. Handles unclosed truncated tags.
 6. **Windows Terminal Compatibility:** Preserve `sys.stdout.reconfigure(encoding="utf-8", errors="replace")` at the top of `cli.py` and `config.py`. Route all prints via `ui/output.py` (`symbol()`, `safe_text()`, `TUI_INSTANCE` routing, `unicode_enabled()`/`color_enabled()` respecting `NIMCODE_ASCII`/`NIMCODE_PLAIN`/`NO_COLOR`). Never write to stdout/stderr while the TUI is up — use `logging`.
 7. **Session Serialization:** `log_turn()` (`core/agent.py`) **appends** one JSON line per message to `sessions/session_<ts>.jsonl` (`default=str` fallback; `tool_calls` arrays keep `id`/`type`/`function.name`/`function.arguments`). Read sessions only via `load_session()` / `list_sessions()` (they also accept legacy `.json` list files; resuming one copies it into a fresh `.jsonl`). Never introduce non-JSON-serializable objects into tool arguments or `messages`; never mutate an already-logged message — append a new one.
@@ -111,7 +110,7 @@ Playwright retries: 3 attempts, `+5s` timeout backoff, viewport `1280×720`, `do
 
 ## 4. Subagent Swarms — `tools/swarm.py`
 
-- **Autonomy:** Swarm threads spawned by `spawn_agent` execute tools **without** the human gate and **without** `render_preview()`. They run the full NIM loop (`resume_subagent_thread()`) for `max_steps = 50` in YOLO else `max_loop_iterations`, via `execute_local_tool()` directly, pruning history to `effective_budget()` each step.
+- **Autonomy:** Swarm threads spawned by `spawn_agent` execute tools **without** the human gate and **without** `render_preview()`. They run the full NIM loop (`resume_subagent_thread()`) for `max_steps = max_loop_iterations`, via `execute_local_tool()` directly, pruning history to `effective_budget()` each step.
 - **Docker-only execution:** Subagents can never run shell commands on the host. If Docker is unavailable or disabled, `execute_command` / `run_tests` / `start_background_process` return `SUBAGENT_HOST_REFUSAL`; if Docker is available, a subagent's `use_docker: false` is ignored.
 - **Lifecycle:** `spawn_agent_logic()` seeds `ACTIVE_SUBAGENTS[agent_id]`, then `resume_subagent_thread()` drives the model → tool cycle. `send_message_to_agent_logic()` puts messages in the agent's `inbox`, drained at the start of each step (no lost messages). `kill_agent_logic()` sets `KILLED`. `list_agents_logic()` renders `id | role | status | snippet`.
 - **Time limit & transcripts:** each run has a `subagent_timeout_s` wall-clock budget (default 900; `TIMED_OUT` when exceeded). Transcripts go to `subagents/<id>.jsonl`; ended agents are reaped from `ACTIVE_SUBAGENTS` after 10 minutes.
@@ -205,7 +204,7 @@ To satisfy NVIDIA NIM endpoints (notably **MiniMax-M3**, **GLM-5.2**) via the Op
 
 - **Live prompt injection:** `run_agent_loop_tui()` rebuilds `messages[0]` every turn with a fresh `generate_workspace_map()` + `build_system_prompt()` so renames, deletes, and `AGENTS.md` edits apply without restart.
 - **TUI routing:** When `TUI_INSTANCE` is set (`ui/output.py`), `echo`/`secho`/`print_text` route to the sidecar TUI buffer; otherwise to `rich`/`typer`. It is cleared on session exit. Markdown is rendered inside the Rust sidecar (`tui-rs/src/main.rs`).
-- **Design ("Nim"):** no boxes; coloured speaker gutters; the context gauge is a 1-3-5-7 Nim matchstick board; mode colours the prompt (Plan wisteria, Build pine, YOLO sulfur); one fuse animation while working. Keep the palette in `tui-rs/src/theme.rs`, keep the board the only bold element, and update `tui-rs/snapshots/` (`cargo test`) when layout changes.
+- **Design ("Nim"):** no boxes; coloured speaker gutters; the context gauge is a 1-3-5-7 Nim matchstick board; mode colours the prompt (Plan wisteria, Build pine); one fuse animation while working. Keep the palette in `tui-rs/src/theme.rs`, keep the board the only bold element, and update `tui-rs/snapshots/` (`cargo test`) when layout changes.
 - **Keys:** `KEY_BINDINGS` in `ui/console.py` must match the bindings in `tui-rs/src/app.rs`.
 - **Ctrl+D is sticky:** once requested, every prompt returns immediately and the interrupt flag stays set, so the loop reaches its exit check even from an approval prompt.
 - **Wire protocol:** NDJSON over loopback, UTF-8 both ways (Rust emits ASCII-escaped JSON). Any new message type must be added to `tests/protocol_samples.json`, which both `cargo test` and `tests/test_bridge_protocol.py` validate.

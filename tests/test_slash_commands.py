@@ -17,7 +17,6 @@ def test_slash_catalog_sane():
         "/help",
         "/plan",
         "/build",
-        "/yolo",
         "/model",
         "/config",
         "/changes",

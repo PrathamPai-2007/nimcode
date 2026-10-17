@@ -7,7 +7,7 @@ All commands are defined in `src/nimcode/cli.py:137` as `typer.Typer` subcommand
 ### `nimcode run --headless` (scripts, CI, benchmarks)
 
 ```bash
-nimcode run --headless --yolo --model <model-id> --max-steps 150 --json-out run.json "fix the failing test"
+nimcode run --headless --model <model-id> --max-steps 150 --json-out run.json "fix the failing test"
 ```
 
 Runs the real agent loop with no TUI: messages stream to stdout as `[role] text`, every approval is auto-accepted, and the run ends when the agent hands control back (finishes) or after `--max-steps`. Exit code `0` = finished, `2` = step limit, `1` = error. `--json-out` writes `{status, model, mode, duration_s, api_calls, prompt_tokens, completion_tokens, total_tokens, error}`, with token counts taken from the API's reported usage. No Rust sidecar is needed.
@@ -20,18 +20,17 @@ Prints every setting with its value and where it came from: `[default]`, `[nimco
 
 Boots the interactive TUI and immediately prompts for an initial task. Equivalent to `nimcode start`.
 
-### `nimcode run <prompt> [--mode plan|build|yolo] [--yolo]`
+### `nimcode run <prompt> [--mode plan|build]`
 
 Start the agent loop with an initial task:
 
 ```bash
 nimcode run "Create a Python script that fetches the current weather."
 nimcode run --mode plan "Design a rate-limiter for the API"
-nimcode run --yolo "Refactor main.py to use async/await and run the tests."
-nimcode run -m yolo -y "Bulk-rename all handlers"
+nimcode run "Refactor main.py to use async/await and run the tests."
 ```
 
-Mode resolution (`src/nimcode/cli.py:159`): `--yolo` flag wins → explicit `--mode` → `config.mode` default.
+Mode resolution (`src/nimcode/cli.py:159`): explicit `--mode` → `config.mode` default.
 
 ### `nimcode start`
 

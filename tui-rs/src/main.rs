@@ -289,7 +289,7 @@ fn demo(app: &mut app::App) {
     app.sidebar.model = "demo-model".into();
     app.sidebar.tokens_used = 41_000;
     app.completions = [
-        "/help", "/plan", "/build", "/yolo", "/model", "/config", "/team", "/exit",
+        "/help", "/plan", "/build", "/model", "/config", "/team", "/exit",
     ]
     .iter()
     .map(|s| s.to_string())

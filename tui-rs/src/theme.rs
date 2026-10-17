@@ -148,7 +148,6 @@ impl Theme {
     pub fn mode_color(mode: &str) -> Color {
         match mode_word(mode) {
             "Plan" => WISTERIA,
-            "YOLO" => SULFUR,
             _ => PINE,
         }
     }
@@ -176,7 +175,7 @@ mod tests {
         ] {
             assert!(s.is_ascii(), "{s}");
         }
-        assert_eq!(mode_word("YOLO Mode"), "YOLO");
+        assert_eq!(mode_word("Build Mode"), "Build");
         assert_eq!(Theme::mode_color("Plan Mode"), WISTERIA);
         assert_eq!(Theme::mode_color("Build Mode"), PINE);
         let nc = Theme {

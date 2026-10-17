@@ -32,7 +32,7 @@ User Prompt
       ┌────────────────┐ ┌──────────────┐ ┌────────────────┐
        │ tools/registry │ │ ui/        │ │ core/state.py  │
        │ TOOL_REGISTRY  │ │ rust_bridge│ │ AgentState     │
-       │ 19 tools       │ │ RustTUI    │ │ Plan/Build/YOLO│
+       │ 19 tools       │ │ RustTUI    │ │ Plan / Build  │
        │                │ │ + nim-tui  │ │                │
       └────────────────┘ └──────────────┘ └────────────────┘
               │
@@ -75,7 +75,7 @@ nimcode/
 │       │   ├── agent.py            # call_nim_with_retry(), prune_history(), normalize_messages(), log_turn(), load_session(), list_sessions(), open_session_path(), migrate_legacy_session(), run_init_command(), session stats
 │       │   ├── agent_tui.py        # run_agent_loop_tui() — the only agent loop; handle_command() incl. /install-skill + /<skill>, model handoff
 │       │   ├── prompts.py          # SYSTEM_PROMPT_TEMPLATE, build_system_prompt(), strip_reasoning_spans(), extract_plan_block()
-│       │   └── state.py            # AgentState (AWAITING_PLAN_APPROVAL / EXECUTING / YOLO) + AgentMode
+│       │   └── state.py            # AgentState (AWAITING_PLAN_APPROVAL / EXECUTING) + AgentMode
 │       ├── tools/                  # 19 tools in AVAILABLE_TOOLS_SPEC
 │       │   ├── __init__.py         # Imports fs/cmd/patch/swarm/browser/web (triggers registration); re-exports shared symbols
 │       │   ├── registry.py         # @register_tool, TOOL_REGISTRY, AVAILABLE_TOOLS_SPEC, execute_local_tool() + spawn caps
@@ -132,10 +132,10 @@ Async wrapper that:
    - `log_turn()` persistence after every message (append-only JSONL).
    - Blocking work (tools, tests, NIM calls) via `asyncio.to_thread`; `poll_events()` between tool calls applies Shift+Tab / Ctrl+C mid-batch.
    - `handle_command()` dispatch for all slash commands (`:179`), including `/install-skill` and `/<skill>` injection (which returns `"resume"` to continue straight to the API call).
-   - `initial_state` sync (`YOLO`/`AWAITING_PLAN_APPROVAL`/`EXECUTING`).
+   - `initial_state` sync (`AWAITING_PLAN_APPROVAL`/`EXECUTING`).
    - Model-dependent `tools_arg` selection (`:626`).
    - `pending_summary_injection` handoff (`<model_handoff_context>`).
-   - Loop-limit guard (20 Build / 50 YOLO) with user prompt to resume/redirect/cancel.
+   - Loop-limit guard (`max_loop_iterations`, 40) with user prompt to resume/redirect/cancel.
 
 `run_agent_loop_tui()` is the only agent loop (the legacy ANSI loop was removed).
 
@@ -165,7 +165,7 @@ GOLDEN OPERATING LOOP (follow for every task):
 2. REPRODUCE/CONFIRM ... 3. MINIMAL EDIT: ... Prefer patch_file_blocks ...
 4. VERIFY: Re-read ... run_tests ... Never claim done without tool evidence.
 5. REPORT: ... TOOL STRATEGY: one logical step per turn ...
-MODES: Plan Mode (<plan>, no tools) / Build/YOLO (execute step by step).
+MODES: Plan Mode (read-only tools, then <plan>) / Build Mode (execute; asks only for sensitive or risky actions).
 Background Processes: start_background_process for dev servers ...
 Visual Verification Loop: screenshot → checklist → fix → repeat.
 COMMUNICATION: terse, no chain-of-thought dumps.
@@ -204,7 +204,7 @@ The fullscreen TUI is a Rust `ratatui`/`crossterm` sidecar, not Python:
 `src/nimcode/tools/swarm.py:118`:
 
 - `spawn_agent_logic(role, task_prompt, workspace_root, config)` builds a fresh `messages = [system + role suffix, user task_prompt]` with a live `workspace_map`, seeds `ACTIVE_SUBAGENTS[agent_id]` (`id = sub_<8-hex-uuid>`, with per-agent `depth`), caps at 10 active subagents / nesting depth 3 (fork-bomb guard), and spawns `resume_subagent_thread()`.
-- `resume_subagent_thread()` (`:178`) runs on a **thread-local config copy** carrying the agent's depth, so the depth cap accumulates across generations (sibling threads never race on shared state). It loops `max_steps` (50 in YOLO, else `max_loop_iterations`) calling the NIM API (same `AVAILABLE_TOOLS_SPEC` + `normalize_messages`), executing tools via `execute_local_tool()` directly (no human gate), and appending `assistant` / `tool` turns to `sub["messages"]`. Aborts after 5 consecutive invalid tool calls; empty model responses mark `ERROR` (no zombie `RUNNING`); cooperative `KILLED` stays `KILLED` (never overwritten to `ERROR`). Thread safety via `sub["lock"]` (`threading.Lock`) + `_SUBAGENTS_LOCK` (`RLock`, `:13`).
+- `resume_subagent_thread()` (`:178`) runs on a **thread-local config copy** carrying the agent's depth, so the depth cap accumulates across generations (sibling threads never race on shared state). It loops `max_steps` (`max_loop_iterations`) calling the NIM API (same `AVAILABLE_TOOLS_SPEC` + `normalize_messages`), executing tools via `execute_local_tool()` directly (no human gate), and appending `assistant` / `tool` turns to `sub["messages"]`. Aborts after 5 consecutive invalid tool calls; empty model responses mark `ERROR` (no zombie `RUNNING`); cooperative `KILLED` stays `KILLED` (never overwritten to `ERROR`). Thread safety via `sub["lock"]` (`threading.Lock`) + `_SUBAGENTS_LOCK` (`RLock`, `:13`).
 - Monitor live with `/team` (sidebar also polls `ACTIVE_SUBAGENTS` every turn).
 - Each run has a wall-clock budget (`subagent_timeout_s`, default 900 s); exceeding it marks the agent `TIMED_OUT`.
 - Transcripts are appended to `~/.nimcode/<project>_<hash>/subagents/<id>.jsonl`; finished, killed and timed-out agents are dropped from `ACTIVE_SUBAGENTS` 10 minutes after they end (transcripts stay).

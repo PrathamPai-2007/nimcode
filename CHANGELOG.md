@@ -9,7 +9,9 @@
 - `/model` and `nimcode refresh-models` tag free-endpoint models with `[free]`.
 
 **Agent**
-- Headless mode: `nimcode run --headless --yolo --model <id> --json-out run.json "<task>"` with token usage.
+- Two modes: Plan and Build. YOLO is gone. Plan can now read the whole project (read-only tools) before proposing a plan; Build runs ordinary edits, commands and tests on its own and asks only for sensitive files (`.env`, keys, `.git`, CI workflows) and risky commands (`rm -r`, `sudo`, `git push`, `curl`, installs). `mode = "yolo"` in old configs falls back to `build`; `--yolo` is removed.
+- `auto_test` option; `max_loop_iterations` default is now 40.
+- Headless mode: `nimcode run --headless --model <id> --json-out run.json "<task>"` with token usage.
 - `NIMCODE_API_BASE_URL` points nimcode at any OpenAI-compatible endpoint.
 - Sessions stored as JSONL; backup manifest; API errors classified by type; pruning budget from the model's real context window.
 - "No tests collected" is no longer reported to the model as a failure.

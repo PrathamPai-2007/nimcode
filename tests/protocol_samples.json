@@ -27,7 +27,7 @@
     {"type": "input", "text": "hello café"},
     {"type": "select_result", "index": 1},
     {"type": "select_result", "index": null},
-    {"type": "mode_cycle", "mode": "YOLO Mode"},
+    {"type": "mode_cycle", "mode": "Plan Mode"},
     {"type": "interrupt"},
     {"type": "eof"}
   ]

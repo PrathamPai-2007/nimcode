@@ -222,7 +222,7 @@ def test_vision_attaches_image_and_logs_path(ws, monkeypatch):
     cfg = Config()
     cfg.vision_screenshots = True
     tui = FakeTUI(cfg, inputs=[None])
-    _run(tui, cfg, ws, "check the page", state="YOLO")
+    _run(tui, cfg, ws, "check the page", state="EXECUTING")
 
     last = seen[1][-1]
     assert last["role"] == "user" and isinstance(last["content"], list)
@@ -251,7 +251,7 @@ def test_vision_off_by_default(ws, monkeypatch):
     (ws / "s.png").write_bytes(b"x")
     monkeypatch.setattr(at, "execute_local_tool", lambda *a, **k: "[screenshot: s.png]")
     monkeypatch.setattr(at, "render_preview", lambda *a, **k: "preview")
-    _run(FakeTUI(Config(), inputs=[None]), Config(), ws, "go", state="YOLO")
+    _run(FakeTUI(Config(), inputs=[None]), Config(), ws, "go", state="EXECUTING")
     assert seen[1][-1]["role"] == "tool"
 
 

@@ -18,12 +18,13 @@ Place an optional `nimcode.toml` in your **workspace root** (the directory you r
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `fast_model` | `str` | `nvidia/nemotron-3-super-120b-a12b` | Model for **Build & YOLO** execution |
+| `fast_model` | `str` | `nvidia/nemotron-3-super-120b-a12b` | Model for **Build** execution |
 | `plan_model` | `str` | `nvidia/nemotron-3-super-120b-a12b` | Model for **Plan** mode reasoning |
-| `mode` | `str` | `build` | Startup mode: `plan` / `build` / `yolo` |
-| `temperature_fast` | `float` | `0.2` | Sampling temperature for Build/YOLO (low = deterministic code) |
+| `mode` | `str` | `build` | Startup mode: `plan` / `build` |
+| `temperature_fast` | `float` | `0.2` | Sampling temperature for Build (low = deterministic code) |
 | `temperature_plan` | `float` | `0.2` | Sampling temperature for Plan |
-| `max_loop_iterations` | `int` | `20` | Consecutive agent steps before pausing for human input (YOLO overrides to **50**) |
+| `max_loop_iterations` | `int` | `40` | Consecutive agent steps before pausing for human input |
+| `auto_test` | `bool` | `true` | Build: run the test suite after each file edit and report failures to the model |
 | `timeout` | `int` | `60` | Subprocess hard timeout (seconds, capped at 600) |
 | `output_cap` | `int` | `100000` | Max characters from any single tool output (`src/nimcode/tools/base.py:240`) |
 | `context_budget_tokens` | `int` | `128000` | Upper bound for history; the effective budget is `min(this, model window) − max_tokens − 1024` (`effective_budget()`) |

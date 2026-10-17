@@ -157,13 +157,7 @@ def run(
         ..., help="The initial coding task or instruction for NIM-Engineer."
     ),
     mode: Optional[str] = typer.Option(
-        None, "--mode", "-m", help="Mode to run in: 'plan', 'build', or 'yolo'."
-    ),
-    yolo: bool = typer.Option(
-        False,
-        "--yolo",
-        "-y",
-        help="Run directly in YOLO mode (auto-accept edits and commands).",
+        None, "--mode", "-m", help="Mode to run in: 'plan' or 'build'."
     ),
     headless: bool = typer.Option(
         False,
@@ -184,15 +178,12 @@ def run(
     Start the NIM-Engineer agent loop with a specific task prompt.
     """
     # Validate before setup so a typo fails fast.
-    if mode is not None and mode.lower() not in ("plan", "build", "yolo"):
-        raise typer.BadParameter("Mode must be one of: plan, build, yolo.")
+    if mode is not None and mode.lower() not in ("plan", "build"):
+        raise typer.BadParameter("Mode must be one of: plan, build.")
     client, config, workspace_root, workspace_map = _get_client_and_setup()
     if model:
         config.fast_model = config.plan_model = model
-    if yolo or (mode and mode.lower() == "yolo"):
-        config.mode = "yolo"
-        initial_state = "YOLO"
-    elif mode and mode.lower() == "plan":
+    if mode and mode.lower() == "plan":
         config.mode = "plan"
         initial_state = "AWAITING_PLAN_APPROVAL"
     elif mode and mode.lower() == "build":
@@ -200,9 +191,7 @@ def run(
         initial_state = "EXECUTING"
     else:
         initial_state = (
-            "YOLO"
-            if config.mode == "yolo"
-            else ("AWAITING_PLAN_APPROVAL" if config.mode == "plan" else "EXECUTING")
+            "AWAITING_PLAN_APPROVAL" if config.mode == "plan" else "EXECUTING"
         )
 
     if headless:
@@ -251,7 +240,7 @@ def _run_headless(
 
     from nimcode.ui.headless import HeadlessTUI, UsageMeter, write_summary
 
-    per_batch = 50 if initial_state == "YOLO" else max(1, config.max_loop_iterations)
+    per_batch = max(1, config.max_loop_iterations)
     tui = HeadlessTUI(config=config, max_resumes=max(0, -(-max_steps // per_batch) - 1))
     meter = UsageMeter(client)
     started = time.time()
@@ -298,9 +287,7 @@ def start():
     tui.show_welcome(str(workspace_root))
 
     # Now run the full agent loop with the initial prompt empty, which will automatically prompt the user in TUI
-    if config.mode == "yolo":
-        initial_state = "YOLO"
-    elif config.mode == "plan":
+    if config.mode == "plan":
         initial_state = "AWAITING_PLAN_APPROVAL"
     else:
         initial_state = "EXECUTING"

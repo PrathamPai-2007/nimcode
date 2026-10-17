@@ -52,12 +52,12 @@ class HeadlessTUI:
     def __init__(self, config: Any = None, out: TextIO = None, max_resumes: int = 2):
         self.config = config
         self.out = out or sys.stdout
-        self.mode = {"plan": "Plan Mode", "yolo": "YOLO Mode"}.get(
+        self.mode = {"plan": "Plan Mode"}.get(
             getattr(config, "mode", "build"), "Build Mode"
         )
         self._interrupted = False
         self._tui_task = None
-        # Each loop-limit check-in grants another batch of steps (50 in YOLO).
+        # Each loop-limit check-in grants another batch of steps.
         self.max_resumes = max_resumes
         self.resumes_used = 0
         self.ended_by: Optional[str] = None

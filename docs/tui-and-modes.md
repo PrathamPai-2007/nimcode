@@ -10,7 +10,7 @@ The TUI is the Rust sidecar `nim-tui` (`tui-rs/`, bundled in release wheels, ove
 
 - **No boxes.** One vertical rule separates the conversation from the sidebar; one horizontal rule sits above the input.
 - **Who is speaking** is a coloured left gutter `▎`: wisteria for you, pine for nimcode, sulfur for tools, ash for system notes, red only for errors. Text wraps at 100 columns.
-- **Mode** colours the mode word and the `›` prompt: Plan = wisteria, Build = pine, YOLO = sulfur.
+- **Mode** colours the mode word and the `›` prompt: Plan = wisteria, Build = pine.
 - **Tool output** is dimmed and folded past 12 lines (`Ctrl+O` expands); diffs use pine `+` and sulfur `-`.
 - **Working** shows a burning fuse `━━━━╸` with the working message and elapsed seconds; when the turn ends, the reply's gutter flashes once.
 - **Empty state:** the board drawn large with "Describe a task, or type / for commands."
@@ -32,7 +32,7 @@ The list lives in `KEY_BINDINGS` (`src/nimcode/ui/console.py`) and is shown by `
 | PgUp/PgDn, Ctrl+↑/↓, mouse wheel | Scroll the conversation ("↑ N more" shows while scrolled) |
 | Esc | Back to the latest message / dismiss the popup |
 | Tab | Complete a `/command` |
-| Shift+Tab / Ctrl+T | Cycle Plan → Build → YOLO (applies between tool calls too) |
+| Shift+Tab / Ctrl+T | Cycle Plan ↔ Build (applies between tool calls too) |
 | Ctrl+O | Expand / fold long tool output |
 | Ctrl+C | Clear the input, or interrupt the turn when it is empty |
 | Ctrl+D | Exit (when the input is empty), even mid-turn |
@@ -48,8 +48,7 @@ All commands are dispatched by `handle_command()` (`src/nimcode/core/agent_tui.p
 |---|---|---|---|
 | `/help` | `?`, `help` | Show keyboard shortcuts & command table | `src/nimcode/ui/console.py:11` |
 | `/plan` | — | Switch to Plan Mode (`AWAITING_PLAN_APPROVAL`) | `src/nimcode/core/agent_tui.py:195` |
-| `/build` | — | Switch to Build Mode (`EXECUTING`, human gate) | same |
-| `/yolo` | — | Switch to YOLO Mode (auto-approve, cap 50) | same |
+| `/build` | — | Switch to Build Mode (`EXECUTING`, risk-based approval) | same |
 | `/model` | — | Inline model selector (`select_model()`) → context handoff via `summary.md` | `src/nimcode/ui/rust_bridge.py:390` |
 | `/models-refresh` | — | Blocking catalog refresh + retired-model reconcile + context re-apply | `src/nimcode/core/agent_tui.py:263` |
 | `/config` | — | Inline table + prompt to edit `output_cap`, `timeout`, `auto_backup`, etc. | `src/nimcode/ui/rust_bridge.py:545` |
@@ -72,15 +71,15 @@ All commands are dispatched by `handle_command()` (`src/nimcode/core/agent_tui.p
 
 | Shortcut | Action |
 |---|---|
-| `Shift+Tab` | Cycle `Plan → Build → YOLO → Plan` (updates `config.mode`) |
+| `Shift+Tab` | Cycle `Plan ↔ Build` (updates `config.mode`) |
 | `Ctrl+C` | Cancel current work: clears input, or interrupts the in-flight API call / remaining tool calls (`_interrupted` flag, `src/nimcode/ui/rust_bridge.py`, `src/nimcode/core/agent.py:395`). Press again at an empty prompt handling to exit |
 | `Ctrl+D` | Exit the session cleanly (sticky `_eof_requested`, observed even mid-turn) |
-| `Ctrl+T` | Cycle `Plan → Build → YOLO → Plan` (same as `Shift+Tab`) |
+| `Ctrl+T` | Cycle `Plan ↔ Build` (same as `Shift+Tab`) |
 | `Tab` (with `/` popup) | Accept the highlighted completion inline |
 | `Esc` | Dismiss the `/` popup, else stop stick-to-bottom follow mode |
 | `↑` / `↓` / `PageUp` / `PageDown` / `Home` / `End` | Scroll the conversation pane |
 
-## Operational Modes (Plan / Build / YOLO)
+## Operational Modes (Plan / Build)
 
 Defined in `src/nimcode/core/state.py:4`:
 
@@ -88,13 +87,13 @@ Defined in `src/nimcode/core/state.py:4`:
 class AgentState(str, Enum):
     AWAITING_PLAN_APPROVAL = "AWAITING_PLAN_APPROVAL"
     EXECUTING = "EXECUTING"
-    YOLO = "YOLO"
 ```
 
-| Mode | State | How to enter | Tool access | Human gate | Loop cap |
+| Mode | State | How to enter | Tool access | Approval | Loop cap |
 |---|---|---|---|---|---|
-| **Plan** | `AWAITING_PLAN_APPROVAL` | `/plan` or `nimcode run --mode plan` or default `mode=plan` | **Disabled** — `tools_arg=None` so model must emit `<plan>...</plan>` (`src/nimcode/core/agent_tui.py:626`) | Plan must be approved `y` | `max_loop_iterations` (20) |
-| **Build** | `EXECUTING` | `/build` or `mode=build` (default) | Full `AVAILABLE_TOOLS_SPEC` (19 tools) | **Every** tool shows `render_preview()` diff/command and waits for `y/n` (`src/nimcode/core/agent_tui.py:1018`) | `max_loop_iterations` (20) |
-| **YOLO** | `YOLO` | `/yolo`, `--yolo`, or approving a plan with `yolo` | Full tools | **Auto-approves** (`y`) and auto-runs tests after file mutations (`src/nimcode/core/agent_tui.py:1011`, `src/nimcode/core/agent_tui.py:1053`) | **50** (hard override) |
+| **Plan** | `AWAITING_PLAN_APPROVAL` | `/plan`, `nimcode run --mode plan` or `mode=plan` | Read-only tools (`read_file`, `list_files`, `glob_files`, `search_grep`, `search_symbols`, `web_search`, ...). Anything else is refused. | Reads run unprompted (sensitive files ask); the plan itself must be approved `y` | `max_loop_iterations` (40) |
+| **Build** | `EXECUTING` | `/build` or `mode=build` (default) | Full `AVAILABLE_TOOLS_SPEC` | `classify()` in `src/nimcode/tools/policy.py`: ordinary writes, commands and network tools run; sensitive files and risky commands ask `y/n` | `max_loop_iterations` (40) |
 
-**Plan flow** (`src/nimcode/core/agent_tui.py:777`): assistant text → `extract_plan_block()` (`src/nimcode/core/prompts.py:159`) → render plan → prompt `Approve? (y/n/yolo)` → on `y`/`yolo` inject trigger message `"Plan approved. Please proceed with step 1 using tool calls."`.
+Build auto-runs the test suite after file edits (`auto_test`, on by default). Tune what asks in `policy.py` (`SENSITIVE_PATTERNS`, `RISKY_COMMAND`); the command rules are a heuristic, Docker is the real boundary.
+
+**Plan flow** (`src/nimcode/core/agent_tui.py:777`): read-only tool calls run first; then assistant text → `extract_plan_block()` (a reply with no `<plan>` is just an answer) (`src/nimcode/core/prompts.py:159`) → render plan → prompt `Approve? (y/n)` → on `y` inject trigger message `"Plan approved. Please proceed with step 1 using tool calls."`.

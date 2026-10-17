@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 pub const MAX_MESSAGES: usize = 5000;
 pub const MAX_HISTORY: usize = 200;
-const MODES: [&str; 3] = ["Plan Mode", "Build Mode", "YOLO Mode"];
+const MODES: [&str; 2] = ["Plan Mode", "Build Mode"];
 
 /// Rendered lines of one message, valid for (width, folded).
 pub struct Cache {
@@ -671,7 +671,7 @@ mod tests {
         ));
         assert!(matches!(
             &a.on_key(key(KeyCode::BackTab, KeyModifiers::SHIFT), false)[..],
-            [RustMsg::ModeCycle { mode }] if mode == "YOLO Mode"
+            [RustMsg::ModeCycle { mode }] if mode == "Plan Mode"
         ));
     }
 

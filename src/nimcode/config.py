@@ -87,7 +87,7 @@ class Config:
     mode: str = "build"
     temperature_fast: float = 0.2
     temperature_plan: float = 0.2
-    max_loop_iterations: int = 20
+    max_loop_iterations: int = 40
     workspace_root: str = "."
     timeout: int = 60
     output_cap: int = 100000
@@ -114,6 +114,8 @@ class Config:
     subagent_timeout_s: int = 900
     # Attach screenshot_page PNGs to the conversation as image_url parts.
     vision_screenshots: bool = False
+    # Build mode: run the test suite after each file edit and report failures.
+    auto_test: bool = True
     # SearXNG base URL used as web_search fallback; "" disables it.
     searxng_url: str = ""
 
@@ -212,7 +214,7 @@ def save_config(config: Config, workspace_root: Optional[Path] = None):
             f"mode = {q(str(config.mode))}",
             f"fast_model = {q(str(config.fast_model))}",
             f"plan_model = {q(str(config.plan_model))}",
-            f"max_loop_iterations = {_num(config.max_loop_iterations, 20)}",
+            f"max_loop_iterations = {_num(config.max_loop_iterations, 40)}",
             f"timeout = {_num(config.timeout, 60)}",
             f"output_cap = {_num(config.output_cap, 100000)}",
             f"context_budget_tokens = {_num(config.context_budget_tokens, 128000)}",
@@ -232,6 +234,7 @@ def save_config(config: Config, workspace_root: Optional[Path] = None):
             f"denylist = {_json.dumps(list(config.denylist or []))}",
             f"subagent_timeout_s = {_num(config.subagent_timeout_s, 900)}",
             f"vision_screenshots = {'true' if config.vision_screenshots else 'false'}",
+            f"auto_test = {'true' if config.auto_test else 'false'}",
             f"searxng_url = {q(str(config.searxng_url or ''))}",
         ]
         if getattr(config, "api_base_url", None):
@@ -304,15 +307,15 @@ def _validate_config(cfg: Config) -> None:
         cfg.max_tokens = 4096
 
     # Validate max_loop_iterations
-    cfg.max_loop_iterations = _coerce(cfg.max_loop_iterations, int, 20)
+    cfg.max_loop_iterations = _coerce(cfg.max_loop_iterations, int, 40)
     if cfg.max_loop_iterations <= 0:
         warnings.warn(
-            f"max_loop_iterations must be positive, got {cfg.max_loop_iterations}. Using default 20."
+            f"max_loop_iterations must be positive, got {cfg.max_loop_iterations}. Using default 40."
         )
-        cfg.max_loop_iterations = 20
+        cfg.max_loop_iterations = 40
 
     # Validate mode
-    valid_modes = ["plan", "build", "yolo"]
+    valid_modes = ["plan", "build"]
     if cfg.mode not in valid_modes:
         warnings.warn(
             f"Invalid mode '{cfg.mode}', must be one of {valid_modes}. Using 'build'."
@@ -353,6 +356,7 @@ def _validate_config(cfg: Config) -> None:
         "disable_native_tools",
         "disable_docker",
         "vision_screenshots",
+        "auto_test",
     ):
         val = getattr(cfg, name)
         if isinstance(val, str):

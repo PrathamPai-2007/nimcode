@@ -19,7 +19,7 @@ KEY_BINDINGS = [
     ("PgUp/PgDn, Ctrl+Up/Down, mouse wheel", "Scroll the conversation"),
     ("Esc", "Jump back to the latest message / dismiss the popup"),
     ("Tab", "Complete a /command"),
-    ("Shift+Tab / Ctrl+T", "Cycle Plan / Build / YOLO"),
+    ("Shift+Tab / Ctrl+T", "Cycle Plan / Build"),
     ("Ctrl+O", "Expand or fold long tool output"),
     ("Ctrl+C", "Clear the input, or interrupt the turn when it is empty"),
     ("Ctrl+D", "Exit (when the input is empty)"),
@@ -29,7 +29,7 @@ KEY_BINDINGS = [
 # Every SLASH_COMMANDS entry must appear here (tests/test_ux_help.py).
 COMMAND_HELP = [
     ("? / /help", "Show this help"),
-    ("/plan / /build / /yolo", "Switch mode directly"),
+    ("/plan / /build", "Switch mode directly"),
     ("/model", "Choose the active model (hands context over via summary.md)"),
     ("/models-refresh", "Refresh the model catalog from the NIM API"),
     ("/config", "Edit runtime settings"),
@@ -97,7 +97,7 @@ def print_welcome():
     right_text = Text()
     right_text.append("\n\n\n")
     right_text.append(
-        f"{bullet} Shift+Tab to cycle between Plan, Build & YOLO modes\n",
+        f"{bullet} Shift+Tab to cycle between Plan & Build modes\n",
         style="dim",
     )
     right_text.append(f"{bullet} To use commands and skills, use /\n", style="dim")

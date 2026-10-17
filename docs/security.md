@@ -16,7 +16,7 @@
 | **Output truncation** | `truncate_output()` keeps head + tail, drops middle (`dropped N chars`) | `src/nimcode/tools/base.py:240` |
 | **SSRF guard** | `_is_url_allowed()` DNS-resolves targets and rejects any non-global IP (localhost excepted for the dev-server loop); applied to every screenshot request and every skill-download redirect | `src/nimcode/tools/base.py` |
 | **Skill install review** | Staged download + preview + confirmation; `.source.json` records url + sha256 | `src/nimcode/skills.py` |
-| **Human gate** | All mutations require `y/n` (Build) or `yolo` (Plan); YOLO still shows preview | `src/nimcode/core/agent_tui.py:1018` |
+| **Approval policy** | Every call shows a preview, then `classify()`: reads and ordinary writes/commands run; sensitive files and risky commands ask `y/n`; Plan mode refuses anything but reads | `src/nimcode/tools/policy.py` |
 | **Subagent caveat** | Swarm threads **bypass** the human gate — they execute tools directly (Docker-only for commands) | `src/nimcode/tools/swarm.py` |
 
 ## Docker Sandbox Details
