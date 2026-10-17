@@ -193,6 +193,22 @@ nimcode/
 
 ## 6. Installation
 
+### Quick install (prebuilt, no Rust or Python setup)
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/PrathamPai-2007/nimcode/main/install.ps1 | iex
+```
+
+```bash
+# Linux / macOS
+curl -LsSf https://raw.githubusercontent.com/PrathamPai-2007/nimcode/main/install.sh | sh
+```
+
+Both scripts install [uv](https://docs.astral.sh/uv/) if needed, then `uv tool install` the wheel for your platform from the latest GitHub Release. Set `NIMCODE_VERSION=v0.7.0rc1` to pick a specific tag (pre-releases included). Then put `NVIDIA_API_KEY=...` in `~/.nimcode/.env` and run `nimcode`. Update by re-running the script; remove with `uv tool uninstall nimcode`.
+
+### Install from source
+
 ```bash
 # 1. Clone
 git clone https://github.com/PrathamPai-2007/nimcode.git
