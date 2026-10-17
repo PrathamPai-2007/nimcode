@@ -6,7 +6,7 @@ import functools
 import typer
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from openai import APIConnectionError, OpenAI, RateLimitError
+from openai import APIConnectionError, APITimeoutError, OpenAI, RateLimitError
 
 # Optional tiktoken for accurate token counting
 try:
@@ -681,8 +681,25 @@ def call_nim_with_retry(
                     _context_budget=new_budget,
                 )
 
+            if status == 410:
+                # Retired model: /v1/models still lists it. Hide it for good.
+                from nimcode.config_models import mark_retired
+
+                mark_retired(model)
+                raise RuntimeError(
+                    f"Model '{model}' has been retired by NVIDIA (410 Gone) and "
+                    f"was removed from your model list. Use /model to pick another."
+                ) from e
+            if isinstance(e, APITimeoutError):
+                # A hung endpoint rarely recovers within seconds: retrying only
+                # triples the wait. Tell the user right away instead.
+                raise RuntimeError(
+                    f"'{model}' did not respond within {kwargs['timeout']:.0f}s. "
+                    f"The endpoint is likely down or overloaded - use /model to "
+                    f"switch, or raise `timeout` in nimcode.toml."
+                ) from e
             if isinstance(e, (RateLimitError, APIConnectionError)):
-                fail_fast, capacity = False, True  # incl. APITimeoutError
+                fail_fast, capacity = False, True
             elif status is not None:
                 # Deterministic client errors: re-sending can only fail again.
                 fail_fast = status in (400, 401, 403, 404, 422)

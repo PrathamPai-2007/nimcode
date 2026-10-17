@@ -75,6 +75,28 @@ def _cache_path() -> Path:
     return Path.home() / ".nimcode" / "models_cache.json"
 
 
+def _retired_path() -> Path:
+    return Path.home() / ".nimcode" / "retired_models.json"
+
+
+def retired_ids() -> set:
+    """Model ids the API answered 410 Gone for (``/v1/models`` still lists them)."""
+    try:
+        return set(json.loads(_retired_path().read_text(encoding="utf-8")))
+    except Exception:
+        return set()
+
+
+def mark_retired(model_id: str) -> None:
+    try:
+        ids = retired_ids() | {model_id}
+        path = _retired_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(sorted(ids)), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _ttl_seconds() -> int:
     try:
         hours = float(os.environ.get("NIMCODE_MODELS_TTL_HOURS", "24"))
@@ -243,7 +265,8 @@ def fetch_free_ids(timeout: float = 15.0) -> set:
 
 def fetch_catalog(client: Any) -> List[Dict[str, Any]]:
     """Live models, each tagged ``free`` (kept from the cache if the lookup fails)."""
-    fetched = fetch_models(client)
+    gone = retired_ids()
+    fetched = [m for m in fetch_models(client) or [] if m["id"] not in gone]
     if not fetched:
         return []
     free = fetch_free_ids()
@@ -309,10 +332,10 @@ def save_models_cache(models: List[Dict[str, Any]]) -> None:
 
 def get_model_catalog() -> List[Dict[str, Any]]:
     """Single source of truth: fresh cache wins, else the static table."""
+    gone = retired_ids()
     cached, age = load_models_cache()
-    if cached and age < _ttl_seconds():
-        return cached
-    return static_catalog()
+    models = cached if cached and age < _ttl_seconds() else static_catalog()
+    return [m for m in models if m["id"] not in gone]
 
 
 def resolve_context(model_id: str) -> Optional[int]:

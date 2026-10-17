@@ -205,7 +205,6 @@ def test_rate_limit_and_connection_errors_retry():
     for err in (
         _api_error(429, "slow down"),
         openai.APIConnectionError(request=req),
-        openai.APITimeoutError(request=req),
     ):
         comp = _FakeCompletions(always_error=err)
         with pytest.raises(type(err)):
@@ -242,3 +241,34 @@ def test_context_overflow_400_prunes_and_retries():
     )
     assert isinstance(res, _FakeResponse)
     assert len(calls) == 2
+
+
+def test_410_retires_model_and_fails_fast(tmp_path, monkeypatch):
+    from nimcode import config_models
+
+    monkeypatch.setattr(config_models, "_retired_path", lambda: tmp_path / "r.json")
+    cfg = Config()
+    comp = _FakeCompletions(always_error=_api_error(410, "end of life"))
+
+    with pytest.raises(RuntimeError, match="retired"):
+        call_nim_with_retry(_FakeClient(comp), _messages(), None, "vendor/old", cfg)
+
+    assert len(comp.calls) == 1
+    assert "vendor/old" in config_models.retired_ids()
+    monkeypatch.setattr(
+        config_models,
+        "load_models_cache",
+        lambda: ([{"id": "vendor/old", "name": "Old"}, {"id": "a/b", "name": "B"}], 0),
+    )
+    assert [m["id"] for m in config_models.get_model_catalog()] == ["a/b"]
+
+
+def test_timeout_fails_after_one_attempt():
+    cfg = Config()
+    req = httpx.Request("POST", "https://nim.test/v1/chat/completions")
+    comp = _FakeCompletions(always_error=openai.APITimeoutError(request=req))
+
+    with pytest.raises(RuntimeError, match="did not respond"):
+        call_nim_with_retry(_FakeClient(comp), _messages(), None, cfg.fast_model, cfg)
+
+    assert len(comp.calls) == 1
