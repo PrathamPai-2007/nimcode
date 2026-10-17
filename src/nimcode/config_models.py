@@ -67,6 +67,17 @@ SKIP_SUBSTRINGS = (
     "usdcode",
 )
 
+# NGC labels 13 models "Free Endpoint", but most were unresponsive when probed
+# (2026-10-17: tools + hello OK). ponytail: hand-kept list; re-probe to update.
+VERIFIED_FREE = frozenset(
+    {
+        "openai/gpt-oss-20b",
+        "nvidia/nemotron-3-super-120b-a12b",
+        "poolside/laguna-xs-2.1",
+        "stepfun-ai/step-5-preview",
+    }
+)
+
 _refresh_lock = threading.Lock()
 _refresh_inflight = False
 
@@ -213,68 +224,14 @@ def fetch_models(client: Any, timeout: float = 20.0) -> List[Dict[str, Any]]:
     return catalog
 
 
-NGC_CATALOG_URL = "https://api.ngc.nvidia.com/v2/search/catalog/resources/ENDPOINT"
-
-
-def fetch_free_ids(timeout: float = 15.0) -> set:
-    """Ids of hosted models NVIDIA labels "Free Endpoint" (public catalog).
-
-    ``/v1/models`` carries no pricing, but build.nvidia.com's catalog marks
-    free-tier endpoints. Never raises — returns an empty set on any failure.
-    """
-    try:
-        import httpx
-
-        free: set = set()
-        page = 0
-        while page < 10:
-            query = {
-                "query": "",
-                "page": page,
-                "pageSize": 100,
-                "filters": [{"field": "nimType", "value": "nim_type_preview"}],
-            }
-            r = httpx.get(
-                NGC_CATALOG_URL,
-                params={"q": json.dumps(query)},
-                timeout=timeout,
-            )
-            r.raise_for_status()
-            body = r.json()
-            for group in body.get("results", []):
-                for res in group.get("resources", []):
-                    labels = {
-                        lab.get("key"): lab.get("values") or []
-                        for lab in res.get("labels", [])
-                    }
-                    publisher = (labels.get("publisher") or [""])[0]
-                    name = res.get("name")
-                    if (
-                        publisher
-                        and name
-                        and "Free Endpoint" in sum(labels.values(), [])
-                    ):
-                        free.add(f"{publisher}/{name}")
-            page += 1
-            if page >= int(body.get("resultPageTotal") or 1):
-                break
-        return free
-    except Exception:
-        return set()
-
-
 def fetch_catalog(client: Any) -> List[Dict[str, Any]]:
     """Live models, each tagged ``free`` (kept from the cache if the lookup fails)."""
     gone = retired_ids()
     fetched = [m for m in fetch_models(client) or [] if m["id"] not in gone]
     if not fetched:
         return []
-    free = fetch_free_ids()
-    if not free:
-        cached, _ = load_models_cache()
-        free = {m["id"] for m in cached or [] if m.get("free")}
     for m in fetched:
-        m["free"] = m["id"] in free
+        m["free"] = m["id"] in VERIFIED_FREE
     return fetched
 
 
@@ -335,7 +292,9 @@ def get_model_catalog() -> List[Dict[str, Any]]:
     gone = retired_ids()
     cached, age = load_models_cache()
     models = cached if cached and age < _ttl_seconds() else static_catalog()
-    return [m for m in models if m["id"] not in gone]
+    return [
+        {**m, "free": m["id"] in VERIFIED_FREE} for m in models if m["id"] not in gone
+    ]
 
 
 def resolve_context(model_id: str) -> Optional[int]:
