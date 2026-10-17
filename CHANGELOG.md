@@ -26,3 +26,5 @@
 
 **Fixes**
 - Startup crash with typer 0.26, Ctrl+D hang at approval prompts, duplicate "(y/n)", and many bugs from the full-project review.
+- Default model is now `nvidia/nemotron-3-super-120b-a12b`; retired models (HTTP 410) are hidden automatically and `[free]` marks only endpoints verified to respond.
+- API timeouts fail after one attempt with a hint to switch models, instead of three silent retries.

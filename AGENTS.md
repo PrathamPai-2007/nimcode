@@ -52,7 +52,8 @@ nimcode/
 ├── requirements.txt                # Runtime deps mirror
 ├── uv.lock                         # uv lockfile
 ├── AGENTS.md                       # This file — live-injected into the agent prompt
-└── README.md                       # User-facing documentation
+├── README.md                       # User-facing quick start
+└── docs/                           # Developer docs (config, CLI, architecture, security, tools, testing, benchmarks)
 ```
 
 > **Migration shims:** `get_project_nimcode_dir()` (`config.py`) auto-migrates legacy `~/.nimcode/<name>` (unhashed) and local `.nimcode/` into the hashed global dir on first access, never overwriting existing files. `migrate_legacy_session()` (`agent.py`) converts `<workspace>/.nimcode_session.json`.
